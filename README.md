@@ -84,6 +84,10 @@ $ ./jb --selftest
 {"selftest":"ok"}
 ```
 
+For operation-level profiling, add `-DJB_PROFILE`. Each request then emits one
+timing line to standard error for attention, dense FFN, routing, MoE experts,
+and remaining FFN work. Normal JSONL on standard output is unchanged.
+
 ## Use
 
 ```sh

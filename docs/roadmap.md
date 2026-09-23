@@ -48,6 +48,14 @@ Record hardware counters where available: sustained memory bandwidth, vector
 utilization, cache misses, instructions per cycle, and time spent at OpenMP
 barriers. Report cold and warm runs separately.
 
+The first `JB_PROFILE` wall-clock measurements establish two prompt-dependent
+profiles on the Threadripper 9980X with 32 threads. A warm 219-token request
+spends 64.8% of total inference time in MoE experts, 20.9% in attention, and
+7.9% in the dense FFN. A 974-token one-read evaluation row spends 41.7% in
+experts, 38.8% in attention, and 11.5% in the dense FFN. Routing is below 1%
+in both. Optimize and benchmark both prompt sizes: short-request results alone
+substantially understate the importance of attention.
+
 Every optimization must preserve byte-identical probabilities unless a change
 is explicitly presented and validated as a numerical experiment. Fast-math is
 the first such experiment: it changed distributions, matched OpenJev automatic-
