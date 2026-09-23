@@ -170,3 +170,8 @@ Current limits are batch size one per process, 4,096 prompt tokens, a 64-token
 answer canvas, and one denoising step. The hypothesis is deliberately narrow:
 bounded typed decisions should read candidate logits instead of paying for
 autoregressive JSON generation.
+
+## License
+
+[0BSD](LICENSE): use, copy, modify, and distribute Jev Bush for any purpose,
+with or without fee and without an attribution requirement.
