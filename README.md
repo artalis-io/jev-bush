@@ -9,6 +9,22 @@ answer-slot logits. It never generates or parses free-form text. The engine is
 one C11 file, [`jb.c`](jb.c), with no runtime dependency beyond the C
 standard library; OpenMP is optional.
 
+## Project goals
+
+- Be a small, readable, educational implementation of direct probabilistic
+  decisions on a real diffusion language model.
+- Run inference on CPUs. GPU backends are deliberately out of scope: adding
+  CUDA, Metal, Vulkan, WebGPU, or another GPGPU path would defeat the point of
+  this project.
+- Make the CPU path correct and fast through model-specific data layouts,
+  vectorization, and OpenMP without turning `jb.c` into a generic framework.
+- Remain compatible with OpenJev's bounded decision semantics and public
+  evaluation data.
+
+For production GPGPU inference, use
+[OpenJev](https://github.com/razorback16/openjev) or
+[SemIf](https://github.com/TheoLeeCJ/SemIf).
+
 ## Build
 
 Linux, optimized for the current CPU:
@@ -164,7 +180,9 @@ accuracy-competitive, but not yet close to GPU latency.
 The subsequent packed-activation kernel removes repeated even/odd lane
 permutations from every NVFP4 expert output row. Six paired compact runs were
 4.42% faster on average, and three paired 501-token runs were 4.06% faster,
-with byte-identical probabilities.
+with byte-identical probabilities. Reusing each activation load across two
+expert output rows reduced the same 501-token request by another 5.24% across
+three paired runs, also with byte-identical probabilities.
 
 Current limits are batch size one per process, 4,096 prompt tokens, a 64-token
 answer canvas, and one denoising step. The hypothesis is deliberately narrow:

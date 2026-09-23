@@ -799,18 +799,20 @@ static void dg_nvfp4_mm(const DGTensor*w,const DGTensor*s,const DGTensor*g,
 #ifdef _OPENMP
 #pragma omp parallel for schedule(static)
 #endif
-    for(int r=0;r<rows;r++){
-        const uint8_t*wp=w->data+(uint64_t)r*cols/2,*sp=s->data+(uint64_t)r*cols/16;
-        for(int tb=0;tb<tokens;tb+=8){int nb=tokens-tb<8?tokens-tb:8;__m512 acc[8];for(int q=0;q<nb;q++)acc[q]=_mm512_setzero_ps();
+    for(int r=0;r<rows;r+=2){
+        const uint8_t*wp0=w->data+(uint64_t)r*cols/2,*wp1=wp0+cols/2;
+        const uint8_t*sp0=s->data+(uint64_t)r*cols/16,*sp1=sp0+cols/16;
+        for(int tb=0;tb<tokens;tb+=8){int nb=tokens-tb<8?tokens-tb:8;__m512 a[8],b[8];for(int q=0;q<nb;q++)a[q]=b[q]=_mm512_setzero_ps();
             for(int c=0;c<cols;c+=32){
-                __m512i raw=_mm512_cvtepu8_epi32(_mm_loadu_si128((const __m128i*)(wp+c/2)));
-                __m512 wl=_mm512_permutexvar_ps(_mm512_and_si512(raw,_mm512_set1_epi32(15)),table);
-                __m512 wh=_mm512_permutexvar_ps(_mm512_srli_epi32(raw,4),table);
-                float s0=dg_f8e4m3(sp[c/16])*global,s1=dg_f8e4m3(sp[c/16+1])*global;
-                __m512 sv=_mm512_mask_blend_ps(0xff00,_mm512_set1_ps(s0),_mm512_set1_ps(s1));wl=_mm512_mul_ps(wl,sv);wh=_mm512_mul_ps(wh,sv);
-                for(int q=0;q<nb;q++){const float*xp=x+(size_t)(tb+q)*cols+c;acc[q]=_mm512_fmadd_ps(wl,_mm512_loadu_ps(xp),acc[q]);acc[q]=_mm512_fmadd_ps(wh,_mm512_loadu_ps(xp+16),acc[q]);}
+                __m512i z=_mm512_set1_epi32(15),raw0=_mm512_cvtepu8_epi32(_mm_loadu_si128((const __m128i*)(wp0+c/2))),raw1=_mm512_cvtepu8_epi32(_mm_loadu_si128((const __m128i*)(wp1+c/2)));
+                __m512 wl0=_mm512_permutexvar_ps(_mm512_and_si512(raw0,z),table),wh0=_mm512_permutexvar_ps(_mm512_srli_epi32(raw0,4),table);
+                __m512 wl1=_mm512_permutexvar_ps(_mm512_and_si512(raw1,z),table),wh1=_mm512_permutexvar_ps(_mm512_srli_epi32(raw1,4),table);
+                float a0=dg_f8e4m3(sp0[c/16])*global,a1=dg_f8e4m3(sp0[c/16+1])*global,b0=dg_f8e4m3(sp1[c/16])*global,b1=dg_f8e4m3(sp1[c/16+1])*global;
+                __m512 sv0=_mm512_mask_blend_ps(0xff00,_mm512_set1_ps(a0),_mm512_set1_ps(a1)),sv1=_mm512_mask_blend_ps(0xff00,_mm512_set1_ps(b0),_mm512_set1_ps(b1));
+                wl0=_mm512_mul_ps(wl0,sv0);wh0=_mm512_mul_ps(wh0,sv0);wl1=_mm512_mul_ps(wl1,sv1);wh1=_mm512_mul_ps(wh1,sv1);
+                for(int q=0;q<nb;q++){const float*xp=x+(size_t)(tb+q)*cols+c;__m512 xe=_mm512_loadu_ps(xp),xo=_mm512_loadu_ps(xp+16);a[q]=_mm512_fmadd_ps(wl0,xe,a[q]);a[q]=_mm512_fmadd_ps(wh0,xo,a[q]);b[q]=_mm512_fmadd_ps(wl1,xe,b[q]);b[q]=_mm512_fmadd_ps(wh1,xo,b[q]);}
             }
-            for(int q=0;q<nb;q++)y[(size_t)(tb+q)*rows+r]=_mm512_reduce_add_ps(acc[q]);
+            for(int q=0;q<nb;q++){y[(size_t)(tb+q)*rows+r]=_mm512_reduce_add_ps(a[q]);y[(size_t)(tb+q)*rows+r+1]=_mm512_reduce_add_ps(b[q]);}
         }
     }
     return;
