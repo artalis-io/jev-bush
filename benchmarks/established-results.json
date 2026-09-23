@@ -19,8 +19,9 @@
       "engine": "jev-bush",
       "checkpoint": "BF16",
       "read_policy": "one",
+      "math": "strict",
       "accuracy": 0.674,
-      "soft_cross_entropy": 1.6134,
+      "label_log_loss": 1.6134,
       "brier": 0.335,
       "ece": 0.2523,
       "score_mae": 0.4394
@@ -29,8 +30,9 @@
       "engine": "openjev",
       "checkpoint": "NVFP4",
       "read_policy": "one",
+      "math": "framework-default",
       "accuracy": 0.666,
-      "soft_cross_entropy": 1.4747,
+      "label_log_loss": 1.4747,
       "brier": 0.3205,
       "ece": 0.2446,
       "score_mae": 0.446
@@ -39,8 +41,9 @@
       "engine": "openjev",
       "checkpoint": "NVFP4",
       "read_policy": "automatic",
+      "math": "framework-default",
       "accuracy": 0.668,
-      "soft_cross_entropy": 1.394,
+      "label_log_loss": 1.394,
       "brier": 0.3107,
       "ece": 0.2352,
       "score_mae": 0.4404
@@ -49,11 +52,23 @@
       "engine": "jev-bush",
       "checkpoint": "NVFP4",
       "read_policy": "one",
+      "math": "strict",
       "accuracy": 0.661,
-      "soft_cross_entropy": 1.5476,
+      "label_log_loss": 1.5476,
       "brier": 0.3268,
       "ece": 0.254,
       "score_mae": 0.4421
+    },
+    {
+      "engine": "jev-bush",
+      "checkpoint": "NVFP4",
+      "read_policy": "one",
+      "math": "fast",
+      "accuracy": 0.668,
+      "label_log_loss": 1.5776713196816974,
+      "brier": 0.32720616244156403,
+      "ece": 0.24543986445063573,
+      "score_mae": 0.4440945542665864
     }
   ],
   "agreement": {
@@ -66,12 +81,15 @@
       "hardware": "64-core Threadripper 9980X",
       "workers": 2,
       "threads_per_worker": 32,
-      "mean_seconds_per_row": 10.11,
-      "p95_seconds_per_row": 15.03,
-      "prefill_tokens_per_second_per_worker": 65.6,
-      "decisions_per_second_per_worker": 0.495,
+      "math": "fast",
+      "compiler_flags": "-O3 -march=native -ffast-math -std=c11 -Wall -Wextra -pedantic -fopenmp",
+      "mean_seconds_per_row": 5.4867407425,
+      "p50_seconds_per_row": 5.369107,
+      "p95_seconds_per_row": 8.66093705,
+      "prefill_tokens_per_second_per_worker": 121.8786348646,
+      "decisions_per_second_per_worker": 0.9112878182,
       "resident_memory_gb_per_process": 14.8,
-      "candidate_projection_ms_per_decision": 0.026
+      "candidate_projection_ms_per_decision": 0.0251725
     },
     "openjev": {
       "hardware": "NVIDIA RTX PRO 6000 Blackwell",

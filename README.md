@@ -49,8 +49,14 @@ For production GPGPU inference, use
 Linux, optimized for the current CPU:
 
 ```sh
-cc -O3 -march=native -std=c11 -Wall -Wextra -pedantic -fopenmp jb.c -lm -o jb
+cc -O3 -march=native -ffast-math -std=c11 -Wall -Wextra -pedantic \
+  -fopenmp jb.c -lm -o jb
 ```
+
+This is the evaluated high-throughput build. `-ffast-math` changes floating-
+point reduction and transcendental behavior; its full accuracy and calibration
+results are reported below. Output records `"math":"fast"`; omit the flag for
+strict IEEE behavior and `"math":"strict"` output.
 
 Portable Linux or macOS:
 
@@ -179,8 +185,9 @@ python3 tools/summarize_eval.py predictions.jsonl
 ```
 
 Give concurrent workers disjoint CPU sets when possible; otherwise separate
-OpenMP processes may bind to the same cores. For lowest single-request latency
-on the measured 64-core Threadripper 9980X, 48 threads was best.
+OpenMP processes may bind to the same cores. On the measured 64-core
+Threadripper 9980X, 40--48 threads performed similarly for single-request
+latency; the two-worker benchmark used 32 threads per worker.
 
 ## Established results
 
@@ -196,7 +203,8 @@ The trusted reference is OpenJev commit `91d5005` with patched vLLM commit
 | Jev Bush BF16, one read | **67.40%** | 1.6134 | 0.3350 | 0.2523 | 0.4394 |
 | OpenJev NVFP4, one read | 66.60% | 1.4747 | 0.3205 | 0.2446 | 0.4460 |
 | OpenJev NVFP4, automatic reads | 66.80% | **1.3940** | **0.3107** | **0.2352** | 0.4404 |
-| Jev Bush NVFP4, one read | 66.10% | 1.5476 | 0.3268 | 0.2540 | 0.4421 |
+| Jev Bush NVFP4, strict, one read | 66.10% | 1.5476 | 0.3268 | 0.2540 | 0.4421 |
+| Jev Bush NVFP4, fast-math, one read | 66.80% | 1.5777 | 0.3272 | 0.2454 | 0.4441 |
 
 ### Why this matters
 
@@ -222,19 +230,16 @@ candidate-distribution total variation is 0.0765. The packed NVFP4 primitive
 was independently checked against PyTorch: activation QDQ matched exactly and
 checked expert projections differed by at most `2.4e-7`.
 
-Two concurrent 32-thread Jev Bush workers averaged 10.11 s per row (p95
-15.03 s), 65.60 prefill tokens/s per worker, 0.495 decisions/s per worker,
-and about 14.8 GB resident memory per process. Candidate projection averaged
-0.026 ms per decision; transformer execution dominates. OpenJev on an RTX PRO
-6000 Blackwell averaged 54.2 ms per one-read row. Jev Bush is
-accuracy-competitive, but not yet close to GPU latency.
+The recommended fast-math build with two concurrent 32-thread workers averaged
+5.49 s per row (p95 8.66 s), 121.88 prefill tokens/s per worker, and 0.911
+decisions/s per worker. Candidate projection averaged 0.025 ms per decision;
+transformer execution dominates. The strict build scored better log loss and
+Brier, while fast-math improved accuracy, ECE, and throughput. Resident memory
+is about 14.8 GB per process.
 
-The subsequent packed-activation kernel removes repeated even/odd lane
-permutations from every NVFP4 expert output row. Six paired compact runs were
-4.42% faster on average, and three paired 501-token runs were 4.06% faster,
-with byte-identical probabilities. Reusing each activation load across two
-expert output rows reduced the same 501-token request by another 5.24% across
-three paired runs, also with byte-identical probabilities.
+OpenJev on an RTX PRO 6000 Blackwell averaged 54.2 ms per one-read row. That
+GPU comparison is context, not a target backend: Jev Bush is intentionally a
+CPU educational implementation.
 
 Current limits are batch size one per process, 4,096 prompt tokens, a 64-token
 answer canvas, and one denoising step. The hypothesis is deliberately narrow:

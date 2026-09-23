@@ -1,7 +1,8 @@
 /*
  * Jev Bush -- CPU-first bounded decisions with DiffusionGemma.
  *
- * Build: cc -O3 -std=c11 -Wall -Wextra -pedantic -fopenmp jb.c -lm -o jb
+ * Build: cc -O3 -march=native -ffast-math -std=c11 -Wall -Wextra
+ *        -pedantic -fopenmp jb.c -lm -o jb
  * The engine reads the exact public DiffusionGemma safetensors layout directly.
  */
 #define _POSIX_C_SOURCE 200809L
@@ -31,6 +32,12 @@
 #define JB_MAX_CTX 4096
 #define JB_MAX_CAND 255
 #define JB_MAX_JSON (64u * 1024u * 1024u)
+
+#if defined(__FAST_MATH__)
+#define JB_MATH_MODE "fast"
+#else
+#define JB_MATH_MODE "strict"
+#endif
 
 typedef struct {
     int id;
@@ -1312,7 +1319,7 @@ static char *dg_system_prompt(const char *qj,JTok *qt,int qnt,DecisionWork*w,int
     db_fmt(&b,"\n%s",nq<=10?"Reply with one line per question, in this order, formatted as \"id: label\".":"Reply on one line with each question's id immediately followed by its label, separated by single spaces.");return b.p;
 }
 static char *dg_answer_text(DecisionWork*w,int nq,const int*pick){size_t cap=64;for(int i=0;i<nq;i++)cap+=strlen(w[i].label[pick[i]])+24;char*s=xmalloc(cap),*p=s;for(int i=0;i<nq;i++){if(i)*p++=nq<=10?'\n':' ';p+=sprintf(p,nq<=10?"q%d: %s":"q%d%s",i+1,w[i].label[pick[i]]);}return s;}
-static void dg_print_answers(const char*qj,JTok*qt,int qnt,DecisionWork*w,int nq,const char*id,uint32_t tokens,double ms,double prefill_ms,double cand_ms,int reads){printf("{\"model\":\"jev-bush-diffusion-%s\",",JB_VERSION);if(id){fputs("\"id\":",stdout);json_print_string(id);putchar(',');}fputs("\"answers\":{",stdout);for(int x=0;x<nq;x++){DecisionWork*d=&w[x];if(x)putchar(',');char*k=jt_string(qj,&qt[d->key]);json_print_string(k);free(k);fputs(":{\"type\":",stdout);json_print_string(d->kind);if(!strcmp(d->kind,"noul"))printf(",\"noul\":%.17g,\"probabilities\":{\"true\":%.17g,\"false\":%.17g},\"confidence\":%.17g",d->prob[0],d->prob[0],d->prob[1],confidence(d->prob,d->nc));else if(!strcmp(d->kind,"choice")){int top=0;for(int i=1;i<d->nc;i++)if(d->prob[i]>d->prob[top])top=i;fputs(",\"choice\":",stdout);json_print_string(d->cand[top]);fputs(",\"probabilities\":{",stdout);for(int i=0;i<d->nc;i++){if(i)putchar(',');json_print_string(d->cand[i]);printf(":%.17g",d->prob[i]);}printf("},\"confidence\":%.17g",confidence(d->prob,d->nc));}else{double ev=0;for(int i=0;i<d->nc;i++)ev+=i*d->prob[i];printf(",\"score\":%.17g,\"legend\":{",ev);int zc=0;for(int z=d->criteria+1;z<qnt;z++)if(qt[z].parent==d->criteria){printf("%s\"%d\":",zc?",":"",zc);zc++;json_print_token(qj,&qt[z]);}fputs("},\"probabilities\":{",stdout);for(int i=0;i<d->nc;i++)printf("%s\"%d\":%.17g",i?",":"",i,d->prob[i]);printf("},\"confidence\":%.17g",confidence(d->prob,d->nc));}putchar('}');}printf("},\"usage\":{\"input_tokens\":%u,\"output_tokens\":0},\"timing_ms\":{\"total\":%.3f,\"prefill\":%.3f,\"decode\":%.3f,\"candidates\":%.3f,\"reads\":%d}}\n",tokens,ms,prefill_ms,ms-prefill_ms-cand_ms,cand_ms,reads);}
+static void dg_print_answers(const char*qj,JTok*qt,int qnt,DecisionWork*w,int nq,const char*id,uint32_t tokens,double ms,double prefill_ms,double cand_ms,int reads){printf("{\"model\":\"jev-bush-diffusion-%s\",\"math\":\"%s\",",JB_VERSION,JB_MATH_MODE);if(id){fputs("\"id\":",stdout);json_print_string(id);putchar(',');}fputs("\"answers\":{",stdout);for(int x=0;x<nq;x++){DecisionWork*d=&w[x];if(x)putchar(',');char*k=jt_string(qj,&qt[d->key]);json_print_string(k);free(k);fputs(":{\"type\":",stdout);json_print_string(d->kind);if(!strcmp(d->kind,"noul"))printf(",\"noul\":%.17g,\"probabilities\":{\"true\":%.17g,\"false\":%.17g},\"confidence\":%.17g",d->prob[0],d->prob[0],d->prob[1],confidence(d->prob,d->nc));else if(!strcmp(d->kind,"choice")){int top=0;for(int i=1;i<d->nc;i++)if(d->prob[i]>d->prob[top])top=i;fputs(",\"choice\":",stdout);json_print_string(d->cand[top]);fputs(",\"probabilities\":{",stdout);for(int i=0;i<d->nc;i++){if(i)putchar(',');json_print_string(d->cand[i]);printf(":%.17g",d->prob[i]);}printf("},\"confidence\":%.17g",confidence(d->prob,d->nc));}else{double ev=0;for(int i=0;i<d->nc;i++)ev+=i*d->prob[i];printf(",\"score\":%.17g,\"legend\":{",ev);int zc=0;for(int z=d->criteria+1;z<qnt;z++)if(qt[z].parent==d->criteria){printf("%s\"%d\":",zc?",":"",zc);zc++;json_print_token(qj,&qt[z]);}fputs("},\"probabilities\":{",stdout);for(int i=0;i<d->nc;i++)printf("%s\"%d\":%.17g",i?",":"",i,d->prob[i]);printf("},\"confidence\":%.17g",confidence(d->prob,d->nc));}putchar('}');}printf("},\"usage\":{\"input_tokens\":%u,\"output_tokens\":0},\"timing_ms\":{\"total\":%.3f,\"prefill\":%.3f,\"decode\":%.3f,\"candidates\":%.3f,\"reads\":%d}}\n",tokens,ms,prefill_ms,ms-prefill_ms-cand_ms,cand_ms,reads);}
 
 static int dg_systemone(DGModel*m,DGTokenizer*tok,const char*j,size_t len,const char*line_id){
     int nt;JTok*t=json_tokens(j,len,&nt);if(!nt||t[0].type!=JT_OBJECT)die("System One request must be an object");int si=jt_obj_get(j,t,nt,0,"state"),qi=jt_obj_get(j,t,nt,0,"questions"),ii=jt_obj_get(j,t,nt,0,"id"),sti=jt_obj_get(j,t,nt,0,"samples"),dpi=jt_obj_get(j,t,nt,0,"steps");int has_samples=sti>=0&&!jt_literal(j,&t[sti],"null"),requested=has_samples?jt_nonnegative_int(j,&t[sti],"samples"):0,steps=dpi>=0&&!jt_literal(j,&t[dpi],"null")?jt_nonnegative_int(j,&t[dpi],"steps"):1;if(has_samples&&(requested<1||requested>32))die("samples must be 1..32");if(steps!=1)die("only one-step DiffusionGemma reads are supported");if(si<0||qi<0||(t[qi].type!=JT_OBJECT&&t[qi].type!=JT_STRING))die("request needs state and questions object");char*state=t[si].type==JT_STRING?jt_string(j,&t[si]):dg_json_canonical(j,t,nt,si,0,0),*reqid=ii>=0?jt_string(j,&t[ii]):NULL,*qowned=NULL;const char*qj=j;JTok*qt=t;int qnt=nt,qroot=qi;if(t[qi].type==JT_STRING){qowned=jt_string(j,&t[qi]);qt=json_tokens(qowned,strlen(qowned),&qnt);qj=qowned;qroot=0;if(!qnt||qt[0].type!=JT_OBJECT)die("questions string is not a JSON object");}

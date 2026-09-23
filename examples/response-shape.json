@@ -1,5 +1,6 @@
 {
   "model": "jev-bush-diffusion-0.1.0",
+  "math": "fast",
   "id": "example-ticket",
   "answers": {
     "is_billing": {

@@ -5,14 +5,15 @@ to Jev on the public typed-decisions benchmark. The next research question is
 how much faster its deliberately small CPU implementation can become without
 turning into a general inference framework.
 
-The established throughput configuration uses two concurrent 32-thread workers
-on a 64-core Threadripper 9980X. Each worker averages 10.11 seconds per
-five-decision row, or 0.495 decisions per second, with a p95 row latency of
-15.03 seconds. Together they sustain about 0.99 decisions per second. OpenJev
-on an RTX PRO 6000 Blackwell averages 54.2 milliseconds per one-read row.
+The established throughput configuration uses the evaluated `-ffast-math`
+build and two concurrent 32-thread workers on a 64-core Threadripper 9980X.
+Each worker averages 5.49 seconds per five-decision row, or 0.911 decisions per
+second, with a p95 row latency of 8.66 seconds. Together they sustain about
+1.82 decisions per second. OpenJev on an RTX PRO 6000 Blackwell averages 54.2
+milliseconds per one-read row.
 
-That is approximately a 187x single-row latency gap and, after accounting for
-the two CPU workers, a 93x aggregate-throughput gap. The comparison is useful,
+That is approximately a 101x single-row latency gap and, after accounting for
+the two CPU workers, a 51x aggregate-throughput gap. The comparison is useful,
 but not perfectly controlled: the CPU number is a two-worker throughput run,
 not the best 48-thread single-request configuration, and the GPU has much more
 memory bandwidth plus native FP4 tensor hardware.
@@ -48,12 +49,17 @@ utilization, cache misses, instructions per cycle, and time spent at OpenMP
 barriers. Report cold and warm runs separately.
 
 Every optimization must preserve byte-identical probabilities unless a change
-is explicitly presented as a numerical experiment. Benchmark single-request
-latency and multi-worker throughput separately.
+is explicitly presented and validated as a numerical experiment. Fast-math is
+the first such experiment: it changed distributions, matched OpenJev automatic-
+read accuracy at 66.80%, and improved throughput, while slightly worsening log
+loss, Brier score, and score MAE. Benchmark strict and fast-math builds
+separately, and separate single-request latency from multi-worker throughput.
 
 ## 2. Cache shared prompt-prefix K/V
 
-This is the highest-priority latency experiment.
+First measure the exact shared-token prefix and potential hit rate for every
+benchmark row. Implement this only if the measured prefill fraction and shared
+prefixes predict a material end-to-end gain.
 
 The prompt places the system text, questions, and criteria before the user
 state. Rows in the same workflow reuse that prefix while changing only the
@@ -112,33 +118,28 @@ slightly worse. Do not present amortized decision time as request latency.
 
 ## 4. Reuse request-independent work
 
-Cache or precompute the inexpensive control-plane work only after measuring it:
+Cache or precompute the inexpensive control-plane work only after measuring
+wall time separately from the current inference timer, which begins after
+tokenization and template construction:
 
 - tokenized system prompts for repeated question schemas;
 - answer-template tokens, label slots, and candidate token ids;
 - parsed and validated question metadata;
 - reusable activation and scratch buffers sized to the largest seen request.
 
-Add optional exact-result memoization keyed by the canonical request, model
-revision, and read settings. Identical retries are deterministic and may return
-immediately. Keep this cache bounded and report hits; it does not improve a
-benchmark containing unique states.
-
-Do not use approximate or semantic caching in correctness evaluations.
+Exact-result and semantic memoization are out of scope: neither accelerates the
+unique public evaluation rows, and both add state unrelated to model execution.
 
 ## 5. Improve the CPU kernels
 
 Once profiles identify the expensive operations:
 
-- prepack BF16 and NVFP4 weights into layouts consumed directly by the
-  AVX-512 kernels;
+- preserve native packed NVFP4 weights; test only bounded metadata or scale
+  preprocessing whose memory cost and end-to-end benefit are measured;
 - tile over several output rows and several tokens to reuse activation and
   weight loads;
-- decode block scales and packed FP4 values once per tile rather than once per
-  scalar use;
-- investigate BF16 dot-product instructions where expansion cost and memory
-  traffic make them beneficial;
-- group routed tokens by expert once, then process active experts in parallel;
+- extend the existing packed-activation and two-output-row NVFP4 tiles only
+  where profiles demonstrate additional reuse;
 - replace repeated inner OpenMP regions with a persistent parallel region or
   lightweight worker pool;
 - retain large scratch buffers instead of allocating them for every layer and
@@ -146,6 +147,12 @@ Once profiles identify the expensive operations:
 
 Keep the scalar kernels as the correctness reference. Validate optimized
 primitives against them and against the existing PyTorch checks.
+
+Already completed: packed activation swizzling, two-output-row NVFP4 expert
+tiles, and routed-token grouping by expert. BF16 dot-product instructions were
+2.8% slower and introduced measurable drift; expert-parallel scheduling was
+about 12% slower. Keep both rejected experiments out of the hot path unless a
+new profile changes their economics.
 
 ## 6. Make benchmark comparisons auditable
 
