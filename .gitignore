@@ -1,0 +1,25 @@
+# Build and profiling output
+/jb
+/jb.exe
+/*.o
+/*.obj
+/*.dSYM/
+/gmon.out
+/*.plist
+
+# Models, generated evaluations, and numerical dumps
+/data/
+/eval/
+/refdump/
+*.safetensors
+*.gguf
+*.bin
+*.f32
+*.jsonl.rows/
+
+# Local tooling residue
+__pycache__/
+*.py[cod]
+/.agents/
+/.codex/
+pi-session-*.html
