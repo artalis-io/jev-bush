@@ -48,13 +48,19 @@ Record hardware counters where available: sustained memory bandwidth, vector
 utilization, cache misses, instructions per cycle, and time spent at OpenMP
 barriers. Report cold and warm runs separately.
 
-The first `JB_PROFILE` wall-clock measurements establish two prompt-dependent
-profiles on the Threadripper 9980X with 32 threads. A warm 219-token request
-spends 64.8% of total inference time in MoE experts, 20.9% in attention, and
-7.9% in the dense FFN. A 974-token one-read evaluation row spends 41.7% in
-experts, 38.8% in attention, and 11.5% in the dense FFN. Routing is below 1%
-in both. Optimize and benchmark both prompt sizes: short-request results alone
-substantially understate the importance of attention.
+The first NVFP4 `JB_PROFILE` wall-clock measurements establish two prompt-
+dependent profiles on the Threadripper 9980X with 32 threads. A warm 219-token
+request spends 62.7% of total inference time in MoE experts, 23.5% in
+attention, and 7.8% in the dense FFN. A 974-token one-read evaluation row
+spends 47.9% in experts, 34.4% in attention, and 10.2% in the dense FFN.
+Routing is below 1% in both. Optimize and benchmark both prompt sizes: short-
+request results alone substantially understate the importance of attention.
+
+Within the NVFP4 expert path, gate/up/down projections plus input and hidden
+QDQ account for 54.6% of total short-request time and 37.3% of the long row.
+This is enough headroom to justify one exact integer-coded E2M1/VNNI prototype.
+Its go/no-go result must use uninstrumented end-to-end latency because detailed
+profiling adds about 0.8% overhead on the warm short request.
 
 Every optimization must preserve byte-identical probabilities unless a change
 is explicitly presented and validated as a numerical experiment. Fast-math is

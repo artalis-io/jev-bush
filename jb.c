@@ -40,7 +40,11 @@
 #endif
 
 #ifdef JB_PROFILE
-typedef struct { uint64_t attention, dense, router, experts, ff_other; } JBProfile;
+typedef struct {
+    uint64_t attention, dense, router, experts, ff_other;
+    uint64_t moe_input_qdq, moe_gate, moe_up, moe_activation;
+    uint64_t moe_hidden_qdq, moe_down;
+} JBProfile;
 static JBProfile jb_profile;
 #define JB_TICK(name) uint64_t name = now_ns()
 #define JB_TO(field, name) (jb_profile.field += now_ns() - (name))
@@ -1079,10 +1083,14 @@ static void dg_ff(DGModel *m, int l, float *x, int n) {
         for(int k=0;k<DG_TOPK;k++){top[(size_t)t*DG_TOPK+k]=ix[k];tw[(size_t)t*DG_TOPK+k]=ev[k]/(float)sel*dg_at(re,ix[k]);}
     }
     JB_TO(router,router_start); JB_TICK(expert_start);
-    float*contrib=xcalloc((size_t)n*DG_TOPK*DG_H,4),*gather=xmalloc((size_t)n*DG_H*4),*gu=xmalloc((size_t)n*1408*4),*hid=xmalloc((size_t)n*DG_MOE*4),*eo=xmalloc((size_t)n*DG_H*4),*qz2=m->nvfp4?xmalloc((size_t)n*DG_H*4):NULL;int*owner=xmalloc((size_t)n*2*sizeof*owner);if(qz2)dg_nvfp4_qdq(qz2,z2,n,DG_H,m->nv_a13[l]);
+    float*contrib=xcalloc((size_t)n*DG_TOPK*DG_H,4),*gather=xmalloc((size_t)n*DG_H*4),*gu=xmalloc((size_t)n*1408*4),*hid=xmalloc((size_t)n*DG_MOE*4),*eo=xmalloc((size_t)n*DG_H*4),*qz2=m->nvfp4?xmalloc((size_t)n*DG_H*4):NULL;int*owner=xmalloc((size_t)n*2*sizeof*owner);if(qz2){JB_TICK(input_qdq_start);dg_nvfp4_qdq(qz2,z2,n,DG_H,m->nv_a13[l]);JB_TO(moe_input_qdq,input_qdq_start);}
     for(int e=0;e<128;e++){int ne=0;for(int t=0;t<n;t++)for(int k=0;k<DG_TOPK;k++)if(top[(size_t)t*DG_TOPK+k]==e){owner[ne*2]=t;owner[ne*2+1]=k;memcpy(gather+(size_t)ne*DG_H,(qz2?qz2:z2)+(size_t)t*DG_H,DG_H*4);ne++;}if(!ne)continue;
         if(m->nvfp4){DGNvExpert*v=&m->nvexpert[l*128+e];float*qh=xmalloc((size_t)ne*DG_MOE*4);
-            dg_nvfp4_mm(v->wg,v->sg,v->gg,gather,gu,ne,DG_MOE,DG_H);dg_nvfp4_mm(v->wu,v->su,v->gu,gather,hid,ne,DG_MOE,DG_H);for(int q=0;q<ne;q++)for(int i=0;i<DG_MOE;i++)hid[(size_t)q*DG_MOE+i]=dg_gelu(gu[(size_t)q*DG_MOE+i])*hid[(size_t)q*DG_MOE+i];dg_nvfp4_qdq(qh,hid,ne,DG_MOE,m->nv_a2[l]);dg_nvfp4_mm(v->wd,v->sd,v->gd,qh,eo,ne,DG_H,DG_MOE);free(qh);
+            JB_TICK(gate_start);dg_nvfp4_mm(v->wg,v->sg,v->gg,gather,gu,ne,DG_MOE,DG_H);JB_TO(moe_gate,gate_start);
+            JB_TICK(up_start);dg_nvfp4_mm(v->wu,v->su,v->gu,gather,hid,ne,DG_MOE,DG_H);JB_TO(moe_up,up_start);
+            JB_TICK(act_start);for(int q=0;q<ne;q++)for(int i=0;i<DG_MOE;i++)hid[(size_t)q*DG_MOE+i]=dg_gelu(gu[(size_t)q*DG_MOE+i])*hid[(size_t)q*DG_MOE+i];JB_TO(moe_activation,act_start);
+            JB_TICK(hidden_qdq_start);dg_nvfp4_qdq(qh,hid,ne,DG_MOE,m->nv_a2[l]);JB_TO(moe_hidden_qdq,hidden_qdq_start);
+            JB_TICK(down_start);dg_nvfp4_mm(v->wd,v->sd,v->gd,qh,eo,ne,DG_H,DG_MOE);JB_TO(moe_down,down_start);free(qh);
         }else{const uint8_t*gp=eg->data+(uint64_t)e*1408*DG_H*2,*dp=ed->data+(uint64_t)e*DG_H*DG_MOE*2;dg_mm_data(gp,gather,gu,ne,1408,DG_H);for(int q=0;q<ne;q++)for(int i=0;i<DG_MOE;i++)hid[(size_t)q*DG_MOE+i]=dg_gelu(gu[(size_t)q*1408+i])*gu[(size_t)q*1408+DG_MOE+i];dg_mm_data(dp,hid,eo,ne,DG_H,DG_MOE);}
         for(int q=0;q<ne;q++){int t=owner[q*2],k=owner[q*2+1];float wt=tw[(size_t)t*DG_TOPK+k],*dst=contrib+((size_t)t*DG_TOPK+k)*DG_H,*src=eo+(size_t)q*DG_H;for(int i=0;i<DG_H;i++)dst[i]=wt*src[i];}}
     JB_TO(experts,expert_start); JB_TICK(ff_tail_start);
@@ -1355,7 +1363,9 @@ static int dg_systemone(DGModel*m,DGTokenizer*tok,const char*j,size_t len,const 
         for(int x=0;x<nq;x++){double*pr=xmalloc((size_t)w[x].nc*sizeof*pr);normalize_scores(sc[x],w[x].nc,pr);for(int c=0;c<w[x].nc;c++)w[x].prob[c]+=pr[c];free(pr);free(sc[x]);}free(sc);candidate_ns+=now_ns()-cs;free(h);reads++;if(!requested&&r==0){auto_all=max_entropy>.1;if(!auto_all)break;}}
     dg_free_kv(kv);for(int x=0;x<nq;x++)for(int c=0;c<w[x].nc;c++)w[x].prob[c]/=reads;double cand_ms=candidate_ns/1e6,ms=(now_ns()-start)/1e6;uint32_t billed=pt.n*(requested?reads:1);dg_print_answers(qj,qt,qnt,w,nq,line_id?line_id:reqid,billed,ms,prefill_ns/1e6,cand_ms,reads);
 #ifdef JB_PROFILE
-    fprintf(stderr,"JB_PROFILE attention=%.3f dense=%.3f router=%.3f experts=%.3f ff_other=%.3f total=%.3f\n",jb_profile.attention/1e6,jb_profile.dense/1e6,jb_profile.router/1e6,jb_profile.experts/1e6,jb_profile.ff_other/1e6,ms);
+    uint64_t detailed=jb_profile.moe_input_qdq+jb_profile.moe_gate+jb_profile.moe_up+jb_profile.moe_activation+jb_profile.moe_hidden_qdq+jb_profile.moe_down;
+    double moe_misc=(double)(jb_profile.experts>=detailed?jb_profile.experts-detailed:0)/1e6;
+    fprintf(stderr,"JB_PROFILE attention=%.3f dense=%.3f router=%.3f experts=%.3f moe_input_qdq=%.3f moe_gate=%.3f moe_up=%.3f moe_activation=%.3f moe_hidden_qdq=%.3f moe_down=%.3f moe_misc=%.3f ff_other=%.3f total=%.3f\n",jb_profile.attention/1e6,jb_profile.dense/1e6,jb_profile.router/1e6,jb_profile.experts/1e6,jb_profile.moe_input_qdq/1e6,jb_profile.moe_gate/1e6,jb_profile.moe_up/1e6,jb_profile.moe_activation/1e6,jb_profile.moe_hidden_qdq/1e6,jb_profile.moe_down/1e6,moe_misc,jb_profile.ff_other/1e6,ms);
 #endif
     fflush(stdout);for(int x=0;x<nq;x++){for(int i=0;i<w[x].nc;i++){free(w[x].cand[i]);free(w[x].label[i]);}free(w[x].cand);free(w[x].label);free(w[x].kind);free(w[x].prob);free(ids[x]);}free(ids);free(slot);free(canvas);free(base.v);free(pt.v);free(text);free(ans);free(zero);free(prompt);free(sys);free(w);free(state);free(reqid);if(qowned){free(qt);free(qowned);}free(t);return 0;
 }

@@ -86,7 +86,9 @@ $ ./jb --selftest
 
 For operation-level profiling, add `-DJB_PROFILE`. Each request then emits one
 timing line to standard error for attention, dense FFN, routing, MoE experts,
-and remaining FFN work. Normal JSONL on standard output is unchanged.
+expert input/hidden QDQ, gate/up/down projections, expert activation and
+miscellaneous expert work, and remaining FFN work. Normal JSONL on standard
+output is unchanged.
 
 ## Use
 
