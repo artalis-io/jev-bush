@@ -1,0 +1,86 @@
+{
+  "schema_version": 1,
+  "dataset": {
+    "id": "LocalLLaMA/typed-decisions",
+    "revision": "ea9306458d6e9563628369a3d1e72e362fb381d2",
+    "config": "all",
+    "split": "test",
+    "rows": 400,
+    "decisions": 2000,
+    "sha256": "78ed4c464597e1334315d1b2b432d2911fa158733658c1c6500d1e5fe9dad8b7"
+  },
+  "implementations": {
+    "jev_bush_commit": "e1cf20f126bdf28c944bedbafdd56f32923f57ba",
+    "openjev_commit": "91d5005",
+    "vllm_commit": "9bbf7418"
+  },
+  "quality_runs": [
+    {
+      "engine": "jev-bush",
+      "checkpoint": "BF16",
+      "read_policy": "one",
+      "accuracy": 0.674,
+      "soft_cross_entropy": 1.6134,
+      "brier": 0.335,
+      "ece": 0.2523,
+      "score_mae": 0.4394
+    },
+    {
+      "engine": "openjev",
+      "checkpoint": "NVFP4",
+      "read_policy": "one",
+      "accuracy": 0.666,
+      "soft_cross_entropy": 1.4747,
+      "brier": 0.3205,
+      "ece": 0.2446,
+      "score_mae": 0.446
+    },
+    {
+      "engine": "openjev",
+      "checkpoint": "NVFP4",
+      "read_policy": "automatic",
+      "accuracy": 0.668,
+      "soft_cross_entropy": 1.394,
+      "brier": 0.3107,
+      "ece": 0.2352,
+      "score_mae": 0.4404
+    },
+    {
+      "engine": "jev-bush",
+      "checkpoint": "NVFP4",
+      "read_policy": "one",
+      "accuracy": 0.661,
+      "soft_cross_entropy": 1.5476,
+      "brier": 0.3268,
+      "ece": 0.254,
+      "score_mae": 0.4421
+    }
+  ],
+  "agreement": {
+    "systems": ["jev-bush NVFP4 one read", "openjev NVFP4 one read"],
+    "argmax": 0.927,
+    "mean_candidate_distribution_total_variation": 0.0765
+  },
+  "performance": {
+    "jev_bush": {
+      "hardware": "64-core Threadripper 9980X",
+      "workers": 2,
+      "threads_per_worker": 32,
+      "mean_seconds_per_row": 10.11,
+      "p95_seconds_per_row": 15.03,
+      "prefill_tokens_per_second_per_worker": 65.6,
+      "decisions_per_second_per_worker": 0.495,
+      "resident_memory_gb_per_process": 14.8,
+      "candidate_projection_ms_per_decision": 0.026
+    },
+    "openjev": {
+      "hardware": "NVIDIA RTX PRO 6000 Blackwell",
+      "read_policy": "one",
+      "mean_ms_per_row": 54.2
+    }
+  },
+  "notes": [
+    "Compiler identity and exact benchmark date were not recorded.",
+    "See README.md for the reproduction commands and interpretation boundaries."
+  ]
+}

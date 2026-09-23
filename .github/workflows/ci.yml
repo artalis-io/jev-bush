@@ -1,0 +1,38 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  selftest:
+    name: Selftest (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure MSVC
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Build and test
+        if: runner.os != 'Windows'
+        run: |
+          cc -O2 -std=c11 -Wall -Wextra -pedantic jb.c -lm -o jb
+          ./jb --selftest
+
+      - name: Build and test
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          cl /nologo /O2 /std:c11 /W4 /Fe:jb.exe jb.c
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          .\jb.exe --selftest

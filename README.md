@@ -16,10 +16,16 @@ standard library; OpenMP is optional.
 Jev Bush tests whether bounded probabilistic decisions can be extracted
 directly from a diffusion language model without autoregressive generation or
 structured-output parsing, and whether the resulting distributions remain
-comparable to the reference GPU implementation.
+comparable to the reference GPU implementation. On the pinned public benchmark,
+its strongest run reaches 67.40% accuracy, 5.3 percentage points behind Jev
+1.13.0's published 72.70% on the same 2,000 decisions. That establishes
+comparable argmax decision quality on this benchmark, not model equivalence.
 
-```text
-OpenJev request → tokenize/template → encoder prefill → cached K/V → diffusion answer canvas → candidate logits → softmax → typed probabilities
+```mermaid
+flowchart LR
+    R[OpenJev request] --> T[tokenize / template] --> P[encoder prefill]
+    P --> K[cached K/V] --> C[diffusion answer canvas]
+    C --> L[candidate logits] --> S[softmax] --> O[typed probabilities]
 ```
 
 ## Project goals
@@ -65,7 +71,12 @@ Windows with MSYS2/MinGW-w64:
 gcc -O3 -std=c11 -Wall -Wextra -pedantic -fopenmp jb.c -lm -o jb.exe
 ```
 
-Run the dependency-free tests with `./jb --selftest`.
+Run the dependency-free smoke test without downloading a model:
+
+```console
+$ ./jb --selftest
+{"selftest":"ok"}
+```
 
 ## Use
 
@@ -73,6 +84,11 @@ Run the dependency-free tests with `./jb --selftest`.
 ./jb MODEL_DIR decide request.json
 ./jb MODEL_DIR eval requests.jsonl
 ```
+
+[`examples/request.json`](examples/request.json) is a small request spanning
+all three decision types. Its response has the structure shown in
+[`examples/response-shape.json`](examples/response-shape.json); probabilities
+and timings depend on the checkpoint and read policy.
 
 `MODEL_DIR` is either the public `google/diffusion-gemma-26b-it` BF16
 checkpoint or NVIDIA's NVFP4 variant. It must contain `config.json`,
@@ -168,6 +184,10 @@ on the measured 64-core Threadripper 9980X, 48 threads was best.
 
 ## Established results
 
+The dataset hash, implementation commits, hardware, quality results, agreement,
+and timing measurements are also recorded in machine-readable form in
+[`benchmarks/established-results.json`](benchmarks/established-results.json).
+
 The trusted reference is OpenJev commit `91d5005` with patched vLLM commit
 `9bbf7418`:
 
@@ -177,6 +197,25 @@ The trusted reference is OpenJev commit `91d5005` with patched vLLM commit
 | OpenJev NVFP4, one read | 66.60% | 1.4747 | 0.3205 | 0.2446 | 0.4460 |
 | OpenJev NVFP4, automatic reads | 66.80% | **1.3940** | **0.3107** | **0.2352** | 0.4404 |
 | Jev Bush NVFP4, one read | 66.10% | 1.5476 | 0.3268 | 0.2540 | 0.4421 |
+
+### Why this matters
+
+The result is striking: a compact repository centered on one C file, with no
+runtime dependencies and CPU-only inference, lands just 5.3 accuracy points
+behind the flagship model of
+[a startup that raised $40 million](https://www.theregister.com/2026/09/16/typesafe_ai_debuts_model_for_machines/)
+on the same 2,000 decisions. The benchmark's
+[published Jev 1.13.0 result](https://huggingface.co/datasets/LocalLLaMA/typed-decisions/blob/main/README.md#baseline-results)
+is 72.70%, compared with Jev Bush BF16 at 67.40%.
+
+The caveat matters: Jev Bush does not reproduce Jev's training, calibration,
+latency, generality, or production service. It does not establish matching
+distributional fidelity either: Jev's model and training are undisclosed, and
+no raw Jev predictions were compared by this repository's scorer. Even with
+those limits, the result suggests that a meaningful part of the decision-model
+advantage comes from the interface and inference method: bound the answer
+space, read candidate logits directly, avoid autoregressive prose and JSON,
+and share the expensive context computation.
 
 Jev Bush NVFP4 and one-read OpenJev agree on 92.70% of 2,000 argmaxes; mean
 candidate-distribution total variation is 0.0765. The packed NVFP4 primitive

@@ -1,0 +1,51 @@
+{
+  "model": "jev-bush-diffusion-0.1.0",
+  "id": "example-ticket",
+  "answers": {
+    "is_billing": {
+      "type": "noul",
+      "noul": 0.98,
+      "probabilities": {
+        "true": 0.98,
+        "false": 0.02
+      },
+      "confidence": 0.858559457458179
+    },
+    "route": {
+      "type": "choice",
+      "choice": "billing",
+      "probabilities": {
+        "billing": 0.96,
+        "technical": 0.02,
+        "general": 0.02
+      },
+      "confidence": 0.821893458707085
+    },
+    "urgency": {
+      "type": "score",
+      "score": 1.0,
+      "legend": {
+        "0": "Routine; no stated deadline.",
+        "1": "Time-sensitive but not immediately harmful.",
+        "2": "Immediate action is needed to prevent material harm."
+      },
+      "probabilities": {
+        "0": 0.1,
+        "1": 0.8,
+        "2": 0.1
+      },
+      "confidence": 0.418328134282113
+    }
+  },
+  "usage": {
+    "input_tokens": 128,
+    "output_tokens": 0
+  },
+  "timing_ms": {
+    "total": 10000.0,
+    "prefill": 9500.0,
+    "decode": 499.9,
+    "candidates": 0.1,
+    "reads": 1
+  }
+}
