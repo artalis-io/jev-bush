@@ -1,6 +1,8 @@
 # Jev Bush
 
-> Jev Bush is a CPU-first probabilistic decision engine for DiffusionGemma.
+![Jev Bush robot mascot](jev-bush-mascot.png)
+
+> CPU-first probabilistic decisions for DiffusionGemma.
 >
 > Please clap.
 
@@ -8,6 +10,17 @@ Jev Bush evaluates bounded OpenJev decisions directly from DiffusionGemma's
 answer-slot logits. It never generates or parses free-form text. The engine is
 one C11 file, [`jb.c`](jb.c), with no runtime dependency beyond the C
 standard library; OpenMP is optional.
+
+## What this experiment establishes
+
+Jev Bush tests whether bounded probabilistic decisions can be extracted
+directly from a diffusion language model without autoregressive generation or
+structured-output parsing, and whether the resulting distributions remain
+comparable to the reference GPU implementation.
+
+```text
+OpenJev request → tokenize/template → encoder prefill → cached K/V → diffusion answer canvas → candidate logits → softmax → typed probabilities
+```
 
 ## Project goals
 
