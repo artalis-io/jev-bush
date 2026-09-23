@@ -778,6 +778,14 @@ static void dg_nvfp4_qdq(float*out,const float*in,int tokens,int cols,float base
         float s=dg_f8e4m3_round((amax/6)/base)*base;
         if(s==0){memset(y,0,16*sizeof*y);continue;}for(int k=0;k<16;k++)y[k]=dg_e2m1_round(x[k]/s)*s;
     }
+#if defined(__AVX512F__)
+    /* Match each packed weight byte: low-nibble activations, then high. This
+     * one-time swizzle removes two activation permutes per expert row/tile. */
+    for(int t=0;t<tokens;t++)for(int c=0;c<cols;c+=32){
+        float *y=out+(size_t)t*cols+c,tmp[32];memcpy(tmp,y,sizeof tmp);
+        for(int k=0;k<16;k++){y[k]=tmp[k*2];y[16+k]=tmp[k*2+1];}
+    }
+#endif
 }
 static void dg_nvfp4_mm(const DGTensor*w,const DGTensor*s,const DGTensor*g,
                         const float*x,float*y,int tokens,int rows,int cols){
@@ -787,9 +795,7 @@ static void dg_nvfp4_mm(const DGTensor*w,const DGTensor*s,const DGTensor*g,
     float global;memcpy(&global,g->data,4);
 #if defined(__AVX512F__)
     static const float lut[16]={0,.5f,1,1.5f,2,3,4,6,0,-.5f,-1,-1.5f,-2,-3,-4,-6};
-    static const int32_t even_i[16]={0,2,4,6,8,10,12,14,16,18,20,22,24,26,28,30};
-    static const int32_t odd_i[16]={1,3,5,7,9,11,13,15,17,19,21,23,25,27,29,31};
-    __m512 table=_mm512_loadu_ps(lut);__m512i even=_mm512_loadu_si512(even_i),odd=_mm512_loadu_si512(odd_i);
+    __m512 table=_mm512_loadu_ps(lut);
 #ifdef _OPENMP
 #pragma omp parallel for schedule(static)
 #endif
@@ -802,7 +808,7 @@ static void dg_nvfp4_mm(const DGTensor*w,const DGTensor*s,const DGTensor*g,
                 __m512 wh=_mm512_permutexvar_ps(_mm512_srli_epi32(raw,4),table);
                 float s0=dg_f8e4m3(sp[c/16])*global,s1=dg_f8e4m3(sp[c/16+1])*global;
                 __m512 sv=_mm512_mask_blend_ps(0xff00,_mm512_set1_ps(s0),_mm512_set1_ps(s1));wl=_mm512_mul_ps(wl,sv);wh=_mm512_mul_ps(wh,sv);
-                for(int q=0;q<nb;q++){const float*xp=x+(size_t)(tb+q)*cols+c;__m512 x0=_mm512_loadu_ps(xp),x1=_mm512_loadu_ps(xp+16);__m512 xe=_mm512_permutex2var_ps(x0,even,x1),xo=_mm512_permutex2var_ps(x0,odd,x1);acc[q]=_mm512_fmadd_ps(wl,xe,acc[q]);acc[q]=_mm512_fmadd_ps(wh,xo,acc[q]);}
+                for(int q=0;q<nb;q++){const float*xp=x+(size_t)(tb+q)*cols+c;acc[q]=_mm512_fmadd_ps(wl,_mm512_loadu_ps(xp),acc[q]);acc[q]=_mm512_fmadd_ps(wh,_mm512_loadu_ps(xp+16),acc[q]);}
             }
             for(int q=0;q<nb;q++)y[(size_t)(tb+q)*rows+r]=_mm512_reduce_add_ps(acc[q]);
         }

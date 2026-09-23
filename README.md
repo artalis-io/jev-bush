@@ -161,6 +161,11 @@ and about 14.8 GB resident memory per process. Candidate projection averaged
 6000 Blackwell averaged 54.2 ms per one-read row. Jev Bush is
 accuracy-competitive, but not yet close to GPU latency.
 
+The subsequent packed-activation kernel removes repeated even/odd lane
+permutations from every NVFP4 expert output row. Six paired compact runs were
+4.42% faster on average, and three paired 501-token runs were 4.06% faster,
+with byte-identical probabilities.
+
 Current limits are batch size one per process, 4,096 prompt tokens, a 64-token
 answer canvas, and one denoising step. The hypothesis is deliberately narrow:
 bounded typed decisions should read candidate logits instead of paying for
