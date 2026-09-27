@@ -59,6 +59,11 @@ results are reported below. Output records `"math":"fast"`; omit the flag for
 strict IEEE behavior and `"math":"strict"` output. Guards against NaN and
 infinity use bit-level tests, so they still hold under `-ffast-math`.
 
+Output also records `"kernels"`: `"avx512"` when the build targets AVX-512F
+and AVX-512DQ, otherwise `"scalar"`. The published throughput figures use the
+AVX-512 kernels; other CPUs run the portable scalar kernels, which are much
+slower.
+
 For deployments that accept requests from other processes or users, add the
 usual Linux hardening flags; they do not change results:
 
