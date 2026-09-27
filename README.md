@@ -128,6 +128,16 @@ expert input/hidden QDQ, gate/up/down projections, expert activation and
 miscellaneous expert work, and remaining FFN work. Normal JSONL on standard
 output is unchanged.
 
+Generate one-state/many-predicate scaling requests from any OpenJev row with:
+
+```sh
+python3 tools/make_predicate_benchmark.py request.jsonl predicates.jsonl --compact
+./jb MODEL_DIR eval predicates.jsonl
+```
+
+Without `--compact`, the source row's first full predicate and rubric are
+cloned. Compact mode isolates execution scaling from prompt-schema length.
+
 ## Use
 
 ```sh

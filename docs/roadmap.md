@@ -62,6 +62,29 @@ This is enough headroom to justify one exact integer-coded E2M1/VNNI prototype.
 Its go/no-go result must use uninstrumented end-to-end latency because detailed
 profiling adds about 0.8% overhead on the warm short request.
 
+The expanded profile accounts for all but 0.03 ms of a 7.40-second, 974-token,
+five-decision row. Experts consume 48.5%, attention 34.0%, dense FFN 10.1%,
+and remaining FFN work 5.6%. Q/K/V projections alone consume 18.6% of the
+complete row. Leave the AVX-512 arithmetic primitives unchanged until a later
+profile moves the limit.
+
+Physical-core scaling on the same row peaks at 32 threads:
+
+| threads | row seconds | decisions/s | prefill tokens/s |
+|---:|---:|---:|---:|
+| 8 | 13.73 | 0.364 | 74.0 |
+| 16 | 9.44 | 0.530 | 107.9 |
+| 24 | 7.96 | 0.628 | 128.1 |
+| 32 | **7.36** | **0.679** | **138.5** |
+| 40 | 8.26 | 0.606 | 123.4 |
+| 48 | 8.74 | 0.572 | 116.2 |
+| 56 | 9.06 | 0.552 | 112.0 |
+| 64 | 9.10 | 0.550 | 111.3 |
+
+Using both SMT threads (`128` threads with `OMP_PLACES=threads`) takes 84.22
+seconds, 11.4 times slower than 32 physical threads. Published runs must set
+thread count and placement explicitly.
+
 Every optimization must preserve byte-identical probabilities unless a change
 is explicitly presented and validated as a numerical experiment. Fast-math is
 the first such experiment: it changed distributions, matched OpenJev automatic-
@@ -69,7 +92,22 @@ read accuracy at 66.80%, and improved throughput, while slightly worsening log
 loss, Brier score, and score MAE. Benchmark strict and fast-math builds
 separately, and separate single-request latency from multi-worker throughput.
 
-## 2. Cache shared prompt-prefix K/V
+## 2. Batch predicates over one state
+
+The existing single-canvas path already demonstrates useful natural batching.
+With one fixed state and compact boolean predicates, 32 physical threads scale
+from 0.245 decisions/s at one predicate to 2.39 decisions/s at sixteen, a
+9.75x throughput gain for 16x the decisions. Total latency grows from 4.08 to
+6.70 seconds. A realistic long-rubric schema peaks at 0.66 decisions/s with
+eight predicates and begins falling at sixteen because prompt prefill grows.
+
+The current 64-token answer canvas fits at most 17 compact predicates; 18 are
+rejected. The next implementation milestone is one shared causal prefill
+followed by a microbatch of independent answer canvases. Benchmark canvas
+batches of 1, 2, 4, 8, and 16 and require semantic equality with the equivalent
+independently evaluated predicates.
+
+## 3. Cache shared prompt-prefix K/V
 
 First measure the exact shared-token prefix and potential hit rate for every
 benchmark row. Implement this only if the measured prefill fraction and shared
@@ -110,7 +148,7 @@ new time = old time - cached prefill time
 speedup  = old time / new time
 ```
 
-## 3. Microbatch independent rows
+## 4. Microbatch independent rows
 
 This is the highest-priority throughput experiment.
 
@@ -130,7 +168,7 @@ Measure:
 Batching is allowed to improve throughput while leaving latency unchanged or
 slightly worse. Do not present amortized decision time as request latency.
 
-## 4. Reuse request-independent work
+## 5. Reuse request-independent work
 
 Cache or precompute the inexpensive control-plane work only after measuring
 wall time separately from the current inference timer, which begins after
@@ -144,7 +182,7 @@ tokenization and template construction:
 Exact-result and semantic memoization are out of scope: neither accelerates the
 unique public evaluation rows, and both add state unrelated to model execution.
 
-## 5. Improve the CPU kernels
+## 6. Improve the CPU kernels
 
 Once profiles identify the expensive operations:
 
@@ -196,7 +234,7 @@ tiles, and routed-token grouping by expert. BF16 dot-product instructions were
 about 12% slower. Keep both rejected experiments out of the hot path unless a
 new profile changes their economics.
 
-## 6. Make benchmark comparisons auditable
+## 7. Make benchmark comparisons auditable
 
 Before publishing a faster number:
 

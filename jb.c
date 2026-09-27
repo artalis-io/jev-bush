@@ -52,7 +52,9 @@
 
 #ifdef JB_PROFILE
 typedef struct {
-    uint64_t attention, dense, router, experts, ff_other;
+    uint64_t layers, attention, attention_qkv, attention_prepare;
+    uint64_t attention_kv, attention_core, attention_output;
+    uint64_t dense, router, experts, ff_other, embedding, final_norm, kv_free;
     uint64_t moe_input_qdq, moe_gate, moe_up, moe_activation;
     uint64_t moe_hidden_qdq, moe_down;
 } JBProfile;
@@ -1198,6 +1200,7 @@ static void dg_norm_heads(float *x, int heads, int hd, DGTensor *scale) {
     for(int h=0;h<heads;h++)dg_rms(x+(size_t)h*hd,x+(size_t)h*hd,scale,hd);
 }
 static void dg_attention(DGModel *m, int l, float *x, int n, int pos0, DGKV *cache, int decoder) {
+    JB_TICK(qkv_start);
     int full = l % 6 == 5, hd = full ? 512 : 256, kvh = full ? 2 : 8;
     int qn = DG_HEADS * hd, kn = kvh * hd;
     DGTensor *qw = dg_layer_tensor(m,l,"self_attn.q_proj.weight");
@@ -1209,6 +1212,7 @@ static void dg_attention(DGModel *m, int l, float *x, int n, int pos0, DGKV *cac
     dg_mm(qw,x,q,n,qn,DG_H);
     dg_mm(kw,x,k,n,kn,DG_H);
     if(vw)dg_mm(vw,x,v,n,kn,DG_H);else memcpy(v,k,(size_t)n*kn*4);
+    JB_TO(attention_qkv,qkv_start); JB_TICK(prepare_start);
     int half=hd/2,rotated=full?64:half;float inv[256];
     for(int i=0;i<half;i++)inv[i]=i<rotated?powf(full?1000000.0f:10000.0f,-(float)(2*i)/hd):0.0f;
 #ifdef _OPENMP
@@ -1222,6 +1226,7 @@ static void dg_attention(DGModel *m, int l, float *x, int n, int pos0, DGKV *cac
         dg_rope(q+(size_t)t*qn,DG_HEADS,hd,cv,sv);
         dg_rope(k+(size_t)t*kn,kvh,hd,cv,sv);
     }
+    JB_TO(attention_prepare,prepare_start); JB_TICK(kv_start);
     int old = decoder && cache ? cache->n : 0;
     float *catk = k, *catv = v;
     if (old) {
@@ -1230,6 +1235,7 @@ static void dg_attention(DGModel *m, int l, float *x, int n, int pos0, DGKV *cac
         memcpy(catk+(size_t)old*kn,k,(size_t)n*kn*4); memcpy(catv+(size_t)old*kn,v,(size_t)n*kn*4);
     }
     float *a = xcalloc((size_t)n * qn, 4), *score = xmalloc((size_t)n*(old+n)*4);
+    JB_TO(attention_kv,kv_start); JB_TICK(core_start);
 #ifdef _OPENMP
 #pragma omp parallel for schedule(static)
 #endif
@@ -1252,8 +1258,10 @@ static void dg_attention(DGModel *m, int l, float *x, int n, int pos0, DGKV *cac
         float *oo=a+(size_t)t*qn+(size_t)h*hd;
         for(int j=start;j<end;j++){float p=expf(tscore[j]-mx)/den;const float *vv=catv+(size_t)j*kn+(size_t)kh*hd;for(int d=0;d<hd;d++)oo[d]+=p*vv[d];}
     }
+    JB_TO(attention_core,core_start); JB_TICK(output_start);
     DGTensor *ow=dg_layer_tensor(m,l,"self_attn.o_proj.weight");
     dg_mm(ow,a,x,n,DG_H,qn);
+    JB_TO(attention_output,output_start);
     if (!decoder && cache) { cache->k=k;cache->v=v;cache->n=n;k=v=NULL; }
     if(old){free(catk);free(catv);} free(q);free(k);free(v);free(a);free(score);
 }
@@ -1311,6 +1319,7 @@ static void dg_ff(DGModel *m, int l, float *x, int n) {
     JB_TO(ff_other,ff_tail_start);
 }
 static void dg_layer(DGModel *m,int l,float *x,int n,int pos0,DGKV *cache,int decoder){
+    JB_TICK(layer_start);
     DGTensor *in=dg_layer_tensor(m,l,"input_layernorm.weight"),*pa=dg_layer_tensor(m,l,"post_attention_layernorm.weight");
     float *res=xmalloc((size_t)n*DG_H*4),*z=xmalloc((size_t)n*DG_H*4);memcpy(res,x,(size_t)n*DG_H*4);
 #ifdef _OPENMP
@@ -1322,13 +1331,13 @@ static void dg_layer(DGModel *m,int l,float *x,int n,int pos0,DGKV *cache,int de
 #pragma omp parallel for schedule(static)
 #endif
     for(int t=0;t<n;t++){dg_rms(x+(size_t)t*DG_H,z+(size_t)t*DG_H,pa,DG_H);for(int i=0;i<DG_H;i++)x[(size_t)t*DG_H+i]+=res[(size_t)t*DG_H+i];}
-    dg_ff(m,l,x,n);float sc=dg_at(dg_layer_tensor(m,l,"layer_scalar"),0);for(size_t i=0;i<(size_t)n*DG_H;i++)x[i]*=sc;free(res);free(z);
+    dg_ff(m,l,x,n);float sc=dg_at(dg_layer_tensor(m,l,"layer_scalar"),0);for(size_t i=0;i<(size_t)n*DG_H;i++)x[i]*=sc;free(res);free(z);JB_TO(layers,layer_start);
 }
 static float *dg_embed(DGModel*m,const int*ids,int n,int decoder){DGTensor*w=dg_tensor(m,"model.decoder.embed_tokens.weight");float*x=xmalloc((size_t)n*DG_H*4);float scale=sqrtf(DG_H);for(int t=0;t<n;t++){for(int i=0;i<DG_H;i++)x[(size_t)t*DG_H+i]=dg_at(w,(uint64_t)ids[t]*DG_H+i)*scale;if(decoder)dg_rms(x+(size_t)t*DG_H,x+(size_t)t*DG_H,NULL,DG_H);}return x;}
 static void dg_final_norm(DGModel*m,float*x,int n){DGTensor*w=dg_tensor(m,"model.decoder.norm.weight");for(int t=0;t<n;t++)dg_rms(x+(size_t)t*DG_H,x+(size_t)t*DG_H,w,DG_H);}
-static void dg_prefill(DGModel*m,const int*prompt,int np,DGKV kv[DG_L]){float*enc=dg_embed(m,prompt,np,0);for(int l=0;l<DG_L;l++)dg_layer(m,l,enc,np,0,&kv[l],0);free(enc);}
-static float *dg_decode(DGModel*m,DGKV kv[DG_L],int np,const int*canvas,int nc){float*dec=dg_embed(m,canvas,nc,1);for(int l=0;l<DG_L;l++)dg_layer(m,l,dec,nc,np,&kv[l],1);dg_final_norm(m,dec,nc);return dec;}
-static void dg_free_kv(DGKV kv[DG_L]){for(int l=0;l<DG_L;l++){free(kv[l].k);free(kv[l].v);}}
+static void dg_prefill(DGModel*m,const int*prompt,int np,DGKV kv[DG_L]){JB_TICK(embed_start);float*enc=dg_embed(m,prompt,np,0);JB_TO(embedding,embed_start);for(int l=0;l<DG_L;l++)dg_layer(m,l,enc,np,0,&kv[l],0);free(enc);}
+static float *dg_decode(DGModel*m,DGKV kv[DG_L],int np,const int*canvas,int nc){JB_TICK(embed_start);float*dec=dg_embed(m,canvas,nc,1);JB_TO(embedding,embed_start);for(int l=0;l<DG_L;l++)dg_layer(m,l,dec,nc,np,&kv[l],1);JB_TICK(norm_start);dg_final_norm(m,dec,nc);JB_TO(final_norm,norm_start);return dec;}
+static void dg_free_kv(DGKV kv[DG_L]){JB_TICK(kv_free_start);for(int l=0;l<DG_L;l++){free(kv[l].k);free(kv[l].v);}JB_TO(kv_free,kv_free_start);}
 static char *jt_raw(const char *j, const JTok *t) {
     size_t n = (size_t)(t->end - t->start);
     char *z = xmalloc(n + 1);
@@ -1617,7 +1626,13 @@ static int dg_systemone(DGModel*m,DGTokenizer*tok,const char*j,size_t len,const 
 #ifdef JB_PROFILE
     uint64_t detailed=jb_profile.moe_input_qdq+jb_profile.moe_gate+jb_profile.moe_up+jb_profile.moe_activation+jb_profile.moe_hidden_qdq+jb_profile.moe_down;
     double moe_misc=(double)(jb_profile.experts>=detailed?jb_profile.experts-detailed:0)/1e6;
-    fprintf(stderr,"JB_PROFILE attention=%.3f dense=%.3f router=%.3f experts=%.3f moe_input_qdq=%.3f moe_gate=%.3f moe_up=%.3f moe_activation=%.3f moe_hidden_qdq=%.3f moe_down=%.3f moe_misc=%.3f ff_other=%.3f total=%.3f\n",jb_profile.attention/1e6,jb_profile.dense/1e6,jb_profile.router/1e6,jb_profile.experts/1e6,jb_profile.moe_input_qdq/1e6,jb_profile.moe_gate/1e6,jb_profile.moe_up/1e6,jb_profile.moe_activation/1e6,jb_profile.moe_hidden_qdq/1e6,jb_profile.moe_down/1e6,moe_misc,jb_profile.ff_other/1e6,ms);
+    uint64_t ad=jb_profile.attention_qkv+jb_profile.attention_prepare+jb_profile.attention_kv+jb_profile.attention_core+jb_profile.attention_output;
+    double attention_misc=(double)(jb_profile.attention>=ad?jb_profile.attention-ad:0)/1e6;
+    uint64_t ld=jb_profile.attention+jb_profile.dense+jb_profile.router+jb_profile.experts+jb_profile.ff_other;
+    double layer_other=(double)(jb_profile.layers>=ld?jb_profile.layers-ld:0)/1e6;
+    double accounted=jb_profile.layers/1e6+jb_profile.embedding/1e6+jb_profile.final_norm/1e6+jb_profile.kv_free/1e6+cand_ms;
+    double unaccounted=ms>accounted?ms-accounted:0;
+    fprintf(stderr,"JB_PROFILE attention=%.3f attention_qkv=%.3f attention_prepare=%.3f attention_kv=%.3f attention_core=%.3f attention_output=%.3f attention_misc=%.3f dense=%.3f router=%.3f experts=%.3f moe_input_qdq=%.3f moe_gate=%.3f moe_up=%.3f moe_activation=%.3f moe_hidden_qdq=%.3f moe_down=%.3f moe_misc=%.3f ff_other=%.3f layer_other=%.3f embedding=%.3f final_norm=%.3f kv_free=%.3f candidates=%.3f unaccounted=%.3f total=%.3f\n",jb_profile.attention/1e6,jb_profile.attention_qkv/1e6,jb_profile.attention_prepare/1e6,jb_profile.attention_kv/1e6,jb_profile.attention_core/1e6,jb_profile.attention_output/1e6,attention_misc,jb_profile.dense/1e6,jb_profile.router/1e6,jb_profile.experts/1e6,jb_profile.moe_input_qdq/1e6,jb_profile.moe_gate/1e6,jb_profile.moe_up/1e6,jb_profile.moe_activation/1e6,jb_profile.moe_hidden_qdq/1e6,jb_profile.moe_down/1e6,moe_misc,jb_profile.ff_other/1e6,layer_other,jb_profile.embedding/1e6,jb_profile.final_norm/1e6,jb_profile.kv_free/1e6,cand_ms,unaccounted,ms);
 #endif
     fflush(stdout);for(int x=0;x<nq;x++)free(ids[x]);free(ids);free(slot);free(canvas);free(base.v);free(pt.v);free(zero);free(prompt);free(sys);dg_questions_free(w,nq);dg_request_free(&rq);return 0;
 }
