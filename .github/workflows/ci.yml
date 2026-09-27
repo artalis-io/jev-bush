@@ -71,3 +71,30 @@ jobs:
         env:
           ASAN_OPTIONS: detect_leaks=0
         run: sh tools/check_requests.sh ./jb-asan
+
+  fuzz:
+    name: Fuzz JSON reader
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build
+        run: |
+          clang -g -O1 -fsanitize=fuzzer,address,undefined -fno-sanitize-recover=all \
+            fuzz/fuzz_json.c -lm -o fuzz_json
+
+      # New inputs go to the first (scratch) directory; the checked-in seeds
+      # stay read-only.
+      - name: Fuzz
+        run: |
+          mkdir -p corpus artifacts
+          ./fuzz_json -max_total_time=120 -max_len=16384 -dict=fuzz/json.dict \
+            -artifact_prefix=artifacts/ corpus fuzz/corpus
+
+      - name: Upload crashing inputs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-artifacts
+          path: artifacts/

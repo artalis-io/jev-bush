@@ -1,0 +1,32 @@
+{
+  "id": "example-ticket",
+  "state": "I was charged twice this month and need the duplicate reversed before Friday.",
+  "questions": {
+    "is_billing": {
+      "type": "noul",
+      "instructions": "This is a billing issue.",
+      "criteria": {
+        "true": "The request concerns a charge, invoice, payment, or refund.",
+        "false": "The request does not concern billing."
+      }
+    },
+    "route": {
+      "type": "choice",
+      "instructions": "Choose the team that should own this request.",
+      "criteria": {
+        "billing": "Handles charges, invoices, payments, and refunds.",
+        "technical": "Handles product failures and account access.",
+        "general": "Handles requests that fit neither specialist team."
+      }
+    },
+    "urgency": {
+      "type": "score",
+      "instructions": "Score how urgently the request needs action.",
+      "criteria": [
+        "Routine; no stated deadline.",
+        "Time-sensitive but not immediately harmful.",
+        "Immediate action is needed to prevent material harm."
+      ]
+    }
+  }
+}

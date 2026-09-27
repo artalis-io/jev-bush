@@ -99,6 +99,17 @@ and prompt construction) without a model. CI runs it under AddressSanitizer
 and UndefinedBehaviorSanitizer against the malformed requests in
 [`tools/check_requests.sh`](tools/check_requests.sh).
 
+[`fuzz/fuzz_json.c`](fuzz/fuzz_json.c) is a libFuzzer target for the JSON
+reader and request validation. Besides sanitizer findings, it checks that
+canonical JSON output re-parses to identical bytes. CI fuzzes it for two
+minutes per push:
+
+```sh
+clang -g -O1 -fsanitize=fuzzer,address,undefined -fno-sanitize-recover=all \
+  fuzz/fuzz_json.c -lm -o fuzz_json
+mkdir -p corpus && ./fuzz_json -max_len=16384 -dict=fuzz/json.dict corpus fuzz/corpus
+```
+
 For operation-level profiling, add `-DJB_PROFILE`. Each request then emits one
 timing line to standard error for attention, dense FFN, routing, MoE experts,
 expert input/hidden QDQ, gate/up/down projections, expert activation and

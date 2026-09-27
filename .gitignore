@@ -6,6 +6,14 @@
 /*.dSYM/
 /gmon.out
 /*.plist
+/fuzz_json
+/fuzz_json.exe
+/corpus/
+/artifacts/
+crash-*
+leak-*
+oom-*
+timeout-*
 
 # Models, generated evaluations, and numerical dumps
 /data/
