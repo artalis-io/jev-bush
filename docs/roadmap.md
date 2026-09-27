@@ -207,12 +207,12 @@ speedup  = old time / new time
 
 ## 4. Microbatch independent rows
 
-This is the highest-priority throughput experiment.
-
-Two processes currently stream the same weights independently. Add a small
-in-process microbatch so each weight tile can serve activations from several
-requests before leaving cache. Begin with batches of two and four and preserve
-each request's independent prompt length, seed, canvas, and output.
+Implemented as an opt-in strict-build experiment. `JB_MICROBATCH=1..16`
+groups consecutive exact-prefix hits with compatible schemas. Suffixes are
+padded only in the execution matrix; attention uses independent document
+boundaries, absolute positions, and useful lengths. Answer canvases likewise
+remain isolated. Dense projections operate over the flattened batch and MoE
+routing buckets selected tokens by expert across every document.
 
 Measure:
 
@@ -222,8 +222,27 @@ Measure:
 - scaling from one to two processes;
 - interaction with prefix-cache hits.
 
-Batching is allowed to improve throughput while leaving latency unchanged or
-slightly worse. Do not present amortized decision time as request latency.
+Five repeated batches at each size on the 32-thread Threadripper 9980X gave:
+
+| batch | batch latency ms | p95 ms | docs/s | predicates/s | scaling vs B=1 |
+|---:|---:|---:|---:|---:|---:|
+| 1 | 2200 | -- | 0.455 | 2.273 | 1.000x |
+| 2 | 4057 | 4084 | 0.493 | 2.465 | 1.085x |
+| 4 | 7992 | 8108 | **0.501** | **2.503** | **1.101x** |
+| 8 | 16128 | 16164 | 0.496 | 2.480 | 1.091x |
+
+All repeated-document outputs were byte-identical to B=1. A separate B=4
+run over eight different OpenJev documents was also 8/8 byte-identical to the
+sequential strict reference. B=4 is the measured sweet spot, but the 10.1%
+gain decisively rejects the hoped-for multi-x improvement and does not cross
+the 10 predicates/s research target.
+
+The reason is visible in the timings. B=4 suffix prefill took 3.72 seconds
+versus about 4 x 0.91 seconds sequential, while decode took 4.24 seconds versus
+about 4 x 1.25 seconds. Existing kernels already process token matrices and
+the AVX-512 NVFP4 path is compute-bound; adding documents supplies little new
+weight-traffic amortization. Keep microbatching opt-in rather than paying its
+latency and memory cost by default.
 
 ## 5. Reuse request-independent work
 

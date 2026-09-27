@@ -1292,6 +1292,48 @@ static void dg_attention(DGModel *m, int l, float *x, int n, int pos0, const DGK
     if(out){out->n=old+n;if(!old){out->k=k;out->v=v;k=v=NULL;}else{out->k=xmalloc((size_t)(old+n)*kn*4);out->v=xmalloc((size_t)(old+n)*kn*4);memcpy(out->k,cache->k,(size_t)old*kn*4);memcpy(out->v,cache->v,(size_t)old*kn*4);memcpy(out->k+(size_t)old*kn,k,(size_t)n*kn*4);memcpy(out->v+(size_t)old*kn,v,(size_t)n*kn*4);}}
     free(q);free(k);free(v);free(a);free(score);
 }
+/* Execute independent equal-stride sequences through one set of projections.
+ * Attention never crosses a segment boundary.  Suffix segments may have
+ * different useful lengths; padding is computed but never copied into K/V. */
+static void dg_attention_multi(DGModel*m,int l,float*x,int segments,int seq,
+                               const DGKV*const*cache,const int*lens,
+                               DGKV*out,int mode){
+    int n=segments*seq;JB_TICK(qkv_start);
+    int full=l%6==5,hd=full?512:256,kvh=full?2:8,qn=DG_HEADS*hd,kn=kvh*hd;
+    DGTensor*qw=dg_layer_tensor(m,l,"self_attn.q_proj.weight");
+    DGTensor*kw=dg_layer_tensor(m,l,"self_attn.k_proj.weight");
+    DGTensor*vw=full?NULL:dg_layer_tensor(m,l,"self_attn.v_proj.weight");
+    DGTensor*qnrm=dg_layer_tensor(m,l,"self_attn.q_norm.weight");
+    DGTensor*knrm=dg_layer_tensor(m,l,"self_attn.k_norm.weight");
+    float*q=xmalloc((size_t)n*qn*4),*k=xmalloc((size_t)n*kn*4),*v=xmalloc((size_t)n*kn*4);
+    dg_mm(qw,x,q,n,qn,DG_H);dg_mm(kw,x,k,n,kn,DG_H);if(vw)dg_mm(vw,x,v,n,kn,DG_H);else memcpy(v,k,(size_t)n*kn*4);
+    JB_TO(attention_qkv,qkv_start);JB_TICK(prepare_start);
+    int half=hd/2,rotated=full?64:half;float inv[256];for(int i=0;i<half;i++)inv[i]=i<rotated?powf(full?1000000.0f:10000.0f,-(float)(2*i)/hd):0;
+#ifdef _OPENMP
+    JB_OMP();
+#pragma omp parallel for schedule(static)
+#endif
+    for(int ti=0;ti<n;ti++){int s=ti/seq,t=ti%seq,pos=cache[s]->n+t;float cv[256],sv[256];for(int i=0;i<half;i++){cv[i]=cosf(pos*inv[i]);sv[i]=sinf(pos*inv[i]);}dg_norm_heads(q+(size_t)ti*qn,DG_HEADS,hd,qnrm);dg_norm_heads(k+(size_t)ti*kn,kvh,hd,knrm);dg_norm_heads(v+(size_t)ti*kn,kvh,hd,NULL);dg_rope(q+(size_t)ti*qn,DG_HEADS,hd,cv,sv);dg_rope(k+(size_t)ti*kn,kvh,hd,cv,sv);}
+    JB_TO(attention_prepare,prepare_start);JB_TICK(kv_start);
+    int maxold=0;for(int s=0;s<segments;s++)if(cache[s]->n>maxold)maxold=cache[s]->n;
+    float*a=xcalloc((size_t)n*qn,4),*score=xmalloc((size_t)n*(maxold+seq)*4);
+    JB_TO(attention_kv,kv_start);JB_TICK(core_start);
+#ifdef _OPENMP
+    JB_OMP();
+#pragma omp parallel for schedule(static)
+#endif
+    for(int ti=0;ti<n;ti++)for(int h=0;h<DG_HEADS;h++){
+        int s=ti/seq,t=ti%seq,old=cache[s]->n,kh=h/(DG_HEADS/kvh),end=mode==DG_CANVAS?old+seq:old+t+1,start=0;
+        if(!full){if(mode==DG_CANVAS){int pos=old+t;start=pos>=1024?pos-1024+1:0;if(end>pos+1024)end=pos+1024;}else start=end>1024?end-1024:0;}
+        float*ts=score+(size_t)ti*(maxold+seq),mx=-FLT_MAX;const float*qq=q+(size_t)ti*qn+(size_t)h*hd;
+        for(int j=start;j<end;j++){const float*kk=j<old?cache[s]->k+(size_t)j*kn+(size_t)kh*hd:k+((size_t)s*seq+j-old)*kn+(size_t)kh*hd;ts[j]=(float)dg_dot(qq,kk,hd);if(ts[j]>mx)mx=ts[j];}
+        float den=0;for(int j=start;j<end;j++)den+=expf(ts[j]-mx);float*oo=a+(size_t)ti*qn+(size_t)h*hd;
+        for(int j=start;j<end;j++){float p=expf(ts[j]-mx)/den;const float*vv=j<old?cache[s]->v+(size_t)j*kn+(size_t)kh*hd:v+((size_t)s*seq+j-old)*kn+(size_t)kh*hd;for(int d=0;d<hd;d++)oo[d]+=p*vv[d];}
+    }
+    JB_TO(attention_core,core_start);JB_TICK(output_start);DGTensor*ow=dg_layer_tensor(m,l,"self_attn.o_proj.weight");dg_mm(ow,a,x,n,DG_H,qn);JB_TO(attention_output,output_start);
+    if(out)for(int s=0;s<segments;s++){int old=cache[s]->n,keep=lens[s];out[s].n=old+keep;out[s].k=xmalloc((size_t)(old+keep)*kn*4);out[s].v=xmalloc((size_t)(old+keep)*kn*4);memcpy(out[s].k,cache[s]->k,(size_t)old*kn*4);memcpy(out[s].v,cache[s]->v,(size_t)old*kn*4);memcpy(out[s].k+(size_t)old*kn,k+(size_t)s*seq*kn,(size_t)keep*kn*4);memcpy(out[s].v+(size_t)old*kn,v+(size_t)s*seq*kn,(size_t)keep*kn*4);}
+    free(q);free(k);free(v);free(a);free(score);
+}
 static void dg_ff(DGModel *m, int l, float *x, int n) {
     JB_TICK(ff_start);
     DGTensor *pre=dg_layer_tensor(m,l,"pre_feedforward_layernorm.weight");
@@ -1366,11 +1408,28 @@ static void dg_layer(DGModel *m,int l,float *x,int n,int pos0,const DGKV *cache,
     for(int t=0;t<n;t++){dg_rms(x+(size_t)t*DG_H,z+(size_t)t*DG_H,pa,DG_H);for(int i=0;i<DG_H;i++)x[(size_t)t*DG_H+i]+=res[(size_t)t*DG_H+i];}
     dg_ff(m,l,x,n);float sc=dg_at(dg_layer_tensor(m,l,"layer_scalar"),0);for(size_t i=0;i<(size_t)n*DG_H;i++)x[i]*=sc;free(res);free(z);JB_TO(layers,layer_start);
 }
+static void dg_layer_multi(DGModel*m,int l,float*x,int segments,int seq,const DGKV*const*cache,const int*lens,DGKV*out,int mode){
+    int n=segments*seq;JB_TICK(layer_start);DGTensor*in=dg_layer_tensor(m,l,"input_layernorm.weight"),*pa=dg_layer_tensor(m,l,"post_attention_layernorm.weight");float*res=xmalloc((size_t)n*DG_H*4),*z=xmalloc((size_t)n*DG_H*4);memcpy(res,x,(size_t)n*DG_H*4);
+#ifdef _OPENMP
+    JB_OMP();
+#pragma omp parallel for schedule(static)
+#endif
+    for(int t=0;t<n;t++)dg_rms(z+(size_t)t*DG_H,x+(size_t)t*DG_H,in,DG_H);
+    JB_TICK(attention_start);dg_attention_multi(m,l,z,segments,seq,cache,lens,out,mode);JB_TO(attention,attention_start);
+#ifdef _OPENMP
+    JB_OMP();
+#pragma omp parallel for schedule(static)
+#endif
+    for(int t=0;t<n;t++){dg_rms(x+(size_t)t*DG_H,z+(size_t)t*DG_H,pa,DG_H);for(int i=0;i<DG_H;i++)x[(size_t)t*DG_H+i]+=res[(size_t)t*DG_H+i];}
+    dg_ff(m,l,x,n);float sc=dg_at(dg_layer_tensor(m,l,"layer_scalar"),0);for(size_t i=0;i<(size_t)n*DG_H;i++)x[i]*=sc;free(res);free(z);JB_TO(layers,layer_start);
+}
 static float *dg_embed(DGModel*m,const int*ids,int n,int decoder){DGTensor*w=dg_tensor(m,"model.decoder.embed_tokens.weight");float*x=xmalloc((size_t)n*DG_H*4);float scale=sqrtf(DG_H);for(int t=0;t<n;t++){for(int i=0;i<DG_H;i++)x[(size_t)t*DG_H+i]=dg_at(w,(uint64_t)ids[t]*DG_H+i)*scale;if(decoder)dg_rms(x+(size_t)t*DG_H,x+(size_t)t*DG_H,NULL,DG_H);}return x;}
 static void dg_final_norm(DGModel*m,float*x,int n){DGTensor*w=dg_tensor(m,"model.decoder.norm.weight");for(int t=0;t<n;t++)dg_rms(x+(size_t)t*DG_H,x+(size_t)t*DG_H,w,DG_H);}
 static void dg_prefill(DGModel*m,const int*prompt,int np,DGKV kv[DG_L]){JB_TICK(embed_start);float*enc=dg_embed(m,prompt,np,0);JB_TO(embedding,embed_start);for(int l=0;l<DG_L;l++)dg_layer(m,l,enc,np,0,NULL,&kv[l],DG_CAUSAL,1);free(enc);}
 static void dg_prefill_suffix(DGModel*m,const int*token,int n,const DGKV prefix[DG_L],DGKV kv[DG_L]){JB_TICK(embed_start);float*x=dg_embed(m,token,n,0);JB_TO(embedding,embed_start);for(int l=0;l<DG_L;l++)dg_layer(m,l,x,n,prefix[l].n,&prefix[l],&kv[l],DG_SUFFIX,1);free(x);}
 static float *dg_decode(DGModel*m,DGKV kv[DG_L],int np,const int*canvas,int nc,int batch){JB_TICK(embed_start);float*dec=dg_embed(m,canvas,nc*batch,1);JB_TO(embedding,embed_start);for(int l=0;l<DG_L;l++)dg_layer(m,l,dec,nc*batch,np,&kv[l],NULL,DG_CANVAS,batch);JB_TICK(norm_start);dg_final_norm(m,dec,nc*batch);JB_TO(final_norm,norm_start);return dec;}
+static void dg_prefill_suffix_multi(DGModel*m,const int*token,const int*lens,int batch,int seq,const DGKV prefix[DG_L],DGKV*kv){JB_TICK(embed_start);float*x=dg_embed(m,token,batch*seq,0);JB_TO(embedding,embed_start);const DGKV**cache=xmalloc((size_t)batch*sizeof*cache);DGKV*out=xmalloc((size_t)batch*sizeof*out);for(int l=0;l<DG_L;l++){for(int b=0;b<batch;b++)cache[b]=&prefix[l];dg_layer_multi(m,l,x,batch,seq,cache,lens,out,DG_SUFFIX);for(int b=0;b<batch;b++)kv[(size_t)b*DG_L+l]=out[b];}free(out);free(cache);free(x);}
+static float *dg_decode_multi(DGModel*m,DGKV*kv,const int*doc,int segments,int seq,const int*canvas){int n=segments*seq;JB_TICK(embed_start);float*x=dg_embed(m,canvas,n,1);JB_TO(embedding,embed_start);const DGKV**cache=xmalloc((size_t)segments*sizeof*cache);int*lens=xmalloc((size_t)segments*sizeof*lens);for(int s=0;s<segments;s++)lens[s]=seq;for(int l=0;l<DG_L;l++){for(int s=0;s<segments;s++)cache[s]=&kv[(size_t)doc[s]*DG_L+l];dg_layer_multi(m,l,x,segments,seq,cache,lens,NULL,DG_CANVAS);}free(lens);free(cache);JB_TICK(norm_start);dg_final_norm(m,x,n);JB_TO(final_norm,norm_start);return x;}
 static void dg_free_kv(DGKV kv[DG_L]){JB_TICK(kv_free_start);for(int l=0;l<DG_L;l++){free(kv[l].k);free(kv[l].v);}JB_TO(kv_free,kv_free_start);}
 static void dg_prefix_free(DGPrefixCache*c){if(!c)return;dg_free_kv(c->kv);free(c->schema);free(c->ids);memset(c,0,sizeof*c);}
 static char *jt_raw(const char *j, const JTok *t) {
@@ -1606,7 +1665,7 @@ static char *dg_system_prompt(const char *qj,JTok *qt,int qnt,DecisionWork*w,int
 }
 static char *dg_answer_text_range(DecisionWork*w,int total,int start,int count,const int*pick){DGBuf b={0};db_mem(&b,"",0);for(int z=0;z<count;z++){int i=start+z;if(z)db_ch(&b,total<=10?'\n':' ');db_fmt(&b,total<=10?"q%d: %s":"q%d%s",i+1,w[i].label[pick[i]]);}return b.p;}
 static char *dg_answer_text(DecisionWork*w,int nq,const int*pick){return dg_answer_text_range(w,nq,0,nq,pick);}
-static void dg_print_answers(const char*qj,JTok*qt,int qnt,DecisionWork*w,int nq,const char*id,uint32_t tokens,double ms,double prefill_ms,double cand_ms,int reads,int canvases,const char*cache_state,int cache_tokens,int processed_tokens){printf("{\"model\":\"jev-bush-diffusion-%s\",\"math\":\"%s\",\"kernels\":\"%s\",\"threads\":%d,",JB_VERSION,JB_MATH_MODE,JB_KERNELS,jb_threads());if(id){fputs("\"id\":",stdout);json_print_string(id);putchar(',');}fputs("\"answers\":{",stdout);for(int x=0;x<nq;x++){DecisionWork*d=&w[x];if(x)putchar(',');char*k=jt_string(qj,&qt[d->key]);json_print_string(k);free(k);fputs(":{\"type\":",stdout);json_print_string(d->kind);if(!strcmp(d->kind,"noul"))printf(",\"noul\":%.17g,\"probabilities\":{\"true\":%.17g,\"false\":%.17g},\"confidence\":%.17g",d->prob[0],d->prob[0],d->prob[1],confidence(d->prob,d->nc));else if(!strcmp(d->kind,"choice")){int top=0;for(int i=1;i<d->nc;i++)if(d->prob[i]>d->prob[top])top=i;fputs(",\"choice\":",stdout);json_print_string(d->cand[top]);fputs(",\"probabilities\":{",stdout);for(int i=0;i<d->nc;i++){if(i)putchar(',');json_print_string(d->cand[i]);printf(":%.17g",d->prob[i]);}printf("},\"confidence\":%.17g",confidence(d->prob,d->nc));}else{double ev=0;for(int i=0;i<d->nc;i++)ev+=i*d->prob[i];printf(",\"score\":%.17g,\"legend\":{",ev);int zc=0;for(int z=d->criteria+1;z<qnt;z++)if(qt[z].parent==d->criteria){printf("%s\"%d\":",zc?",":"",zc);zc++;json_print_token(qj,&qt[z]);}fputs("},\"probabilities\":{",stdout);for(int i=0;i<d->nc;i++)printf("%s\"%d\":%.17g",i?",":"",i,d->prob[i]);printf("},\"confidence\":%.17g",confidence(d->prob,d->nc));}putchar('}');}printf("},\"usage\":{\"input_tokens\":%u,\"output_tokens\":0,\"prefill_tokens\":%d},\"timing_ms\":{\"total\":%.3f,\"prefill\":%.3f,\"decode\":%.3f,\"candidates\":%.3f,\"reads\":%d,\"canvases\":%d,\"prefix_cache\":\"%s\",\"cache_tokens\":%d}}\n",tokens,processed_tokens,ms,prefill_ms,ms-prefill_ms-cand_ms,cand_ms,reads,canvases,cache_state,cache_tokens);}
+static void dg_print_answers(const char*qj,JTok*qt,int qnt,DecisionWork*w,int nq,const char*id,uint32_t tokens,double ms,double prefill_ms,double cand_ms,int reads,int canvases,const char*cache_state,int cache_tokens,int processed_tokens,int microbatch){printf("{\"model\":\"jev-bush-diffusion-%s\",\"math\":\"%s\",\"kernels\":\"%s\",\"threads\":%d,",JB_VERSION,JB_MATH_MODE,JB_KERNELS,jb_threads());if(id){fputs("\"id\":",stdout);json_print_string(id);putchar(',');}fputs("\"answers\":{",stdout);for(int x=0;x<nq;x++){DecisionWork*d=&w[x];if(x)putchar(',');char*k=jt_string(qj,&qt[d->key]);json_print_string(k);free(k);fputs(":{\"type\":",stdout);json_print_string(d->kind);if(!strcmp(d->kind,"noul"))printf(",\"noul\":%.17g,\"probabilities\":{\"true\":%.17g,\"false\":%.17g},\"confidence\":%.17g",d->prob[0],d->prob[0],d->prob[1],confidence(d->prob,d->nc));else if(!strcmp(d->kind,"choice")){int top=0;for(int i=1;i<d->nc;i++)if(d->prob[i]>d->prob[top])top=i;fputs(",\"choice\":",stdout);json_print_string(d->cand[top]);fputs(",\"probabilities\":{",stdout);for(int i=0;i<d->nc;i++){if(i)putchar(',');json_print_string(d->cand[i]);printf(":%.17g",d->prob[i]);}printf("},\"confidence\":%.17g",confidence(d->prob,d->nc));}else{double ev=0;for(int i=0;i<d->nc;i++)ev+=i*d->prob[i];printf(",\"score\":%.17g,\"legend\":{",ev);int zc=0;for(int z=d->criteria+1;z<qnt;z++)if(qt[z].parent==d->criteria){printf("%s\"%d\":",zc?",":"",zc);zc++;json_print_token(qj,&qt[z]);}fputs("},\"probabilities\":{",stdout);for(int i=0;i<d->nc;i++)printf("%s\"%d\":%.17g",i?",":"",i,d->prob[i]);printf("},\"confidence\":%.17g",confidence(d->prob,d->nc));}putchar('}');}printf("},\"usage\":{\"input_tokens\":%u,\"output_tokens\":0,\"prefill_tokens\":%d},\"timing_ms\":{\"total\":%.3f,\"prefill\":%.3f,\"decode\":%.3f,\"candidates\":%.3f,\"reads\":%d,\"canvases\":%d,\"microbatch\":%d,\"prefix_cache\":\"%s\",\"cache_tokens\":%d}}\n",tokens,processed_tokens,ms,prefill_ms,ms-prefill_ms-cand_ms,cand_ms,reads,canvases,microbatch,cache_state,cache_tokens);}
 
 typedef struct {
     const char *j, *qj;
@@ -1636,6 +1695,22 @@ static DecisionWork *dg_questions(const DGRequest*r,char**choice_label,int*nq_ou
 static void dg_questions_free(DecisionWork*w,int nq){for(int x=0;x<nq;x++){for(int i=0;i<w[x].nc;i++){free(w[x].cand[i]);free(w[x].label[i]);}free(w[x].cand);free(w[x].label);free(w[x].kind);free(w[x].prob);}free(w);}
 static char *dg_answer_template(DecisionWork*w,int nq,const int*pick){char*a=dg_answer_text(w,nq,pick);DGBuf b={0};db_fmt(&b,"<|channel>thought\n<channel|>%s",a);free(a);return b.p;}
 static char *dg_answer_template_range(DecisionWork*w,int total,int start,int count,const int*pick){char*a=dg_answer_text_range(w,total,start,count,pick);DGBuf b={0};db_fmt(&b,"<|channel>thought\n<channel|>%s",a);free(a);return b.p;}
+
+typedef struct{
+    DGRequest rq;DecisionWork*w;int nq;uint32_t seed;char*sys,*pre,*prompt;Tokens pt;
+    int group_cap,groups,width,*slot,**ids,*canvas;DGCanvas*cv;
+    int requested,reads,max_reads,active;uint64_t candidate_ns;
+} DGJob;
+static void dg_job_prepare(DGJob*g,DGTokenizer*tok,const char*j,size_t len){
+    memset(g,0,sizeof*g);dg_request_parse(&g->rq,j,len);g->requested=g->rq.requested;g->seed=dg_request_seed(&g->rq);char*choice[128];int nc=dg_choice_inventory(tok,choice);if(nc!=128)die("cannot construct OpenJev choice labels");g->w=dg_questions(&g->rq,choice,&g->nq);for(int i=0;i<nc;i++)free(choice[i]);
+    g->sys=dg_system_prompt(g->rq.qj,g->rq.qt,g->rq.qnt,g->w,g->nq);DGBuf pre={0},pb={0};db_fmt(&pre,"<bos><|turn>system\n%s<turn|>\n<|turn>user\n",g->sys);g->pre=pre.p;db_fmt(&pb,"%s%s<turn|>\n<|turn>model\n",g->pre,g->rq.state);g->prompt=pb.p;if(strlen(g->prompt)>(size_t)JB_MAX_CTX*tok->maxlen)die("prompt exceeds DiffusionGemma context");g->pt=dgt_tokenize(tok,g->prompt);if(g->pt.n>JB_MAX_CTX)die("prompt exceeds DiffusionGemma context");
+    int*zero=xcalloc((size_t)g->nq,sizeof*zero);g->group_cap=g->nq<=16?g->nq:8;g->groups=(g->nq+g->group_cap-1)/g->group_cap;g->cv=xcalloc((size_t)g->groups,sizeof*g->cv);g->slot=xmalloc((size_t)g->nq*sizeof*g->slot);g->ids=xcalloc((size_t)g->nq,sizeof*g->ids);
+    for(int b=0;b<g->groups;b++){DGCanvas*c=&g->cv[b];c->start=b*g->group_cap;c->count=g->nq-c->start<g->group_cap?g->nq-c->start:g->group_cap;char*text=dg_answer_template_range(g->w,g->nq,c->start,c->count,zero);c->base=dgt_tokenize(tok,text);free(text);if(c->base.n+1>64)die("OpenJev answer template exceeds 64-token canvas");int cw=(int)(((c->base.n+1+15)/16)*16);if(cw>g->width)g->width=cw;
+        for(int x=c->start;x<c->start+c->count;x++){g->ids[x]=xmalloc((size_t)g->w[x].nc*sizeof**g->ids);g->slot[x]=-1;for(int q=1;q<g->w[x].nc;q++){int old=zero[x];zero[x]=q;char*a=dg_answer_template_range(g->w,g->nq,c->start,c->count,zero);Tokens v=dgt_tokenize(tok,a);free(a);zero[x]=old;if(v.n!=c->base.n)die("labels do not share one template slot");int diff=-1;for(uint32_t z=0;z<v.n;z++)if(v.v[z]!=c->base.v[z]){if(diff>=0)die("label changes more than one template token");diff=(int)z;}if(diff<0)die("duplicate label token");if(g->slot[x]>=0&&diff!=g->slot[x])die("labels do not share one template slot");g->slot[x]=diff;g->ids[x][q]=v.v[diff];free(v.v);}if(g->slot[x]<0)die("cannot resolve label slot");g->ids[x][0]=c->base.v[g->slot[x]];}}
+    if((uint64_t)g->width*g->groups>JB_MAX_CTX)die("batched answer canvases exceed DiffusionGemma context");
+    g->canvas=xcalloc((size_t)g->width*g->groups,sizeof*g->canvas);for(int x=0;x<g->nq;x++)memset(g->w[x].prob,0,(size_t)g->w[x].nc*sizeof*g->w[x].prob);g->max_reads=g->requested?g->requested:4;g->active=1;free(zero);
+}
+static void dg_job_free(DGJob*g){for(int x=0;x<g->nq;x++)free(g->ids[x]);for(int b=0;b<g->groups;b++)free(g->cv[b].base.v);free(g->cv);free(g->ids);free(g->slot);free(g->canvas);free(g->pt.v);free(g->prompt);free(g->pre);free(g->sys);dg_questions_free(g->w,g->nq);dg_request_free(&g->rq);memset(g,0,sizeof*g);}
 
 static int dg_systemone(DGModel*m,DGTokenizer*tok,const char*j,size_t len,const char*line_id,DGPrefixCache*prefix_cache){
 #ifdef JB_PROFILE
@@ -1681,7 +1756,7 @@ static int dg_systemone(DGModel*m,DGTokenizer*tok,const char*j,size_t len,const 
         uint64_t cs=now_ns();double max_entropy=0;double**sc=xmalloc((size_t)nq*sizeof*sc);for(int x=0;x<nq;x++)sc[x]=xmalloc((size_t)w[x].nc*sizeof**sc);
         if(!requested&&r==0){float*answer_h=xmalloc((size_t)nq*DG_H*sizeof*answer_h);int*label_n=xmalloc((size_t)nq*sizeof*label_n);for(int x=0;x<nq;x++){memcpy(answer_h+(size_t)x*DG_H,h+((size_t)(x/group_cap)*width+slot[x])*DG_H,DG_H*sizeof*answer_h);label_n[x]=w[x].nc;}max_entropy=dg_slot_logits_entropy(emb,answer_h,nq,ids,label_n,sc);free(label_n);free(answer_h);}else for(int x=0;x<nq;x++)for(int c=0;c<w[x].nc;c++){float z;dg_mv_slice(emb,(uint64_t)ids[x][c]*DG_H,h+((size_t)(x/group_cap)*width+slot[x])*DG_H,&z,1,DG_H);sc[x][c]=30*tanh(z/30);}
         for(int x=0;x<nq;x++){double*pr=xmalloc((size_t)w[x].nc*sizeof*pr);normalize_scores(sc[x],w[x].nc,pr);for(int c=0;c<w[x].nc;c++)w[x].prob[c]+=pr[c];free(pr);free(sc[x]);}free(sc);candidate_ns+=now_ns()-cs;free(h);reads++;if(!requested&&r==0){auto_all=max_entropy>.1;if(!auto_all)break;}}
-    dg_free_kv(kv);for(int x=0;x<nq;x++)for(int c=0;c<w[x].nc;c++)w[x].prob[c]/=reads;double cand_ms=candidate_ns/1e6,ms=(now_ns()-start)/1e6;uint32_t billed=pt.n*(requested?reads:1);dg_print_answers(qj,qt,qnt,w,nq,line_id?line_id:rq.reqid,billed,ms,prefill_ns/1e6,cand_ms,reads,groups,cache_state,cache_tokens,processed_tokens);
+    dg_free_kv(kv);for(int x=0;x<nq;x++)for(int c=0;c<w[x].nc;c++)w[x].prob[c]/=reads;double cand_ms=candidate_ns/1e6,ms=(now_ns()-start)/1e6;uint32_t billed=pt.n*(requested?reads:1);dg_print_answers(qj,qt,qnt,w,nq,line_id?line_id:rq.reqid,billed,ms,prefill_ns/1e6,cand_ms,reads,groups,cache_state,cache_tokens,processed_tokens,1);
 #ifdef JB_PROFILE
     uint64_t detailed=jb_profile.moe_input_qdq+jb_profile.moe_gate+jb_profile.moe_up+jb_profile.moe_activation+jb_profile.moe_hidden_qdq+jb_profile.moe_down;
     double moe_misc=(double)(jb_profile.experts>=detailed?jb_profile.experts-detailed:0)/1e6;
@@ -1695,18 +1770,44 @@ static int dg_systemone(DGModel*m,DGTokenizer*tok,const char*j,size_t len,const 
 #endif
     fflush(stdout);for(int x=0;x<nq;x++)free(ids[x]);for(int b=0;b<groups;b++)free(cv[b].base.v);free(cv);free(ids);free(slot);free(canvas);free(pt.v);free(zero);free(prompt);free(pre.p);free(sys);dg_questions_free(w,nq);dg_request_free(&rq);return 0;
 }
+/* Returns zero when the rows do not all hit the current exact schema entry;
+ * the caller then executes them sequentially, allowing normal cache replace. */
+static int dg_system_batch(DGModel*m,DGTokenizer*tok,char**row,size_t*len,int batch,DGPrefixCache*prefix){
+    if(batch<2||!prefix||!prefix->schema)return 0;
+    DGJob*g=xcalloc((size_t)batch,sizeof*g);int ok=1;
+    for(int b=0;b<batch;b++){dg_job_prepare(&g[b],tok,row[b],len[b]);if(strcmp(g[b].sys,prefix->schema)||prefix->n>(int)g[b].pt.n||memcmp(prefix->ids,g[b].pt.v,(size_t)prefix->n*sizeof*prefix->ids))ok=0;if(b&&(g[b].width!=g[0].width||g[b].groups!=g[0].groups||g[b].nq!=g[0].nq))ok=0;}
+    if((uint64_t)batch*g[0].groups*g[0].width>JB_MAX_CTX)ok=0;
+    if(!ok){for(int b=0;b<batch;b++)dg_job_free(&g[b]);free(g);return 0;}
+    int seq=0,*sl=xmalloc((size_t)batch*sizeof*sl);for(int b=0;b<batch;b++){sl[b]=(int)g[b].pt.n-prefix->n;if(sl[b]<1)die("schema prefix consumes complete prompt");if(sl[b]>seq)seq=sl[b];}
+    if((uint64_t)batch*seq>JB_MAX_CTX)die("microbatch suffix exceeds DiffusionGemma work limit");
+    int*st=xcalloc((size_t)batch*seq,sizeof*st);for(int b=0;b<batch;b++)memcpy(st+(size_t)b*seq,g[b].pt.v+prefix->n,(size_t)sl[b]*sizeof*st);DGKV*kv=xcalloc((size_t)batch*DG_L,sizeof*kv);uint64_t start=now_ns();dg_prefill_suffix_multi(m,st,sl,batch,seq,prefix->kv,kv);uint64_t prefill_ns=now_ns()-start;free(st);free(sl);
+    DGTensor*emb=dg_tensor(m,"model.decoder.embed_tokens.weight");int width=g[0].width,maxr=0;for(int b=0;b<batch;b++)if(g[b].max_reads>maxr)maxr=g[b].max_reads;
+    for(int r=0;r<maxr;r++){
+        int segments=0;for(int b=0;b<batch;b++)if(g[b].active&&r<g[b].max_reads)segments+=g[b].groups;if(!segments)break;
+        int*canvas=xcalloc((size_t)segments*width,sizeof*canvas),*doc=xmalloc((size_t)segments*sizeof*doc),*base=xmalloc((size_t)batch*sizeof*base);int at=0;
+        for(int b=0;b<batch;b++){base[b]=-1;if(!g[b].active||r>=g[b].max_reads)continue;base[b]=at;memset(g[b].canvas,0,(size_t)width*g[b].groups*sizeof*g[b].canvas);for(int q=0;q<g[b].groups;q++){memcpy(g[b].canvas+(size_t)q*width,g[b].cv[q].base.v,(size_t)g[b].cv[q].base.n*sizeof*g[b].canvas);g[b].canvas[(size_t)q*width+g[b].cv[q].base.n]=106;}DGMT rng;dg_mt_seed(&rng,g[b].seed+(uint32_t)r*7919u);for(int x=0;x<g[b].nq;x++)g[b].canvas[(size_t)(x/g[b].group_cap)*width+g[b].slot[x]]=(int)dg_mt_vocab(&rng);for(int q=0;q<g[b].groups;q++){memcpy(canvas+(size_t)at*width,g[b].canvas+(size_t)q*width,(size_t)width*sizeof*canvas);doc[at++]=b;}}
+        float*h=dg_decode_multi(m,kv,doc,segments,width,canvas);free(canvas);free(doc);
+        for(int b=0;b<batch;b++)if(base[b]>=0){uint64_t cs=now_ns();double entropy=0;double**sc=xmalloc((size_t)g[b].nq*sizeof*sc);for(int x=0;x<g[b].nq;x++)sc[x]=xmalloc((size_t)g[b].w[x].nc*sizeof**sc);
+            if(!g[b].requested&&r==0){float*ah=xmalloc((size_t)g[b].nq*DG_H*sizeof*ah);int*ln=xmalloc((size_t)g[b].nq*sizeof*ln);for(int x=0;x<g[b].nq;x++){memcpy(ah+(size_t)x*DG_H,h+((size_t)(base[b]+x/g[b].group_cap)*width+g[b].slot[x])*DG_H,DG_H*sizeof*ah);ln[x]=g[b].w[x].nc;}entropy=dg_slot_logits_entropy(emb,ah,g[b].nq,g[b].ids,ln,sc);free(ln);free(ah);}else for(int x=0;x<g[b].nq;x++)for(int c=0;c<g[b].w[x].nc;c++){float z;dg_mv_slice(emb,(uint64_t)g[b].ids[x][c]*DG_H,h+((size_t)(base[b]+x/g[b].group_cap)*width+g[b].slot[x])*DG_H,&z,1,DG_H);sc[x][c]=30*tanh(z/30);}
+            for(int x=0;x<g[b].nq;x++){double*pr=xmalloc((size_t)g[b].w[x].nc*sizeof*pr);normalize_scores(sc[x],g[b].w[x].nc,pr);for(int c=0;c<g[b].w[x].nc;c++)g[b].w[x].prob[c]+=pr[c];free(pr);free(sc[x]);}free(sc);g[b].candidate_ns+=now_ns()-cs;g[b].reads++;if(!g[b].requested&&r==0&&!((entropy>.1)))g[b].active=0;}
+        free(base);free(h);
+    }
+    uint64_t total_ns=now_ns()-start;for(int b=0;b<batch;b++){dg_free_kv(kv+(size_t)b*DG_L);for(int x=0;x<g[b].nq;x++)for(int c=0;c<g[b].w[x].nc;c++)g[b].w[x].prob[c]/=g[b].reads;uint32_t billed=g[b].pt.n*(g[b].requested?g[b].reads:1);dg_print_answers(g[b].rq.qj,g[b].rq.qt,g[b].rq.qnt,g[b].w,g[b].nq,g[b].rq.reqid,billed,total_ns/1e6,prefill_ns/1e6,g[b].candidate_ns/1e6,g[b].reads,g[b].groups,"hit",prefix->n,(int)g[b].pt.n-prefix->n,batch);dg_job_free(&g[b]);}
+    fflush(stdout);free(kv);free(g);return 1;
+}
 static int dg_decide_file(const char*dir,const char*path){size_t n;char*j=read_all(path,&n);DGModel m;DGTokenizer t;dg_load(&m,dir);dgt_load(&t,dir);int rc=dg_systemone(&m,&t,j,n,NULL,NULL);dgt_free(&t);dg_free(&m);free(j);return rc;}
+static void dg_eval_group(DGModel*m,DGTokenizer*t,char**row,size_t*len,int n,DGPrefixCache*cache){if(n>1&&dg_system_batch(m,t,row,len,n,cache))return;for(int i=0;i<n;i++)dg_systemone(m,t,row[i],len[i],NULL,cache);}
 static int dg_eval_file(const char*dir,const char*path){FILE*f=!strcmp(path,"-")?stdin:fopen(path,"rb");if(!f)die2("cannot open",path);
 #if defined(_WIN32)
     if(f==stdin&&_setmode(_fileno(stdin),_O_BINARY)<0)die("cannot set binary stdin");
 #endif
-    DGModel m;DGTokenizer t;DGPrefixCache cache={0};
+    DGModel m;DGTokenizer t;DGPrefixCache cache={0};int mb=1;const char*me=getenv("JB_MICROBATCH");if(me){char*e;long v=strtol(me,&e,10);if(*e||v<1||v>16)die("JB_MICROBATCH must be 1..16");mb=(int)v;}
 #ifdef __FAST_MATH__
     DGPrefixCache*cachep=NULL;
 #else
     DGPrefixCache*cachep=&cache;
 #endif
-    dg_load(&m,dir);dgt_load(&t,dir);char*line=NULL;size_t cap=0,n=0;int ch;while((ch=fgetc(f))!=EOF){if(ch=='\n'){while(n&&line[n-1]=='\r')n--;if(n)dg_systemone(&m,&t,line,n,NULL,cachep);n=0;continue;}if(n==cap){cap=cap?cap*2:4096;if(cap>JB_MAX_JSON)die("JSONL row too large");line=xrealloc(line,cap);}line[n++]=(char)ch;}if(ferror(f))die2("cannot read",path);while(n&&line[n-1]=='\r')n--;if(n)dg_systemone(&m,&t,line,n,NULL,cachep);free(line);if(f!=stdin)fclose(f);dg_prefix_free(&cache);dgt_free(&t);dg_free(&m);return 0;}
+    dg_load(&m,dir);dgt_load(&t,dir);char*line=NULL,**rows=xcalloc((size_t)mb,sizeof*rows);size_t cap=0,n=0,*lens=xcalloc((size_t)mb,sizeof*lens);int nr=0,ch;while((ch=fgetc(f))!=EOF){if(ch=='\n'){while(n&&line[n-1]=='\r')n--;if(n){rows[nr]=xmalloc(n);memcpy(rows[nr],line,n);lens[nr++]=n;if(nr==mb){dg_eval_group(&m,&t,rows,lens,nr,cachep);for(int i=0;i<nr;i++)free(rows[i]);nr=0;}}n=0;continue;}if(n==cap){cap=cap?cap*2:4096;if(cap>JB_MAX_JSON)die("JSONL row too large");line=xrealloc(line,cap);}line[n++]=(char)ch;}if(ferror(f))die2("cannot read",path);while(n&&line[n-1]=='\r')n--;if(n){rows[nr]=xmalloc(n);memcpy(rows[nr],line,n);lens[nr++]=n;}if(nr){dg_eval_group(&m,&t,rows,lens,nr,cachep);for(int i=0;i<nr;i++)free(rows[i]);}free(lens);free(rows);free(line);if(f!=stdin)fclose(f);dg_prefix_free(&cache);dgt_free(&t);dg_free(&m);return 0;}
 
 /* Validate a request without a model: JSON, request fields, questions, and
  * prompt construction. Choice labels use OpenJev's candidate order without

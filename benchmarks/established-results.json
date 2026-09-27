@@ -110,6 +110,21 @@
       "prefill_tokens_evaluated": [486, 592, 804, 1228, 2076, 7164, 27516],
       "validation": "256/256 answer objects byte-identical; first eight cache rows also byte-identical to independent monolithic strict runs"
     },
+    "microbatch": {
+      "hardware": "64-core Threadripper 9980X",
+      "threads": 32,
+      "math": "strict",
+      "documents": "repeated 486-token prompt with a 380-token cached prefix",
+      "decisions_per_document": 5,
+      "batches_measured": 5,
+      "batch": [1, 2, 4, 8],
+      "mean_batch_ms": [2199.97205, 4056.776, 7991.7678, 16127.8454],
+      "p95_batch_ms": [null, 4084.174, 8108.35, 16163.542],
+      "documents_per_second": [0.454551, 0.493002, 0.500515, 0.496037],
+      "predicates_per_second": [2.272756, 2.465012, 2.502575, 2.480183],
+      "throughput_scaling": [1.0, 1.084591, 1.101119, 1.091266],
+      "validation": "all repeated rows byte-identical to B=1; eight varying OpenJev rows at B=4 were 8/8 byte-identical to sequential strict output"
+    },
     "openjev": {
       "hardware": "NVIDIA RTX PRO 6000 Blackwell",
       "read_policy": "one",

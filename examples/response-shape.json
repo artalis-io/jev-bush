@@ -52,6 +52,7 @@
     "candidates": 0.1,
     "reads": 1,
     "canvases": 1,
+    "microbatch": 1,
     "prefix_cache": "off",
     "cache_tokens": 0
   }

@@ -60,7 +60,10 @@ suffix. `decide` is always monolithic. Output reports `prefix_cache` as
 `off`, `miss`, or `hit`, `cache_tokens`, and the number of tokens actually
 evaluated as `usage.prefill_tokens`.
 
-Linux, highest established uncached throughput:
+Strict arithmetic defines canonical Jev Bush semantics: reproducible output
+must not depend on batching or temporary-buffer shape.
+
+Linux, approximate highest-throughput experiment:
 
 ```sh
 cc -O3 -march=native -ffast-math -std=c11 -Wall -Wextra -pedantic \
@@ -165,6 +168,18 @@ cloned. Compact mode isolates execution scaling from prompt-schema length.
 ./jb MODEL_DIR decide request.json
 ./jb MODEL_DIR eval requests.jsonl
 ```
+
+Strict `eval` can microbatch consecutive exact-prefix hits in the same schema:
+
+```sh
+OMP_NUM_THREADS=32 JB_MICROBATCH=4 ./jb MODEL_DIR eval requests.jsonl
+```
+
+`JB_MICROBATCH` accepts `1..16` and defaults to `1`. Incompatible rows fall
+back to sequential execution. Attention remains isolated per document and per
+answer canvas, while dense projections, routing, and expert buckets span the
+batch. Output records the actual `microbatch` size. Prefix caching and
+microbatching remain disabled by the fast-math correctness boundary.
 
 [`examples/request.json`](examples/request.json) is a small request spanning
 all three decision types. Its response has the structure shown in
