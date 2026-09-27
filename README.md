@@ -56,7 +56,17 @@ cc -O3 -march=native -ffast-math -std=c11 -Wall -Wextra -pedantic \
 This is the evaluated high-throughput build. `-ffast-math` changes floating-
 point reduction and transcendental behavior; its full accuracy and calibration
 results are reported below. Output records `"math":"fast"`; omit the flag for
-strict IEEE behavior and `"math":"strict"` output.
+strict IEEE behavior and `"math":"strict"` output. Guards against NaN and
+infinity use bit-level tests, so they still hold under `-ffast-math`.
+
+For deployments that accept requests from other processes or users, add the
+usual Linux hardening flags; they do not change results:
+
+```sh
+cc -O3 -march=native -ffast-math -std=c11 -Wall -Wextra -pedantic \
+  -fstack-protector-strong -D_FORTIFY_SOURCE=3 -fPIE -pie \
+  -Wl,-z,relro,-z,now,-z,noexecstack -fopenmp jb.c -lm -o jb
+```
 
 Portable Linux or macOS:
 
@@ -83,6 +93,11 @@ Run the dependency-free smoke test without downloading a model:
 $ ./jb --selftest
 {"selftest":"ok"}
 ```
+
+`jb --check-request REQUEST.json` validates a request (JSON, fields, questions,
+and prompt construction) without a model. CI runs it under AddressSanitizer
+and UndefinedBehaviorSanitizer against the malformed requests in
+[`tools/check_requests.sh`](tools/check_requests.sh).
 
 For operation-level profiling, add `-DJB_PROFILE`. Each request then emits one
 timing line to standard error for attention, dense FFN, routing, MoE experts,
@@ -132,6 +147,14 @@ The input is OpenJev's System One request shape:
   }
 }
 ```
+
+Requests are rejected if they contain duplicate object keys, `\u0000`,
+nesting deeper than 256 levels, or a prompt longer than the 4096-token context.
+
+Request text is not a trust boundary. As in OpenJev, `state`, instructions and
+criteria are placed in the chat template and tokenized as one string, so
+special-token spellings such as `<turn|>` in request text become control
+tokens. Callers that pass third-party text should strip or escape them first.
 
 ## Decision semantics
 

@@ -36,3 +36,38 @@ jobs:
           cl /nologo /O2 /std:c11 /W4 /Fe:jb.exe jb.c
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           .\jb.exe --selftest
+
+  sanitizers:
+    name: ASan + UBSan (${{ matrix.math }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - math: strict
+            flags: ""
+          - math: fast
+            flags: "-ffast-math"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build
+        run: |
+          clang -O1 -g -std=c11 -Wall -Wextra -pedantic -Werror ${{ matrix.flags }} \
+            -fsanitize=address,undefined -fno-sanitize-recover=all \
+            -fno-omit-frame-pointer jb.c -lm -o jb-asan
+
+      - name: Selftest and valid request (leak-checked)
+        env:
+          ASAN_OPTIONS: detect_leaks=1
+        run: |
+          ./jb-asan --selftest
+          ./jb-asan --check-request examples/request.json
+
+      # Rejected requests exit through die() with allocations still live, so
+      # leak reports there are expected; memory errors still fail the run.
+      - name: Malformed requests
+        env:
+          ASAN_OPTIONS: detect_leaks=0
+        run: sh tools/check_requests.sh ./jb-asan
