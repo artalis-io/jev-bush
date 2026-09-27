@@ -14,7 +14,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        os: [ubuntu-latest, ubuntu-24.04-arm, macos-latest, windows-latest]
 
     steps:
       - uses: actions/checkout@v4
@@ -36,6 +36,42 @@ jobs:
           cl /nologo /O2 /std:c11 /W4 /Fe:jb.exe jb.c
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           .\jb.exe --selftest
+
+  # GitHub's x86 runners may lack AVX-512, so run those kernels under Intel's
+  # Software Development Emulator, pinned by URL and checksum.
+  avx512:
+    name: AVX-512 kernels under SDE (${{ matrix.math }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - math: strict
+            flags: ""
+          - math: fast
+            flags: "-ffast-math"
+    env:
+      SDE_URL: https://downloadmirror.intel.com/924984/sde-external-10.13.1-2026-07-28-lin.tar.xz
+      SDE_SHA256: 94e97d623fec54385686e1e7ba65ebc9941748c05ee451423948334892bf2b50
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install SDE
+        run: |
+          curl -sSfL -o sde.tar.xz "$SDE_URL"
+          echo "$SDE_SHA256  sde.tar.xz" | sha256sum -c -
+          mkdir sde && tar -xJf sde.tar.xz -C sde --strip-components=1
+
+      - name: Build
+        run: |
+          gcc -O2 -march=skylake-avx512 -std=c11 -Wall -Wextra -pedantic -Werror ${{ matrix.flags }} \
+            jb.c -lm -o jb-avx512
+          # Fail if the build silently fell back to the scalar kernels.
+          grep -q 'BF16 matmul (avx512)' jb-avx512
+
+      - name: Selftest
+        run: sde/sde64 -skx -- ./jb-avx512 --selftest
 
   sanitizers:
     name: ASan + UBSan (${{ matrix.math }})

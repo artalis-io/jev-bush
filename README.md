@@ -94,6 +94,13 @@ $ ./jb --selftest
 {"selftest":"ok"}
 ```
 
+The selftest also checks every compute kernel, both the portable reference and
+the one selected for the build, against a double-precision oracle on random
+data. CI runs it natively on x86-64 and ARM64, and under Intel's Software
+Development Emulator for the AVX-512 kernels. `jb --bench-kernels` reports
+kernel throughput at model shapes next to a memory-read baseline, for comparing
+builds and machines.
+
 `jb --check-request REQUEST.json` validates a request (JSON, fields, questions,
 and prompt construction) without a model. CI runs it under AddressSanitizer
 and UndefinedBehaviorSanitizer against the malformed requests in

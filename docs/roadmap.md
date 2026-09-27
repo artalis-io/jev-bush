@@ -162,6 +162,34 @@ Once profiles identify the expensive operations:
 Keep the scalar kernels as the correctness reference. Validate optimized
 primitives against them and against the existing PyTorch checks.
 
+### Machines without AVX-512
+
+Only the AVX-512 build has vectorized kernels; everything else, including
+Apple Silicon, Graviton, and AVX2-only x86, runs the portable reference
+kernels. `jb --bench-kernels` on a Ryzen 9 5950X (Zen 3, AVX2, 32 threads,
+`-O3 -march=native -ffast-math -fopenmp`, 35 GB/s measured streaming read):
+
+| Kernel | Tokens | GFLOP/s | Weight GB/s |
+|---|---:|---:|---:|
+| BF16 matmul, 4096 x 2816 | 1 | 26 | 26 |
+| | 8 | 129 | 16 |
+| | 64 | 85 | 1.3 |
+| | 256 | 74 | 0.3 |
+| NVFP4 experts, 128 x 704 x 2816 | 1 | 9 | 2.5 |
+| | 4 | 16 | 1.1 |
+| | 16 | 24 | 0.4 |
+| | 64 | 28 | 0.1 |
+
+Single-token BF16 already runs near memory bandwidth, though the 23 MB matrix
+partly fits the 64 MB L3, so that figure may be cache-assisted. Every multi-token case is
+compute-bound far below the CPU's roughly 1.9 TFLOP/s FP32 FMA peak, and the
+NVFP4 expert path, the largest share of model time in the profiles above,
+streams weights at under a tenth of the available bandwidth even for one token.
+AVX2 and NEON versions of the BF16 and NVFP4 kernels are the main opportunity.
+To keep strict builds byte-identical across ISAs, each should reproduce the
+AVX-512 kernels' 16-lane accumulation and reduction order rather than choose
+its own.
+
 Already completed: packed activation swizzling, two-output-row NVFP4 expert
 tiles, and routed-token grouping by expert. BF16 dot-product instructions were
 2.8% slower and introduced measurable drift; expert-parallel scheduling was
