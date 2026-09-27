@@ -116,6 +116,19 @@ at 32 predicates and 20.1% faster at 64. Both runs produce byte-identical
 probabilities to the isolated sequential-canvas reference; the established
 eight-row OpenJev regression is also byte-identical to the prior engine.
 
+The 64-predicate prompt contains 1,248 system/predicate tokens, 525 state
+tokens, and about 14 chat-boundary tokens. An experimental compact rendering
+removed 155 tokens and reduced latency by 10.4%, but failed the quality gate:
+on 120 decisions accuracy fell from 68.33% to 60.00%, Brier worsened from
+0.249 to 0.299, ECE from 0.178 to 0.286, and argmax agreement with the default
+prompt was only 77.5%. The compact prompt was removed.
+
+The same request enters 16,327 OpenMP regions, but an isolated 32-thread region
+launch benchmark puts their fixed floor near 100 ms, below 0.6% of request
+time; persistent teams would retain synchronization barriers. Likewise 19,071
+profiled allocations consume only 43 ms. Persistent OpenMP and reusable scratch
+storage are therefore rejected until a future profile shows a larger ceiling.
+
 ## 3. Cache shared prompt-prefix K/V
 
 First measure the exact shared-token prefix and potential hit rate for every

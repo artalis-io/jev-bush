@@ -57,13 +57,17 @@ typedef struct {
     uint64_t dense, router, experts, ff_other, embedding, final_norm, kv_free;
     uint64_t moe_input_qdq, moe_gate, moe_up, moe_activation;
     uint64_t moe_hidden_qdq, moe_down;
+    uint64_t prompt_tokens, system_tokens, state_tokens;
+    uint64_t omp_regions, alloc_calls, alloc_ns;
 } JBProfile;
 static JBProfile jb_profile;
 #define JB_TICK(name) uint64_t name = now_ns()
 #define JB_TO(field, name) (jb_profile.field += now_ns() - (name))
+#define JB_OMP() (jb_profile.omp_regions++)
 #else
 #define JB_TICK(name)
 #define JB_TO(field, name)
+#define JB_OMP()
 #endif
 
 typedef struct {
@@ -86,6 +90,7 @@ typedef struct {
     int *v;
     uint32_t n, cap;
 } Tokens;
+static uint64_t now_ns(void);
 static void die(const char *s) {
     fprintf(stderr, "jb: %s\n", s);
     exit(2);
@@ -95,13 +100,25 @@ static void die2(const char *a, const char *b) {
     exit(2);
 }
 static void *xmalloc(size_t n) {
+#ifdef JB_PROFILE
+    uint64_t start=now_ns();
+#endif
     void *p = malloc(n ? n : 1);
+#ifdef JB_PROFILE
+    jb_profile.alloc_ns+=now_ns()-start;jb_profile.alloc_calls++;
+#endif
     if (!p)
         die("out of memory");
     return p;
 }
 static void *xcalloc(size_t n, size_t z) {
+#ifdef JB_PROFILE
+    uint64_t start=now_ns();
+#endif
     void *p = calloc(n ? n : 1, z);
+#ifdef JB_PROFILE
+    jb_profile.alloc_ns+=now_ns()-start;jb_profile.alloc_calls++;
+#endif
     if (!p)
         die("out of memory");
     return p;
@@ -113,7 +130,13 @@ static char *xstrdup(const char *s) {
     return z;
 }
 static void *xrealloc(void *p, size_t n) {
+#ifdef JB_PROFILE
+    uint64_t start=now_ns();
+#endif
     p = realloc(p, n ? n : 1);
+#ifdef JB_PROFILE
+    jb_profile.alloc_ns+=now_ns()-start;jb_profile.alloc_calls++;
+#endif
     if (!p)
         die("out of memory");
     return p;
@@ -1012,6 +1035,7 @@ static void dg_nvfp4_mm_avx512(const uint8_t*wd,const uint8_t*sd,float global,co
     static const float lut[16]={0,.5f,1,1.5f,2,3,4,6,0,-.5f,-1,-1.5f,-2,-3,-4,-6};
     __m512 table=_mm512_loadu_ps(lut);
 #ifdef _OPENMP
+    JB_OMP();
 #pragma omp parallel for schedule(static)
 #endif
     for(int r=0;r<rows;r+=2){
@@ -1053,6 +1077,7 @@ static __m512 dg_bf16x16(const uint8_t *p){
 static void dg_mm_data_avx512(const uint8_t*data,const float*x,float*y,int tokens,int rows,int cols){
     if(rows%2)die("AVX-512 matrix row count must be even");
 #ifdef _OPENMP
+    JB_OMP();
 #pragma omp parallel for schedule(static)
 #endif
     for(int r=0;r<rows;r+=2){
@@ -1086,6 +1111,7 @@ static void dg_mm_data(const uint8_t*data,const float*x,float*y,int tokens,int r
 static void dg_mm(const DGTensor*w,const float*x,float*y,int tokens,int rows,int cols){if(w->nd!=2||w->shape[0]!=(uint64_t)rows||w->shape[1]!=(uint64_t)cols)die2("bad matrix shape",w->name);dg_mm_data(w->data,x,y,tokens,rows,cols);}
 static void dg_mv_slice(const DGTensor *w, uint64_t base, const float *x, float *y, int rows, int cols) {
 #ifdef _OPENMP
+    JB_OMP();
 #pragma omp parallel for schedule(static)
 #endif
     for (int r = 0; r < rows; r++) {
@@ -1217,6 +1243,7 @@ static void dg_attention(DGModel *m, int l, float *x, int n, int pos0, DGKV *cac
     for(int i=0;i<half;i++)inv[i]=i<rotated?powf(full?1000000.0f:10000.0f,-(float)(2*i)/hd):0.0f;
     int seq=n/batch;
 #ifdef _OPENMP
+    JB_OMP();
 #pragma omp parallel for schedule(static)
 #endif
     for (int t = 0; t < n; t++) {
@@ -1233,6 +1260,7 @@ static void dg_attention(DGModel *m, int l, float *x, int n, int pos0, DGKV *cac
     float *a = xcalloc((size_t)n * qn, 4), *score = xmalloc((size_t)n*(old+seq)*4);
     JB_TO(attention_kv,kv_start); JB_TICK(core_start);
 #ifdef _OPENMP
+    JB_OMP();
 #pragma omp parallel for schedule(static)
 #endif
     for (int ti=0;ti<n;ti++) for(int h=0;h<DG_HEADS;h++) {
@@ -1273,17 +1301,20 @@ static void dg_ff(DGModel *m, int l, float *x, int n) {
     DGTensor *p2=dg_layer_tensor(m,l,"post_feedforward_layernorm_2.weight"),*post=dg_layer_tensor(m,l,"post_feedforward_layernorm.weight");
     float *z1=xcalloc((size_t)n*DG_H,4),*g=xmalloc((size_t)n*DG_DENSE*4),*u=xmalloc((size_t)n*DG_DENSE*4),*d=xmalloc((size_t)n*DG_H*4),*z2=xmalloc((size_t)n*DG_H*4),*rin=xcalloc((size_t)n*DG_H,4),*route=xmalloc((size_t)n*128*4);
 #ifdef _OPENMP
+    JB_OMP();
 #pragma omp parallel for schedule(static)
 #endif
     for(int t=0;t<n;t++)dg_rms(z1+(size_t)t*DG_H,x+(size_t)t*DG_H,pre,DG_H);
     dg_mm(gw,z1,g,n,DG_DENSE,DG_H);dg_mm(uw,z1,u,n,DG_DENSE,DG_H);
 #ifdef _OPENMP
+    JB_OMP();
 #pragma omp parallel for schedule(static)
 #endif
     for(size_t i=0;i<(size_t)n*DG_DENSE;i++)g[i]=dg_gelu(g[i])*u[i];
     dg_mm(dw,g,d,n,DG_H,DG_DENSE);
     JB_TO(dense,ff_start); JB_TICK(router_start);
 #ifdef _OPENMP
+    JB_OMP();
 #pragma omp parallel for schedule(static)
 #endif
     for(int t=0;t<n;t++){float*r=x+(size_t)t*DG_H;dg_rms(d+(size_t)t*DG_H,d+(size_t)t*DG_H,p1,DG_H);dg_rms(z2+(size_t)t*DG_H,r,pre2,DG_H);dg_rms(rin+(size_t)t*DG_H,r,NULL,DG_H);for(int i=0;i<DG_H;i++)rin[(size_t)t*DG_H+i]*=dg_at(rs,i)/sqrtf(DG_H);}
@@ -1291,6 +1322,7 @@ static void dg_ff(DGModel *m, int l, float *x, int n) {
     for(size_t i=0;i<(size_t)n*128;i++)if(!jb_finitef(route[i]))die("non-finite DiffusionGemma router logits");
     int *top=xmalloc((size_t)n*DG_TOPK*sizeof*top);float*tw=xmalloc((size_t)n*DG_TOPK*4);
 #ifdef _OPENMP
+    JB_OMP();
 #pragma omp parallel for schedule(static)
 #endif
     for(int t=0;t<n;t++){
@@ -1320,11 +1352,13 @@ static void dg_layer(DGModel *m,int l,float *x,int n,int pos0,DGKV *cache,int de
     DGTensor *in=dg_layer_tensor(m,l,"input_layernorm.weight"),*pa=dg_layer_tensor(m,l,"post_attention_layernorm.weight");
     float *res=xmalloc((size_t)n*DG_H*4),*z=xmalloc((size_t)n*DG_H*4);memcpy(res,x,(size_t)n*DG_H*4);
 #ifdef _OPENMP
+    JB_OMP();
 #pragma omp parallel for schedule(static)
 #endif
     for(int t=0;t<n;t++) dg_rms(z+(size_t)t*DG_H,x+(size_t)t*DG_H,in,DG_H);
     JB_TICK(attention_start); dg_attention(m,l,z,n,pos0,cache,decoder,batch); JB_TO(attention,attention_start);
 #ifdef _OPENMP
+    JB_OMP();
 #pragma omp parallel for schedule(static)
 #endif
     for(int t=0;t<n;t++){dg_rms(x+(size_t)t*DG_H,z+(size_t)t*DG_H,pa,DG_H);for(int i=0;i<DG_H;i++)x[(size_t)t*DG_H+i]+=res[(size_t)t*DG_H+i];}
@@ -1616,6 +1650,9 @@ static int dg_systemone(DGModel*m,DGTokenizer*tok,const char*j,size_t len,const 
      * context; reject it before spending time on tokenization. */
     if(strlen(prompt)>(size_t)JB_MAX_CTX*tok->maxlen)die("prompt exceeds DiffusionGemma context");
     Tokens pt=dgt_tokenize(tok,prompt);if(pt.n>JB_MAX_CTX)die("prompt exceeds DiffusionGemma context");
+#ifdef JB_PROFILE
+    Tokens system_part=dgt_tokenize(tok,sys),state_part=dgt_tokenize(tok,rq.state);jb_profile.prompt_tokens=pt.n;jb_profile.system_tokens=system_part.n;jb_profile.state_tokens=state_part.n;free(system_part.v);free(state_part.v);
+#endif
     int*zero=xcalloc((size_t)nq,sizeof*zero),group_cap=nq<=16?nq:8,groups=(nq+group_cap-1)/group_cap,width=0;DGCanvas*cv=xcalloc((size_t)groups,sizeof*cv);int*slot=xmalloc((size_t)nq*sizeof*slot);int**ids=xcalloc((size_t)nq,sizeof*ids);
     for(int b=0;b<groups;b++){DGCanvas*c=&cv[b];c->start=b*group_cap;c->count=nq-c->start<group_cap?nq-c->start:group_cap;char*text=dg_answer_template_range(w,nq,c->start,c->count,zero);c->base=dgt_tokenize(tok,text);free(text);if(c->base.n+1>64)die("OpenJev answer template exceeds 64-token canvas");int cw=(int)(((c->base.n+1+15)/16)*16);if(cw>width)width=cw;
         for(int x=c->start;x<c->start+c->count;x++){ids[x]=xmalloc((size_t)w[x].nc*sizeof**ids);slot[x]=-1;for(int q=1;q<w[x].nc;q++){int old=zero[x];zero[x]=q;char*a=dg_answer_template_range(w,nq,c->start,c->count,zero);Tokens v=dgt_tokenize(tok,a);free(a);zero[x]=old;if(v.n!=c->base.n)die("labels do not share one template slot");int diff=-1;for(uint32_t z=0;z<v.n;z++)if(v.v[z]!=c->base.v[z]){if(diff>=0)die("label changes more than one template token");diff=(int)z;}if(diff<0)die("duplicate label token");if(slot[x]>=0&&diff!=slot[x])die("labels do not share one template slot");slot[x]=diff;ids[x][q]=v.v[diff];free(v.v);}if(slot[x]<0)die("cannot resolve label slot");ids[x][0]=c->base.v[slot[x]];}}
@@ -1640,7 +1677,7 @@ static int dg_systemone(DGModel*m,DGTokenizer*tok,const char*j,size_t len,const 
     double layer_other=(double)(jb_profile.layers>=ld?jb_profile.layers-ld:0)/1e6;
     double accounted=jb_profile.layers/1e6+jb_profile.embedding/1e6+jb_profile.final_norm/1e6+jb_profile.kv_free/1e6+cand_ms;
     double unaccounted=ms>accounted?ms-accounted:0;
-    fprintf(stderr,"JB_PROFILE attention=%.3f attention_qkv=%.3f attention_prepare=%.3f attention_kv=%.3f attention_core=%.3f attention_output=%.3f attention_misc=%.3f dense=%.3f router=%.3f experts=%.3f moe_input_qdq=%.3f moe_gate=%.3f moe_up=%.3f moe_activation=%.3f moe_hidden_qdq=%.3f moe_down=%.3f moe_misc=%.3f ff_other=%.3f layer_other=%.3f embedding=%.3f final_norm=%.3f kv_free=%.3f candidates=%.3f unaccounted=%.3f total=%.3f\n",jb_profile.attention/1e6,jb_profile.attention_qkv/1e6,jb_profile.attention_prepare/1e6,jb_profile.attention_kv/1e6,jb_profile.attention_core/1e6,jb_profile.attention_output/1e6,attention_misc,jb_profile.dense/1e6,jb_profile.router/1e6,jb_profile.experts/1e6,jb_profile.moe_input_qdq/1e6,jb_profile.moe_gate/1e6,jb_profile.moe_up/1e6,jb_profile.moe_activation/1e6,jb_profile.moe_hidden_qdq/1e6,jb_profile.moe_down/1e6,moe_misc,jb_profile.ff_other/1e6,layer_other,jb_profile.embedding/1e6,jb_profile.final_norm/1e6,jb_profile.kv_free/1e6,cand_ms,unaccounted,ms);
+    fprintf(stderr,"JB_PROFILE prompt_tokens=%llu system_tokens=%llu state_tokens=%llu omp_regions=%llu alloc_calls=%llu alloc_ms=%.3f attention=%.3f attention_qkv=%.3f attention_prepare=%.3f attention_kv=%.3f attention_core=%.3f attention_output=%.3f attention_misc=%.3f dense=%.3f router=%.3f experts=%.3f moe_input_qdq=%.3f moe_gate=%.3f moe_up=%.3f moe_activation=%.3f moe_hidden_qdq=%.3f moe_down=%.3f moe_misc=%.3f ff_other=%.3f layer_other=%.3f embedding=%.3f final_norm=%.3f kv_free=%.3f candidates=%.3f unaccounted=%.3f total=%.3f\n",(unsigned long long)jb_profile.prompt_tokens,(unsigned long long)jb_profile.system_tokens,(unsigned long long)jb_profile.state_tokens,(unsigned long long)jb_profile.omp_regions,(unsigned long long)jb_profile.alloc_calls,jb_profile.alloc_ns/1e6,jb_profile.attention/1e6,jb_profile.attention_qkv/1e6,jb_profile.attention_prepare/1e6,jb_profile.attention_kv/1e6,jb_profile.attention_core/1e6,jb_profile.attention_output/1e6,attention_misc,jb_profile.dense/1e6,jb_profile.router/1e6,jb_profile.experts/1e6,jb_profile.moe_input_qdq/1e6,jb_profile.moe_gate/1e6,jb_profile.moe_up/1e6,jb_profile.moe_activation/1e6,jb_profile.moe_hidden_qdq/1e6,jb_profile.moe_down/1e6,moe_misc,jb_profile.ff_other/1e6,layer_other,jb_profile.embedding/1e6,jb_profile.final_norm/1e6,jb_profile.kv_free/1e6,cand_ms,unaccounted,ms);
 #endif
     fflush(stdout);for(int x=0;x<nq;x++)free(ids[x]);for(int b=0;b<groups;b++)free(cv[b].base.v);free(cv);free(ids);free(slot);free(canvas);free(pt.v);free(zero);free(prompt);free(sys);dg_questions_free(w,nq);dg_request_free(&rq);return 0;
 }

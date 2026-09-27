@@ -125,8 +125,9 @@ mkdir -p corpus && ./fuzz_json -max_len=16384 -dict=fuzz/json.dict corpus fuzz/c
 For operation-level profiling, add `-DJB_PROFILE`. Each request then emits one
 timing line to standard error for attention, dense FFN, routing, MoE experts,
 expert input/hidden QDQ, gate/up/down projections, expert activation and
-miscellaneous expert work, and remaining FFN work. Normal JSONL on standard
-output is unchanged.
+miscellaneous expert work, remaining FFN work, prompt composition, OpenMP
+region count, and allocation time. Normal JSONL on standard output is
+unchanged.
 
 Generate one-state/many-predicate scaling requests from any OpenJev row with:
 
