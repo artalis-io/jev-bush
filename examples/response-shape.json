@@ -49,6 +49,7 @@
     "prefill": 9500.0,
     "decode": 499.9,
     "candidates": 0.1,
-    "reads": 1
+    "reads": 1,
+    "canvases": 1
   }
 }

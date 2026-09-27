@@ -101,11 +101,20 @@ from 0.245 decisions/s at one predicate to 2.39 decisions/s at sixteen, a
 6.70 seconds. A realistic long-rubric schema peaks at 0.66 decisions/s with
 eight predicates and begins falling at sixteen because prompt prefill grows.
 
-The current 64-token answer canvas fits at most 17 compact predicates; 18 are
-rejected. The next implementation milestone is one shared causal prefill
-followed by a microbatch of independent answer canvases. Benchmark canvas
-batches of 1, 2, 4, 8, and 16 and require semantic equality with the equivalent
-independently evaluated predicates.
+The former 64-token answer canvas fit at most 17 compact predicates. The
+multi-canvas path now preserves the single canvas for requests through sixteen
+decisions, then groups at most eight decisions per canvas. Every canvas shares
+one causal prompt K/V; matrix and FFN execution is flattened across canvases,
+while attention restricts each canvas to the shared prefix and its own answer
+tokens.
+
+At 32 predicates (four canvases), total latency is 10.95 seconds and throughput
+is 2.92 decisions/s. At 64 predicates (eight canvases), total latency is 16.68
+seconds, including 14.52 seconds of shared prefill and 2.17 seconds of decode,
+for 3.84 decisions/s. Batched decode is 18.7% faster than sequential canvases
+at 32 predicates and 20.1% faster at 64. Both runs produce byte-identical
+probabilities to the isolated sequential-canvas reference; the established
+eight-row OpenJev regression is also byte-identical to the prior engine.
 
 ## 3. Cache shared prompt-prefix K/V
 

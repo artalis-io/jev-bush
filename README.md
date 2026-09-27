@@ -202,6 +202,12 @@ Jev Bush reproduces OpenJev's bounded read:
 5. Normalize only the declared candidate logits:
    `p_i = exp(z_i - max(z)) / sum_j exp(z_j - max(z))`.
 
+Up to sixteen decisions retain the original single answer canvas. Larger
+requests are split into groups of at most eight and decoded as one microbatch:
+all canvases share the prompt K/V, while attention masks keep their answer
+tokens isolated from one another. Matrix and expert kernels see the flattened
+canvas batch and therefore reuse each streamed weight tile.
+
 Long choices use one-token labels rather than autoregressive string
 likelihoods. Boolean values map to `yes/no`, ordinal scores to decimal
 labels, and choices to stable alphabetic labels. Output contains every
@@ -306,8 +312,9 @@ OpenJev on an RTX PRO 6000 Blackwell averaged 54.2 ms per one-read row. That
 GPU comparison is context, not a target backend: Jev Bush is intentionally a
 CPU educational implementation.
 
-Current limits are batch size one per process, 4,096 prompt tokens, a 64-token
-answer canvas, and one denoising step. The hypothesis is deliberately narrow:
+Current limits are one request per process, 4,096 prompt tokens, 64 tokens per
+answer canvas, 4,096 total batched canvas tokens, and one denoising step. The
+hypothesis is deliberately narrow:
 bounded typed decisions should read candidate logits instead of paying for
 autoregressive JSON generation.
 
