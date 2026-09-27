@@ -16,8 +16,15 @@
 #include <string.h>
 #include <time.h>
 
-#if defined(__AVX512F__)
+#if defined(__AVX512F__) && defined(__AVX512DQ__)
+#define JB_AVX512 1
+#define JB_KERNELS "avx512"
 #include <immintrin.h>
+#else
+#define JB_KERNELS "scalar"
+#endif
+#ifdef _OPENMP
+#include <omp.h>
 #endif
 
 #if defined(_WIN32)
@@ -944,7 +951,11 @@ static float dg_e2m1_round(float x){
     for(int i=1;i<8;i++){float d=fabsf(a-q[i]),old=fabsf(a-q[best]);if(d<old||(d==old&&!(i&1)))best=i;}
     return signbit(x)?-q[best]:q[best];
 }
-static void dg_nvfp4_qdq(float*out,const float*in,int tokens,int cols,float base){
+/* Kernels come in pairs: a portable *_ref version that is always compiled and
+ * serves as the correctness reference, and an ISA-specific version selected
+ * at compile time. The selftest checks both against a double-precision
+ * oracle. */
+static void dg_nvfp4_qdq_ref(float*out,const float*in,int tokens,int cols,float base){
     if(!jb_finitef(base)||!(base>0)||cols%32)die("invalid NVFP4 activation scale");
     for(int t=0;t<tokens;t++)for(int b=0;b<cols/16;b++){
         const float*x=in+(size_t)t*cols+(size_t)b*16;float*y=out+(size_t)t*cols+(size_t)b*16,amax=0;
@@ -952,30 +963,50 @@ static void dg_nvfp4_qdq(float*out,const float*in,int tokens,int cols,float base
         float s=dg_f8e4m3_round((amax/6)/base)*base;
         if(s==0){memset(y,0,16*sizeof*y);continue;}for(int k=0;k<16;k++)y[k]=dg_e2m1_round(x[k]/s)*s;
     }
-#if defined(__AVX512F__)
-    /* Match each packed weight byte: low-nibble activations, then high. This
-     * one-time swizzle removes two activation permutes per expert row/tile. */
+}
+#if defined(JB_AVX512)
+/* Match each packed weight byte: low-nibble activations, then high. This
+ * one-time swizzle removes two activation permutes per expert row/tile. */
+static void dg_nvfp4_swizzle(float*out,int tokens,int cols){
     for(int t=0;t<tokens;t++)for(int c=0;c<cols;c+=32){
         float *y=out+(size_t)t*cols+c,tmp[32];memcpy(tmp,y,sizeof tmp);
         for(int k=0;k<16;k++){y[k]=tmp[k*2];y[16+k]=tmp[k*2+1];}
     }
+}
+#endif
+/* Produces the activation layout the selected dg_nvfp4_mm kernel expects. */
+static void dg_nvfp4_qdq(float*out,const float*in,int tokens,int cols,float base){
+    dg_nvfp4_qdq_ref(out,in,tokens,cols,base);
+#if defined(JB_AVX512)
+    dg_nvfp4_swizzle(out,tokens,cols);
 #endif
 }
-static void dg_nvfp4_mm(const DGTensor*w,const DGTensor*s,const DGTensor*g,
-                        const float*x,float*y,int tokens,int rows,int cols){
-    if(w->dtype!=DG_U8||w->nd!=2||w->shape[0]!=(uint64_t)rows||w->shape[1]!=(uint64_t)cols/2||
-       s->dtype!=DG_F8E4M3||s->nd!=2||s->shape[0]!=(uint64_t)rows||s->shape[1]!=(uint64_t)cols/16||
-       g->dtype!=DG_F32||g->nd!=0||g->bytes!=4||cols%32||rows%2)die2("bad NVFP4 expert tensor",w->name);
-    float global;memcpy(&global,g->data,4);
-#if defined(__AVX512F__)
+/* x in the dg_nvfp4_qdq_ref layout. */
+static void dg_nvfp4_mm_ref(const uint8_t*wd,const uint8_t*sd,float global,const float*x,float*y,int tokens,int rows,int cols){
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+    for(int r=0;r<rows;r++)for(int t=0;t<tokens;t++){
+        const uint8_t*wp=wd+(uint64_t)r*cols/2,*sp=sd+(uint64_t)r*cols/16;
+        const float*xp=x+(size_t)t*cols;float sum=0;
+        for(int b=0;b<cols/16;b++){
+            float scale=dg_f8e4m3(sp[b])*global;const uint8_t*q=wp+(size_t)b*8;const float*a=xp+(size_t)b*16;
+            for(int k=0;k<8;k++){uint8_t v=q[k];int lo=v&7,hi=(v>>4)&7;float wl=(float[]){0,.5f,1,1.5f,2,3,4,6}[lo],wh=(float[]){0,.5f,1,1.5f,2,3,4,6}[hi];if(v&8)wl=-wl;if(v&128)wh=-wh;sum+=scale*(wl*a[k*2]+wh*a[k*2+1]);}
+        }
+        y[(size_t)t*rows+r]=sum;
+    }
+}
+#if defined(JB_AVX512)
+/* x in the dg_nvfp4_swizzle layout; rows must be even. */
+static void dg_nvfp4_mm_avx512(const uint8_t*wd,const uint8_t*sd,float global,const float*x,float*y,int tokens,int rows,int cols){
     static const float lut[16]={0,.5f,1,1.5f,2,3,4,6,0,-.5f,-1,-1.5f,-2,-3,-4,-6};
     __m512 table=_mm512_loadu_ps(lut);
 #ifdef _OPENMP
 #pragma omp parallel for schedule(static)
 #endif
     for(int r=0;r<rows;r+=2){
-        const uint8_t*wp0=w->data+(uint64_t)r*cols/2,*wp1=wp0+cols/2;
-        const uint8_t*sp0=s->data+(uint64_t)r*cols/16,*sp1=sp0+cols/16;
+        const uint8_t*wp0=wd+(uint64_t)r*cols/2,*wp1=wp0+cols/2;
+        const uint8_t*sp0=sd+(uint64_t)r*cols/16,*sp1=sp0+cols/16;
         for(int tb=0;tb<tokens;tb+=8){int nb=tokens-tb<8?tokens-tb:8;__m512 a[8],b[8];for(int q=0;q<nb;q++)a[q]=b[q]=_mm512_setzero_ps();
             for(int c=0;c<cols;c+=32){
                 __m512i z=_mm512_set1_epi32(15),raw0=_mm512_cvtepu8_epi32(_mm_loadu_si128((const __m128i*)(wp0+c/2))),raw1=_mm512_cvtepu8_epi32(_mm_loadu_si128((const __m128i*)(wp1+c/2)));
@@ -989,23 +1020,22 @@ static void dg_nvfp4_mm(const DGTensor*w,const DGTensor*s,const DGTensor*g,
             for(int q=0;q<nb;q++){y[(size_t)(tb+q)*rows+r]=_mm512_reduce_add_ps(a[q]);y[(size_t)(tb+q)*rows+r+1]=_mm512_reduce_add_ps(b[q]);}
         }
     }
-    return;
-#else
-#ifdef _OPENMP
-#pragma omp parallel for schedule(static)
+}
 #endif
-    for(int r=0;r<rows;r++)for(int t=0;t<tokens;t++){
-        const uint8_t*wp=w->data+(uint64_t)r*cols/2,*sp=s->data+(uint64_t)r*cols/16;
-        const float*xp=x+(size_t)t*cols;float sum=0;
-        for(int b=0;b<cols/16;b++){
-            float scale=dg_f8e4m3(sp[b])*global;const uint8_t*q=wp+(size_t)b*8;const float*a=xp+(size_t)b*16;
-            for(int k=0;k<8;k++){uint8_t v=q[k];int lo=v&7,hi=(v>>4)&7;float wl=(float[]){0,.5f,1,1.5f,2,3,4,6}[lo],wh=(float[]){0,.5f,1,1.5f,2,3,4,6}[hi];if(v&8)wl=-wl;if(v&128)wh=-wh;sum+=scale*(wl*a[k*2]+wh*a[k*2+1]);}
-        }
-        y[(size_t)t*rows+r]=sum;
-    }
+/* x comes from dg_nvfp4_qdq, in the layout the selected kernel expects. */
+static void dg_nvfp4_mm(const DGTensor*w,const DGTensor*s,const DGTensor*g,
+                        const float*x,float*y,int tokens,int rows,int cols){
+    if(w->dtype!=DG_U8||w->nd!=2||w->shape[0]!=(uint64_t)rows||w->shape[1]!=(uint64_t)cols/2||
+       s->dtype!=DG_F8E4M3||s->nd!=2||s->shape[0]!=(uint64_t)rows||s->shape[1]!=(uint64_t)cols/16||
+       g->dtype!=DG_F32||g->nd!=0||g->bytes!=4||cols%32||rows%2)die2("bad NVFP4 expert tensor",w->name);
+    float global;memcpy(&global,g->data,4);
+#if defined(JB_AVX512)
+    dg_nvfp4_mm_avx512(w->data,s->data,global,x,y,tokens,rows,cols);
+#else
+    dg_nvfp4_mm_ref(w->data,s->data,global,x,y,tokens,rows,cols);
 #endif
 }
-#if defined(__AVX512F__)
+#if defined(JB_AVX512)
 static __m512 dg_bf16x16(const uint8_t *p){
     __m256i h=_mm256_loadu_si256((const __m256i*)p);
     return _mm512_castsi512_ps(_mm512_slli_epi32(_mm512_cvtepu16_epi32(h),16));
@@ -1024,11 +1054,7 @@ static void dg_mm_data_avx512(const uint8_t*data,const float*x,float*y,int token
     }
 }
 #endif
-static void dg_mm_data(const uint8_t*data,const float*x,float*y,int tokens,int rows,int cols){
-    if(tokens<1||tokens>JB_MAX_CTX)die("DiffusionGemma sequence exceeds context limit");
-#if defined(__AVX512F__)
-    dg_mm_data_avx512(data,x,y,tokens,rows,cols);
-#else
+static void dg_mm_data_ref(const uint8_t*data,const float*x,float*y,int tokens,int rows,int cols){
 #ifdef _OPENMP
 #pragma omp parallel for schedule(static)
 #endif
@@ -1038,6 +1064,13 @@ static void dg_mm_data(const uint8_t*data,const float*x,float*y,int tokens,int r
         for(int c=0;c<cols;c++){float a=dg_bf(p+c*2);for(int t=0;t<tokens;t++)sum[t]+=a*x[(size_t)t*cols+c];}
         for(int t=0;t<tokens;t++)y[(size_t)t*rows+r]=sum[t];
     }
+}
+static void dg_mm_data(const uint8_t*data,const float*x,float*y,int tokens,int rows,int cols){
+    if(tokens<1||tokens>JB_MAX_CTX)die("DiffusionGemma sequence exceeds context limit");
+#if defined(JB_AVX512)
+    dg_mm_data_avx512(data,x,y,tokens,rows,cols);
+#else
+    dg_mm_data_ref(data,x,y,tokens,rows,cols);
 #endif
 }
 static void dg_mm(const DGTensor*w,const float*x,float*y,int tokens,int rows,int cols){if(w->nd!=2||w->shape[0]!=(uint64_t)rows||w->shape[1]!=(uint64_t)cols)die2("bad matrix shape",w->name);dg_mm_data(w->data,x,y,tokens,rows,cols);}
@@ -1095,8 +1128,14 @@ static double dg_slot_logits_entropy(const DGTensor *w,const float *hidden,int n
     }
     free(logits);return max_entropy;
 }
-static void dg_rms(float *y, const float *x, const DGTensor *scale, int n) {
-#if defined(__AVX512F__)
+static void dg_rms_ref(float *y, const float *x, const DGTensor *scale, int n) {
+    double ss = 0.0;
+    for (int i = 0; i < n; i++) ss += (double)x[i] * x[i];
+    float q = 1.0f / sqrtf((float)(ss / n) + 1e-6f);
+    for (int i = 0; i < n; i++) y[i] = x[i] * q * (scale ? dg_at(scale, i) : 1.0f);
+}
+#if defined(JB_AVX512)
+static void dg_rms_avx512(float *y, const float *x, const DGTensor *scale, int n) {
     __m512d a=_mm512_setzero_pd(),b=a,c=a,d=a;int i=0;
     for(;i+31<n;i+=32){
         __m512 x0=_mm512_loadu_ps(x+i),x1=_mm512_loadu_ps(x+i+16);
@@ -1113,21 +1152,31 @@ static void dg_rms(float *y, const float *x, const DGTensor *scale, int n) {
     if(scale)for(;i+15<n;i+=16)_mm512_storeu_ps(y+i,_mm512_mul_ps(_mm512_mul_ps(_mm512_loadu_ps(x+i),_mm512_set1_ps(q)),dg_bf16x16(scale->data+(size_t)i*2)));
     else for(;i+15<n;i+=16)_mm512_storeu_ps(y+i,_mm512_mul_ps(_mm512_loadu_ps(x+i),_mm512_set1_ps(q)));
     for(;i<n;i++)y[i]=x[i]*q*(scale?dg_at(scale,i):1.0f);
+}
+#endif
+static void dg_rms(float *y, const float *x, const DGTensor *scale, int n) {
+#if defined(JB_AVX512)
+    dg_rms_avx512(y, x, scale, n);
 #else
-    double ss = 0.0;
-    for (int i = 0; i < n; i++) ss += (double)x[i] * x[i];
-    float q = 1.0f / sqrtf((float)(ss / n) + 1e-6f);
-    for (int i = 0; i < n; i++) y[i] = x[i] * q * (scale ? dg_at(scale, i) : 1.0f);
+    dg_rms_ref(y, x, scale, n);
 #endif
 }
 static float dg_gelu(float x) {
     return .5f * x * (1.0f + tanhf(.7978845608028654f * (x + .044715f * x * x * x)));
 }
-static double dg_dot(const float*a,const float*b,int n){
-#if defined(__AVX512F__)
-    __m512d s0=_mm512_setzero_pd(),s1=s0;int i=0;for(;i+15<n;i+=16){__m512 x=_mm512_loadu_ps(a+i),y=_mm512_loadu_ps(b+i);s0=_mm512_fmadd_pd(_mm512_cvtps_pd(_mm512_castps512_ps256(x)),_mm512_cvtps_pd(_mm512_castps512_ps256(y)),s0);s1=_mm512_fmadd_pd(_mm512_cvtps_pd(_mm512_extractf32x8_ps(x,1)),_mm512_cvtps_pd(_mm512_extractf32x8_ps(y,1)),s1);}double s=_mm512_reduce_add_pd(_mm512_add_pd(s0,s1));for(;i<n;i++)s+=(double)a[i]*b[i];return s;
-#else
+static double dg_dot_ref(const float*a,const float*b,int n){
     double s=0;for(int i=0;i<n;i++)s+=(double)a[i]*b[i];return s;
+}
+#if defined(JB_AVX512)
+static double dg_dot_avx512(const float*a,const float*b,int n){
+    __m512d s0=_mm512_setzero_pd(),s1=s0;int i=0;for(;i+15<n;i+=16){__m512 x=_mm512_loadu_ps(a+i),y=_mm512_loadu_ps(b+i);s0=_mm512_fmadd_pd(_mm512_cvtps_pd(_mm512_castps512_ps256(x)),_mm512_cvtps_pd(_mm512_castps512_ps256(y)),s0);s1=_mm512_fmadd_pd(_mm512_cvtps_pd(_mm512_extractf32x8_ps(x,1)),_mm512_cvtps_pd(_mm512_extractf32x8_ps(y,1)),s1);}double s=_mm512_reduce_add_pd(_mm512_add_pd(s0,s1));for(;i<n;i++)s+=(double)a[i]*b[i];return s;
+}
+#endif
+static double dg_dot(const float*a,const float*b,int n){
+#if defined(JB_AVX512)
+    return dg_dot_avx512(a,b,n);
+#else
+    return dg_dot_ref(a,b,n);
 #endif
 }
 static DGTensor *dg_layer_tensor(DGModel *m, int l, const char *tail) {
@@ -1585,6 +1634,235 @@ static int dg_check_request(const char*path){
     free(text);free(zero);free(sys);dg_questions_free(w,nq);dg_request_free(&rq);free(j);return 0;
 }
 
+/* Kernel self-tests: every kernel, reference and selected ISA version, is
+ * checked against a double-precision oracle on random data. Shapes cover
+ * full 8-token blocks, token remainders, and column tails. The bound is
+ * 1e-4 of the absolute-value sum: summation order may differ between
+ * kernels, but an indexing or tail bug moves results by far more. */
+static uint32_t jb_rng(uint64_t *s) {
+    *s ^= *s << 13;
+    *s ^= *s >> 7;
+    *s ^= *s << 17;
+    return (uint32_t)(*s >> 32);
+}
+static float jb_rng_unit(uint64_t *s) { return (float)(jb_rng(s) >> 8) / 8388608.0f * 2.0f - 1.0f; }
+static void jb_put_bf16(uint8_t *p, float v) {
+    uint32_t u;
+    memcpy(&u, &v, 4);
+    p[0] = (uint8_t)(u >> 16);
+    p[1] = (uint8_t)(u >> 24);
+}
+static void jb_check_close(const char *what, double got, double want, double bound) {
+    if (!jb_finite(got) || fabs(got - want) > bound) {
+        char z[160];
+        snprintf(z, sizeof z, "%s (got %.9g, want %.9g, bound %.3g)", what, got, want, bound);
+        die2("kernel self-test failed", z);
+    }
+}
+static void dg_test_mm(uint64_t *rs) {
+    static const int shape[][3] = {{2, 16, 1}, {2, 7, 1}, {2, 15, 8}, {4, 40, 3}, {6, 33, 9}, {8, 2816, 17}};
+    for (size_t k = 0; k < sizeof shape / sizeof *shape; k++) {
+        int rows = shape[k][0], cols = shape[k][1], tokens = shape[k][2];
+        uint8_t *w = xmalloc((size_t)rows * cols * 2);
+        float *x = xmalloc((size_t)tokens * cols * 4), *y = xmalloc((size_t)tokens * rows * 4);
+        double *want = xmalloc((size_t)tokens * rows * sizeof *want), *mag = xmalloc((size_t)tokens * rows * sizeof *mag);
+        for (int i = 0; i < rows * cols; i++) jb_put_bf16(w + (size_t)i * 2, jb_rng_unit(rs));
+        for (int i = 0; i < tokens * cols; i++) x[i] = jb_rng_unit(rs);
+        for (int t = 0; t < tokens; t++)
+            for (int r = 0; r < rows; r++) {
+                double s = 0, a = 0;
+                for (int c = 0; c < cols; c++) {
+                    double v = (double)dg_bf(w + ((size_t)r * cols + c) * 2) * x[(size_t)t * cols + c];
+                    s += v;
+                    a += fabs(v);
+                }
+                want[(size_t)t * rows + r] = s;
+                mag[(size_t)t * rows + r] = a;
+            }
+        for (int pass = 0; pass < 2; pass++) {
+            if (pass) dg_mm_data(w, x, y, tokens, rows, cols);
+            else dg_mm_data_ref(w, x, y, tokens, rows, cols);
+            for (int i = 0; i < tokens * rows; i++)
+                jb_check_close(pass ? "BF16 matmul (" JB_KERNELS ")" : "BF16 matmul (ref)", y[i], want[i], 1e-4 * mag[i]);
+        }
+        free(w); free(x); free(y); free(want); free(mag);
+    }
+}
+static void dg_test_nvfp4(uint64_t *rs) {
+    static const int shape[][3] = {{2, 32, 1}, {4, 64, 9}, {8, 704, 17}, {2, 2816, 3}};
+    static const float mag4[8] = {0, .5f, 1, 1.5f, 2, 3, 4, 6};
+    const float global = 0.01f, base = 0.02f;
+    for (size_t k = 0; k < sizeof shape / sizeof *shape; k++) {
+        int rows = shape[k][0], cols = shape[k][1], tokens = shape[k][2];
+        uint8_t *wd = xmalloc((size_t)rows * cols / 2), *sd = xmalloc((size_t)rows * cols / 16);
+        float *x = xmalloc((size_t)tokens * cols * 4), *xq = xmalloc((size_t)tokens * cols * 4);
+        float *xs = xmalloc((size_t)tokens * cols * 4), *y = xmalloc((size_t)tokens * rows * 4);
+        double *want = xmalloc((size_t)tokens * rows * sizeof *want), *mag = xmalloc((size_t)tokens * rows * sizeof *mag);
+        for (int i = 0; i < rows * cols / 2; i++) wd[i] = (uint8_t)jb_rng(rs);
+        for (int i = 0; i < rows * cols / 16; i++) sd[i] = (uint8_t)(0x30 + jb_rng(rs) % 32);
+        for (int i = 0; i < tokens * cols; i++) x[i] = 3 * jb_rng_unit(rs);
+        dg_nvfp4_qdq_ref(xq, x, tokens, cols, base);
+        for (int t = 0; t < tokens; t++)
+            for (int r = 0; r < rows; r++) {
+                double s = 0, a = 0;
+                for (int c = 0; c < cols; c++) {
+                    uint8_t b = wd[(size_t)r * cols / 2 + c / 2], nib = (uint8_t)(c & 1 ? b >> 4 : b & 15);
+                    float scale = dg_f8e4m3(sd[(size_t)r * cols / 16 + c / 16]) * global;
+                    double v = (double)scale * (nib & 8 ? -mag4[nib & 7] : mag4[nib & 7]) * xq[(size_t)t * cols + c];
+                    s += v;
+                    a += fabs(v);
+                }
+                want[(size_t)t * rows + r] = s;
+                mag[(size_t)t * rows + r] = a;
+            }
+        dg_nvfp4_mm_ref(wd, sd, global, xq, y, tokens, rows, cols);
+        for (int i = 0; i < tokens * rows; i++) jb_check_close("NVFP4 matmul (ref)", y[i], want[i], 1e-4 * mag[i]);
+        /* The production path: QDQ into the selected kernel's layout, then
+         * the validated tensor entry point. */
+        dg_nvfp4_qdq(xs, x, tokens, cols, base);
+#if defined(JB_AVX512)
+        dg_nvfp4_swizzle(xq, tokens, cols);
+#endif
+        if (memcmp(xs, xq, (size_t)tokens * cols * 4)) die2("kernel self-test failed", "NVFP4 QDQ layout (" JB_KERNELS ")");
+        DGTensor tw = {0}, ts = {0}, tg = {0};
+        tw.name = ts.name = tg.name = "selftest";
+        tw.data = wd; tw.dtype = DG_U8; tw.nd = 2; tw.shape[0] = (uint64_t)rows; tw.shape[1] = (uint64_t)cols / 2;
+        ts.data = sd; ts.dtype = DG_F8E4M3; ts.nd = 2; ts.shape[0] = (uint64_t)rows; ts.shape[1] = (uint64_t)cols / 16;
+        tg.data = (const uint8_t *)&global; tg.dtype = DG_F32; tg.bytes = 4;
+        dg_nvfp4_mm(&tw, &ts, &tg, xs, y, tokens, rows, cols);
+        for (int i = 0; i < tokens * rows; i++) jb_check_close("NVFP4 matmul (" JB_KERNELS ")", y[i], want[i], 1e-4 * mag[i]);
+        free(wd); free(sd); free(x); free(xq); free(xs); free(y); free(want); free(mag);
+    }
+}
+static void dg_test_rms_dot(uint64_t *rs) {
+    static const int len[] = {1, 15, 16, 17, 31, 32, 33, 256, 2816};
+    for (size_t k = 0; k < sizeof len / sizeof *len; k++) {
+        int n = len[k];
+        float *x = xmalloc((size_t)n * 4), *b = xmalloc((size_t)n * 4), *y = xmalloc((size_t)n * 4);
+        uint8_t *sw = xmalloc((size_t)n * 2);
+        for (int i = 0; i < n; i++) { x[i] = 4 * jb_rng_unit(rs); b[i] = jb_rng_unit(rs); jb_put_bf16(sw + (size_t)i * 2, jb_rng_unit(rs)); }
+        DGTensor scale = {0};
+        scale.name = "selftest"; scale.data = sw; scale.dtype = DG_BF16; scale.nd = 1; scale.shape[0] = (uint64_t)n; scale.bytes = (uint64_t)n * 2;
+        double ss = 0, dot = 0, dmag = 0;
+        for (int i = 0; i < n; i++) { ss += (double)x[i] * x[i]; dot += (double)x[i] * b[i]; dmag += fabs((double)x[i] * b[i]); }
+        double q = 1.0 / sqrt(ss / n + 1e-6);
+        for (int pass = 0; pass < 4; pass++) {
+            const DGTensor *sc = pass & 1 ? &scale : NULL;
+            if (pass & 2) dg_rms(y, x, sc, n);
+            else dg_rms_ref(y, x, sc, n);
+            for (int i = 0; i < n; i++) {
+                double want = x[i] * q * (sc ? dg_at(sc, i) : 1.0);
+                jb_check_close(pass & 2 ? "RMS norm (" JB_KERNELS ")" : "RMS norm (ref)", y[i], want, 1e-5 * fabs(want) + 1e-12);
+            }
+        }
+        jb_check_close("dot (ref)", dg_dot_ref(x, b, n), dot, 1e-12 * dmag);
+        jb_check_close("dot (" JB_KERNELS ")", dg_dot(x, b, n), dot, 1e-12 * dmag);
+        free(x); free(b); free(y); free(sw);
+    }
+}
+static void dg_kernel_selftest(void) {
+    uint64_t rs = 0x9e3779b97f4a7c15ull;
+    dg_test_mm(&rs);
+    dg_test_nvfp4(&rs);
+    dg_test_rms_dot(&rs);
+}
+
+/* Kernel throughput at model shapes, for comparing ISA paths and builds.
+ * "read" is a streaming-read baseline for this machine's memory bandwidth. */
+static double jb_best_ms(uint64_t *ns, int reps) {
+    uint64_t best = UINT64_MAX;
+    for (int i = 0; i < reps; i++) if (ns[i] < best) best = ns[i];
+    return (double)best / 1e6;
+}
+static int bench_kernels(void) {
+    int threads = 1;
+#ifdef _OPENMP
+    threads = omp_get_max_threads();
+#endif
+    printf("{\"bench\":\"info\",\"kernels\":\"%s\",\"math\":\"%s\",\"threads\":%d}\n", JB_KERNELS, JB_MATH_MODE, threads);
+    uint64_t rs = 0x243f6a8885a308d3ull, ns[3];
+    size_t nw = (size_t)1 << 26;
+    uint64_t *buf = xmalloc(nw * sizeof *buf), acc = 0;
+    for (size_t i = 0; i < nw; i++) buf[i] = i;
+    for (int rep = 0; rep < 3; rep++) {
+        uint64_t t0 = now_ns(), sum = 0;
+#ifdef _OPENMP
+#pragma omp parallel for reduction(+:sum) schedule(static)
+#endif
+        for (size_t i = 0; i < nw; i++) sum += buf[i];
+        ns[rep] = now_ns() - t0;
+        acc += sum;
+    }
+    free(buf);
+    double ms = jb_best_ms(ns, 3);
+    printf("{\"bench\":\"read\",\"bytes\":%zu,\"ms\":%.3f,\"gb_per_s\":%.2f,\"check\":%llu}\n",
+           nw * sizeof(uint64_t), ms, (double)(nw * sizeof(uint64_t)) / ms / 1e6, (unsigned long long)(acc & 0xff));
+
+    static const int mm_tokens[] = {1, 8, 64, 256};
+    int rows = 4096, cols = DG_H;
+    uint8_t *w = xmalloc((size_t)rows * cols * 2);
+    float *x = xmalloc((size_t)256 * cols * 4), *y = xmalloc((size_t)256 * rows * 4);
+    for (size_t i = 0; i < (size_t)rows * cols; i++) jb_put_bf16(w + i * 2, jb_rng_unit(&rs));
+    for (size_t i = 0; i < (size_t)256 * cols; i++) x[i] = jb_rng_unit(&rs);
+    for (size_t k = 0; k < sizeof mm_tokens / sizeof *mm_tokens; k++) {
+        int tokens = mm_tokens[k];
+        for (int kernel = 0; kernel < 2; kernel++) {
+#if !defined(JB_AVX512)
+            if (kernel) break;
+#endif
+            dg_mm_data_ref(w, x, y, tokens, rows, cols);
+            for (int rep = 0; rep < 3; rep++) {
+                uint64_t t0 = now_ns();
+                if (kernel) dg_mm_data(w, x, y, tokens, rows, cols);
+                else dg_mm_data_ref(w, x, y, tokens, rows, cols);
+                ns[rep] = now_ns() - t0;
+            }
+            ms = jb_best_ms(ns, 3);
+            printf("{\"bench\":\"bf16_mm\",\"kernel\":\"%s\",\"rows\":%d,\"cols\":%d,\"tokens\":%d,\"ms\":%.3f,\"gflops\":%.2f,\"weight_gb_per_s\":%.2f}\n",
+                   kernel ? JB_KERNELS : "ref", rows, cols, tokens, ms, 2.0 * rows * cols * tokens / ms / 1e6, 2.0 * rows * cols / ms / 1e6);
+        }
+    }
+    free(w); free(x); free(y);
+
+    /* All 128 experts of one gate projection, so weights stream from memory
+     * as in the model rather than staying cache-resident. */
+    static const int nv_tokens[] = {1, 4, 16, 64};
+    int experts = 128, nr = DG_MOE, nc = DG_H;
+    size_t wbytes = (size_t)nr * nc / 2, sbytes = (size_t)nr * nc / 16;
+    uint8_t *wd = xmalloc(wbytes * experts), *sd = xmalloc(sbytes * experts);
+    float *xr = xmalloc((size_t)64 * nc * 4), *xs = xmalloc((size_t)64 * nc * 4), *xq = xmalloc((size_t)64 * nc * 4), *yo = xmalloc((size_t)64 * nr * 4);
+    for (size_t i = 0; i < wbytes * experts; i++) wd[i] = (uint8_t)jb_rng(&rs);
+    for (size_t i = 0; i < sbytes * experts; i++) sd[i] = (uint8_t)(0x30 + jb_rng(&rs) % 32);
+    for (size_t i = 0; i < (size_t)64 * nc; i++) xr[i] = 3 * jb_rng_unit(&rs);
+    dg_nvfp4_qdq_ref(xq, xr, 64, nc, 0.02f);
+    dg_nvfp4_qdq(xs, xr, 64, nc, 0.02f);
+    for (size_t k = 0; k < sizeof nv_tokens / sizeof *nv_tokens; k++) {
+        int tokens = nv_tokens[k];
+        for (int kernel = 0; kernel < 2; kernel++) {
+#if !defined(JB_AVX512)
+            if (kernel) break;
+#endif
+            for (int rep = 0; rep < 3; rep++) {
+                uint64_t t0 = now_ns();
+                for (int e = 0; e < experts; e++) {
+#if defined(JB_AVX512)
+                    if (kernel) dg_nvfp4_mm_avx512(wd + wbytes * e, sd + sbytes * e, 0.01f, xs, yo, tokens, nr, nc);
+                    else
+#endif
+                        dg_nvfp4_mm_ref(wd + wbytes * e, sd + sbytes * e, 0.01f, xq, yo, tokens, nr, nc);
+                }
+                ns[rep] = now_ns() - t0;
+            }
+            ms = jb_best_ms(ns, 3);
+            printf("{\"bench\":\"nvfp4_mm\",\"kernel\":\"%s\",\"experts\":%d,\"rows\":%d,\"cols\":%d,\"tokens\":%d,\"ms\":%.3f,\"gflops\":%.2f,\"weight_gb_per_s\":%.2f}\n",
+                   kernel ? JB_KERNELS : "ref", experts, nr, nc, tokens, ms, 2.0 * experts * nr * nc * tokens / ms / 1e6,
+                   (double)(wbytes + sbytes) * experts / ms / 1e6);
+        }
+    }
+    free(wd); free(sd); free(xr); free(xs); free(xq); free(yo);
+    return 0;
+}
+
 static int selftest(void) {
     uint8_t sh[32],sha_abc[32]={0xba,0x78,0x16,0xbf,0x8f,0x01,0xcf,0xea,0x41,0x41,0x40,0xde,0x5d,0xae,0x22,0x23,0xb0,0x03,0x61,0xa3,0x96,0x17,0x7a,0x9c,0xb4,0x10,0xff,0x61,0xf2,0x00,0x15,0xad};dg_sha256((const uint8_t*)"abc",3,sh);if(memcmp(sh,sha_abc,32))die("SHA-256 self-test failed");DGMT mt;dg_mt_seed(&mt,0);uint32_t py_mt[5]={201979,220500,21225,135746,254766};for(int i=0;i<5;i++)if(dg_mt_vocab(&mt)!=py_mt[i])die("MT19937 self-test failed");const char*cj="{\"state\":{\"b\":2,\"a\":\"é\"},\"questions\":{\"q\":{\"type\":\"noul\",\"instructions\":\"x\"}}}";int cnt;JTok*ct=json_tokens(cj,strlen(cj),&cnt);int cs=jt_obj_get(cj,ct,cnt,0,"state"),cq=jt_obj_get(cj,ct,cnt,0,"questions");DGBuf cb={0};db_ch(&cb,'[');dg_json_value(&cb,cj,ct,cnt,cs,1,1);db_mem(&cb,", ",2);dg_json_value(&cb,cj,ct,cnt,cq,1,1);db_ch(&cb,']');dg_sha256((const uint8_t*)cb.p,cb.n,sh);uint32_t cseed=(uint32_t)sh[0]<<24|(uint32_t)sh[1]<<16|(uint32_t)sh[2]<<8|sh[3];if(cseed!=1123096946u)die("OpenJev canonical seed self-test failed");dg_mt_seed(&mt,cseed);if(dg_mt_vocab(&mt)!=238957u)die("OpenJev canvas RNG self-test failed");free(cb.p);free(ct);
     const char*tx="{\"s\":\" \\u2003x\\u00a0 \",\"o\":{\"b\":2,\"a\":1},\"n\":null}";int txn;JTok*tt=json_tokens(tx,strlen(tx),&txn);int ts=jt_obj_get(tx,tt,txn,0,"s"),to=jt_obj_get(tx,tt,txn,0,"o"),tn=jt_obj_get(tx,tt,txn,0,"n");char*sv=dg_text_of(tx,tt,txn,ts),*ov=dg_text_of(tx,tt,txn,to),*nv=dg_text_of(tx,tt,txn,tn);if(strcmp(sv,"x")||strcmp(ov,"{\"b\": 2, \"a\": 1}")||*nv)die("OpenJev text_of self-test failed");free(sv);free(ov);free(nv);free(tt);
@@ -1626,6 +1904,7 @@ static int selftest(void) {
         tokens[candidates].type != JT_ARRAY || tokens[candidates].size != 2)
         die("JSON self-test failed");
     free(tokens);
+    dg_kernel_selftest();
     puts("{\"selftest\":\"ok\"}");
     return 0;
 }
@@ -1636,12 +1915,15 @@ static void usage(void) {
             "  jb MODEL_DIR decide REQUEST.json\n"
             "  jb MODEL_DIR eval OPENJEV.jsonl\n"
             "  jb --check-request REQUEST.json\n"
-            "  jb --selftest\n",
+            "  jb --selftest\n"
+            "  jb --bench-kernels\n",
             JB_VERSION);
 }
 int main(int ac, char **av) {
     if (ac == 2 && !strcmp(av[1], "--selftest"))
         return selftest();
+    if (ac == 2 && !strcmp(av[1], "--bench-kernels"))
+        return bench_kernels();
     if (ac == 3 && !strcmp(av[1], "--check-request"))
         return dg_check_request(av[2]);
     if (ac < 3) {
