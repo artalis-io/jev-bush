@@ -91,6 +91,25 @@
       "resident_memory_gb_per_process": 14.8,
       "candidate_projection_ms_per_decision": 0.0251725
     },
+    "prefix_cache": {
+      "hardware": "64-core Threadripper 9980X",
+      "threads": 32,
+      "math": "strict",
+      "compiler_flags": "-O3 -march=native -std=c11 -Wall -Wextra -pedantic -fopenmp",
+      "schema_prefix_tokens": 380,
+      "full_prompt_tokens": 486,
+      "decisions_per_document": 5,
+      "reads": 4,
+      "cold_total_ms": 6291.202,
+      "cold_prefill_ms": 4919.115,
+      "warm_mean_total_ms": 2197.8519843137256,
+      "warm_mean_prefill_ms": 912.3141843137255,
+      "documents_per_schema": [1, 2, 4, 8, 16, 64, 256],
+      "mean_ms_per_document": [6291.202, 4292.122, 3250.122, 2716.753, 2441.586, 2257.249, 2213.842],
+      "predicates_per_second": [0.7948, 1.1649, 1.5384, 1.8404, 2.0478, 2.2151, 2.2585],
+      "prefill_tokens_evaluated": [486, 592, 804, 1228, 2076, 7164, 27516],
+      "validation": "256/256 answer objects byte-identical; first eight cache rows also byte-identical to independent monolithic strict runs"
+    },
     "openjev": {
       "hardware": "NVIDIA RTX PRO 6000 Blackwell",
       "read_policy": "one",

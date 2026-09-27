@@ -131,24 +131,27 @@ storage are therefore rejected until a future profile shows a larger ceiling.
 
 ## 3. Cache shared prompt-prefix K/V
 
-First measure the exact shared-token prefix and potential hit rate for every
-benchmark row. Implement this only if the measured prefill fraction and shared
-prefixes predict a material end-to-end gain.
+Implemented for strict builds as a deliberately small one-entry cache. `eval`
+tokenizes the prefix through the start of the user turn, verifies an exact
+schema string and token-id match, and retains immutable per-layer K/V. A miss
+runs ordinary monolithic prefill and copies its exact prefix K/V; a hit performs
+causal suffix prefill at the original absolute positions. `decide` remains
+uncached.
 
 The prompt places the system text, questions, and criteria before the user
 state. Rows in the same workflow reuse that prefix while changing only the
 state. Jev Bush currently recomputes the complete prefix for every row and
 frees its K/V after the request.
 
-Add a small exact-match LRU cache keyed by:
+The initial implementation intentionally does not add an LRU, eviction policy,
+persistent cache, hashes, or arbitrary prefix matching. Its key is:
 
 - model and tokenizer identity;
 - the tokenized prefix through the start of the user turn;
 - inference settings that affect hidden states.
 
-On a hit, process only the unique state suffix causally, using the cached
-per-layer prefix K/V. Start with a one-entry cache, then test whether one entry
-per recurring question schema is worth the memory.
+On a hit, only the unique state suffix is processed causally using the cached
+per-layer prefix K/V. A schema change replaces the sole entry.
 
 The attention code currently treats cache reuse as answer-canvas decoding.
 Split those concepts into explicit modes:
@@ -159,7 +162,39 @@ Split those concepts into explicit modes:
 
 FP32 K/V is large: the model's mixed attention layout requires roughly 440 KB
 per cached prefix token. A 500-token entry is therefore about 220 MB. Bound the
-cache by bytes, expose its hit rate, and do not allow unbounded schema growth.
+cache by bytes. The one-entry design bounds growth without a cache framework.
+
+An eight-row repeated-schema regression is byte-identical to eight independent
+monolithic strict-build runs, including every printed probability. Its 380-token
+prefix reduced warm prefill to 102--124 evaluated tokens. Warm total latency
+fell from 5.77--6.10 seconds to 2.19--2.36 seconds on the 32-thread Threadripper
+9980X, a 2.5--2.7x improvement. The cold row remains monolithic and pays a
+small copy/allocation cost.
+
+A 256-row repeated-document run isolates amortization while holding the schema,
+document, five decisions, and four-read policy fixed. All 256 answer objects
+are byte-identical. Times include the cold cache construction row:
+
+| documents/schema | ms/document | documents/s | predicates/s | prefill tokens evaluated |
+|---:|---:|---:|---:|---:|
+| 1 | 6291 | 0.159 | 0.795 | 486 |
+| 2 | 4292 | 0.233 | 1.165 | 592 |
+| 4 | 3250 | 0.308 | 1.538 | 804 |
+| 8 | 2717 | 0.368 | 1.840 | 1228 |
+| 16 | 2442 | 0.410 | 2.048 | 2076 |
+| 64 | 2257 | 0.443 | 2.215 | 7164 |
+| 256 | 2214 | 0.452 | 2.259 | 27516 |
+
+The cold row took 6.291 seconds, including 4.919 seconds of prefill. Across
+the 255 warm hits, mean total latency was 2.198 seconds and mean suffix prefill
+was 0.912 seconds. Cache construction is therefore amortized quickly and the
+steady-state rate is about 2.28 predicates/s for this five-decision workload.
+
+Fast-math prefix reuse is disabled. Testing found that prompt splitting changes
+temporary-buffer shape and therefore fast-math rounding; later NVFP4 activation
+rounding amplified the initially tiny difference. Strict compilation produced
+byte-identical cached and monolithic results. Approximate fast-math caching
+would violate the execution-only optimization contract.
 
 The attainable speedup is limited by the answer-canvas work that remains. Use
 the measured prefill fraction and shared-prefix fraction to predict the ceiling

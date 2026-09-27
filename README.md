@@ -46,7 +46,21 @@ For production GPGPU inference, use
 
 ## Build
 
-Linux, optimized for the current CPU:
+Linux, optimized for the current CPU with exact repeated-schema prefix reuse:
+
+```sh
+cc -O3 -march=native -std=c11 -Wall -Wextra -pedantic \
+  -fopenmp jb.c -lm -o jb
+```
+
+`eval` keeps one immutable, exact-match schema-prefix K/V entry in strict
+builds. The first row for a schema is a cache miss and uses ordinary monolithic
+prefill; later exact token-prefix matches evaluate only the document-dependent
+suffix. `decide` is always monolithic. Output reports `prefix_cache` as
+`off`, `miss`, or `hit`, `cache_tokens`, and the number of tokens actually
+evaluated as `usage.prefill_tokens`.
+
+Linux, highest established uncached throughput:
 
 ```sh
 cc -O3 -march=native -ffast-math -std=c11 -Wall -Wextra -pedantic \
@@ -58,6 +72,12 @@ point reduction and transcendental behavior; its full accuracy and calibration
 results are reported below. Output records `"math":"fast"`; omit the flag for
 strict IEEE behavior and `"math":"strict"` output. Guards against NaN and
 infinity use bit-level tests, so they still hold under `-ffast-math`.
+
+Prefix reuse is deliberately disabled in fast-math builds. Splitting the
+prompt changes temporary-buffer shape and may change fast-math evaluation by
+tiny amounts; NVFP4 activation rounding can amplify that drift into different
+probabilities. The strict build is byte-identical between cached and
+monolithic execution. This is a correctness boundary, not a tunable tolerance.
 
 Output also records `"kernels"`: `"avx512"` when the build targets AVX-512F
 and AVX-512DQ, otherwise `"scalar"`. The published throughput figures use the

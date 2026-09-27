@@ -42,7 +42,8 @@
   },
   "usage": {
     "input_tokens": 128,
-    "output_tokens": 0
+    "output_tokens": 0,
+    "prefill_tokens": 128
   },
   "timing_ms": {
     "total": 10000.0,
@@ -50,6 +51,8 @@
     "decode": 499.9,
     "candidates": 0.1,
     "reads": 1,
-    "canvases": 1
+    "canvases": 1,
+    "prefix_cache": "off",
+    "cache_tokens": 0
   }
 }
