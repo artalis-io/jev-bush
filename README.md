@@ -62,7 +62,7 @@ infinity use bit-level tests, so they still hold under `-ffast-math`.
 Output also records `"kernels"`: `"avx512"` when the build targets AVX-512F
 and AVX-512DQ, otherwise `"scalar"`. The published throughput figures use the
 AVX-512 kernels; other CPUs run the portable scalar kernels, which are much
-slower.
+slower. `"threads"` records the OpenMP thread count the process ran with.
 
 For deployments that accept requests from other processes or users, add the
 usual Linux hardening flags; they do not change results:
@@ -239,7 +239,10 @@ python3 tools/summarize_eval.py predictions.jsonl
 Give concurrent workers disjoint CPU sets when possible; otherwise separate
 OpenMP processes may bind to the same cores. On the measured 64-core
 Threadripper 9980X, 40--48 threads performed similarly for single-request
-latency; the two-worker benchmark used 32 threads per worker.
+latency; the two-worker benchmark used 32 threads per worker. Always set
+`OMP_NUM_THREADS`: without it, OpenMP uses every hardware thread (128 on that
+machine), and performance is dramatically worse. Check `"threads"` in the
+output to confirm the setting took effect.
 
 ## Established results
 

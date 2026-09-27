@@ -2,6 +2,7 @@
   "model": "jev-bush-diffusion-0.1.0",
   "math": "fast",
   "kernels": "avx512",
+  "threads": 32,
   "id": "example-ticket",
   "answers": {
     "is_billing": {

@@ -128,6 +128,14 @@ static int jb_finite(double x) {
     memcpy(&u, &x, sizeof u);
     return (u & 0x7ff0000000000000ull) != 0x7ff0000000000000ull;
 }
+/* Threads OpenMP will use for parallel regions; 1 without OpenMP. */
+static int jb_threads(void) {
+#ifdef _OPENMP
+    return omp_get_max_threads();
+#else
+    return 1;
+#endif
+}
 static void jb_path(char *out, size_t cap, const char *fmt, ...) {
     va_list a;
     va_start(a, fmt);
@@ -1552,7 +1560,7 @@ static char *dg_system_prompt(const char *qj,JTok *qt,int qnt,DecisionWork*w,int
     db_fmt(&b,"\n%s",nq<=10?"Reply with one line per question, in this order, formatted as \"id: label\".":"Reply on one line with each question's id immediately followed by its label, separated by single spaces.");return b.p;
 }
 static char *dg_answer_text(DecisionWork*w,int nq,const int*pick){DGBuf b={0};db_mem(&b,"",0);for(int i=0;i<nq;i++){if(i)db_ch(&b,nq<=10?'\n':' ');db_fmt(&b,nq<=10?"q%d: %s":"q%d%s",i+1,w[i].label[pick[i]]);}return b.p;}
-static void dg_print_answers(const char*qj,JTok*qt,int qnt,DecisionWork*w,int nq,const char*id,uint32_t tokens,double ms,double prefill_ms,double cand_ms,int reads){printf("{\"model\":\"jev-bush-diffusion-%s\",\"math\":\"%s\",\"kernels\":\"%s\",",JB_VERSION,JB_MATH_MODE,JB_KERNELS);if(id){fputs("\"id\":",stdout);json_print_string(id);putchar(',');}fputs("\"answers\":{",stdout);for(int x=0;x<nq;x++){DecisionWork*d=&w[x];if(x)putchar(',');char*k=jt_string(qj,&qt[d->key]);json_print_string(k);free(k);fputs(":{\"type\":",stdout);json_print_string(d->kind);if(!strcmp(d->kind,"noul"))printf(",\"noul\":%.17g,\"probabilities\":{\"true\":%.17g,\"false\":%.17g},\"confidence\":%.17g",d->prob[0],d->prob[0],d->prob[1],confidence(d->prob,d->nc));else if(!strcmp(d->kind,"choice")){int top=0;for(int i=1;i<d->nc;i++)if(d->prob[i]>d->prob[top])top=i;fputs(",\"choice\":",stdout);json_print_string(d->cand[top]);fputs(",\"probabilities\":{",stdout);for(int i=0;i<d->nc;i++){if(i)putchar(',');json_print_string(d->cand[i]);printf(":%.17g",d->prob[i]);}printf("},\"confidence\":%.17g",confidence(d->prob,d->nc));}else{double ev=0;for(int i=0;i<d->nc;i++)ev+=i*d->prob[i];printf(",\"score\":%.17g,\"legend\":{",ev);int zc=0;for(int z=d->criteria+1;z<qnt;z++)if(qt[z].parent==d->criteria){printf("%s\"%d\":",zc?",":"",zc);zc++;json_print_token(qj,&qt[z]);}fputs("},\"probabilities\":{",stdout);for(int i=0;i<d->nc;i++)printf("%s\"%d\":%.17g",i?",":"",i,d->prob[i]);printf("},\"confidence\":%.17g",confidence(d->prob,d->nc));}putchar('}');}printf("},\"usage\":{\"input_tokens\":%u,\"output_tokens\":0},\"timing_ms\":{\"total\":%.3f,\"prefill\":%.3f,\"decode\":%.3f,\"candidates\":%.3f,\"reads\":%d}}\n",tokens,ms,prefill_ms,ms-prefill_ms-cand_ms,cand_ms,reads);}
+static void dg_print_answers(const char*qj,JTok*qt,int qnt,DecisionWork*w,int nq,const char*id,uint32_t tokens,double ms,double prefill_ms,double cand_ms,int reads){printf("{\"model\":\"jev-bush-diffusion-%s\",\"math\":\"%s\",\"kernels\":\"%s\",\"threads\":%d,",JB_VERSION,JB_MATH_MODE,JB_KERNELS,jb_threads());if(id){fputs("\"id\":",stdout);json_print_string(id);putchar(',');}fputs("\"answers\":{",stdout);for(int x=0;x<nq;x++){DecisionWork*d=&w[x];if(x)putchar(',');char*k=jt_string(qj,&qt[d->key]);json_print_string(k);free(k);fputs(":{\"type\":",stdout);json_print_string(d->kind);if(!strcmp(d->kind,"noul"))printf(",\"noul\":%.17g,\"probabilities\":{\"true\":%.17g,\"false\":%.17g},\"confidence\":%.17g",d->prob[0],d->prob[0],d->prob[1],confidence(d->prob,d->nc));else if(!strcmp(d->kind,"choice")){int top=0;for(int i=1;i<d->nc;i++)if(d->prob[i]>d->prob[top])top=i;fputs(",\"choice\":",stdout);json_print_string(d->cand[top]);fputs(",\"probabilities\":{",stdout);for(int i=0;i<d->nc;i++){if(i)putchar(',');json_print_string(d->cand[i]);printf(":%.17g",d->prob[i]);}printf("},\"confidence\":%.17g",confidence(d->prob,d->nc));}else{double ev=0;for(int i=0;i<d->nc;i++)ev+=i*d->prob[i];printf(",\"score\":%.17g,\"legend\":{",ev);int zc=0;for(int z=d->criteria+1;z<qnt;z++)if(qt[z].parent==d->criteria){printf("%s\"%d\":",zc?",":"",zc);zc++;json_print_token(qj,&qt[z]);}fputs("},\"probabilities\":{",stdout);for(int i=0;i<d->nc;i++)printf("%s\"%d\":%.17g",i?",":"",i,d->prob[i]);printf("},\"confidence\":%.17g",confidence(d->prob,d->nc));}putchar('}');}printf("},\"usage\":{\"input_tokens\":%u,\"output_tokens\":0},\"timing_ms\":{\"total\":%.3f,\"prefill\":%.3f,\"decode\":%.3f,\"candidates\":%.3f,\"reads\":%d}}\n",tokens,ms,prefill_ms,ms-prefill_ms-cand_ms,cand_ms,reads);}
 
 typedef struct {
     const char *j, *qj;
@@ -1775,11 +1783,7 @@ static double jb_best_ms(uint64_t *ns, int reps) {
     return (double)best / 1e6;
 }
 static int bench_kernels(void) {
-    int threads = 1;
-#ifdef _OPENMP
-    threads = omp_get_max_threads();
-#endif
-    printf("{\"bench\":\"info\",\"kernels\":\"%s\",\"math\":\"%s\",\"threads\":%d}\n", JB_KERNELS, JB_MATH_MODE, threads);
+    printf("{\"bench\":\"info\",\"kernels\":\"%s\",\"math\":\"%s\",\"threads\":%d}\n", JB_KERNELS, JB_MATH_MODE, jb_threads());
     uint64_t rs = 0x243f6a8885a308d3ull, ns[3];
     size_t nw = (size_t)1 << 26;
     uint64_t *buf = xmalloc(nw * sizeof *buf), acc = 0;
