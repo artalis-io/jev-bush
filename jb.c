@@ -1209,7 +1209,7 @@ static void dg_ff(DGModel *m, int l, float *x, int n) {
     DGTensor *rw=dg_layer_tensor(m,l,"router.proj.weight"),*rs=dg_layer_tensor(m,l,"router.scale"),*re=dg_layer_tensor(m,l,"router.per_expert_scale");
     DGTensor *eg=m->nvfp4?NULL:dg_layer_tensor(m,l,"experts.gate_up_proj"),*ed=m->nvfp4?NULL:dg_layer_tensor(m,l,"experts.down_proj");
     DGTensor *p2=dg_layer_tensor(m,l,"post_feedforward_layernorm_2.weight"),*post=dg_layer_tensor(m,l,"post_feedforward_layernorm.weight");
-    float *z1=xmalloc((size_t)n*DG_H*4),*g=xmalloc((size_t)n*DG_DENSE*4),*u=xmalloc((size_t)n*DG_DENSE*4),*d=xmalloc((size_t)n*DG_H*4),*z2=xmalloc((size_t)n*DG_H*4),*rin=xmalloc((size_t)n*DG_H*4),*route=xmalloc((size_t)n*128*4);
+    float *z1=xcalloc((size_t)n*DG_H,4),*g=xmalloc((size_t)n*DG_DENSE*4),*u=xmalloc((size_t)n*DG_DENSE*4),*d=xmalloc((size_t)n*DG_H*4),*z2=xmalloc((size_t)n*DG_H*4),*rin=xcalloc((size_t)n*DG_H,4),*route=xmalloc((size_t)n*128*4);
 #ifdef _OPENMP
 #pragma omp parallel for schedule(static)
 #endif
