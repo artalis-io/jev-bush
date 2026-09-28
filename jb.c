@@ -102,14 +102,17 @@ typedef struct {
     uint64_t moe_hidden_qdq, moe_down;
     uint64_t prompt_tokens, system_tokens, state_tokens;
     uint64_t omp_regions, alloc_calls, hot_alloc_calls, alloc_ns;
+    int hot;
 } JBProfile;
 
-/* Per calling thread: concurrent sessions would otherwise mix their counts. */
-static _Thread_local JBProfile jb_profile;
-static _Thread_local int jb_profile_hot;
+/* A request's counters live in its session's workspace. This points at the
+ * running request's counters, or is NULL (kernel self-tests, benchmarks),
+ * for code that has no session in scope: allocators and kernels. */
+static _Thread_local JBProfile *jb_profile_active;
 #define JB_TICK(name) uint64_t name = now_ns()
-#define JB_TO(field, name) (jb_profile.field += now_ns() - (name))
-#define JB_OMP() (jb_profile.omp_regions++)
+#define JB_TO(field, name)                                                                        \
+    (jb_profile_active ? (void)(jb_profile_active->field += now_ns() - (name)) : (void)0)
+#define JB_OMP() (jb_profile_active ? (void)jb_profile_active->omp_regions++ : (void)0)
 #else
 #define JB_TICK(name)
 #define JB_TO(field, name)
@@ -258,9 +261,11 @@ static void *jb_try_allocate(size_t n, int clear) {
 #endif
     JBAllocation *a = clear ? calloc(1, sizeof *a + n) : malloc(sizeof *a + n);
 #ifdef JB_PROFILE
-    jb_profile.alloc_ns += now_ns() - start;
-    jb_profile.alloc_calls++;
-    jb_profile.hot_alloc_calls += (uint64_t)jb_profile_hot;
+    if (jb_profile_active) {
+        jb_profile_active->alloc_ns += now_ns() - start;
+        jb_profile_active->alloc_calls++;
+        jb_profile_active->hot_alloc_calls += (uint64_t)jb_profile_active->hot;
+    }
 #endif
     if (!a)
         return NULL;
@@ -314,9 +319,11 @@ static void *xrealloc(void *p, size_t n) {
 #endif
     JBAllocation *b = realloc(a, sizeof *a + n);
 #ifdef JB_PROFILE
-    jb_profile.alloc_ns += now_ns() - start;
-    jb_profile.alloc_calls++;
-    jb_profile.hot_alloc_calls += (uint64_t)jb_profile_hot;
+    if (jb_profile_active) {
+        jb_profile_active->alloc_ns += now_ns() - start;
+        jb_profile_active->alloc_calls++;
+        jb_profile_active->hot_alloc_calls += (uint64_t)jb_profile_active->hot;
+    }
 #endif
     if (!b) {
         if (tracked)
@@ -2375,6 +2382,9 @@ typedef struct {
     JBArena control_arena;
     size_t capacity, kv_capacity, control_capacity;
     int active, kv_active, control_active;
+#ifdef JB_PROFILE
+    JBProfile profile;
+#endif
 } DGWorkspace;
 
 static JBArena *dg_workspace_begin(DGWorkspace *workspace, size_t required) {
@@ -4060,8 +4070,9 @@ static int dg_systemone(DGModel *m, DGTokenizer *tok, const char *j, size_t len,
                         DGPrefixCache *prefix_cache, DGWorkspace *workspace, char **output,
                         size_t *output_length) {
 #ifdef JB_PROFILE
-    memset(&jb_profile, 0, sizeof jb_profile);
-    jb_profile_hot = 0;
+    JBProfile *profile = &workspace->profile, *previous_profile = jb_profile_active;
+    memset(profile, 0, sizeof *profile);
+    jb_profile_active = profile;
 #endif
     DGJob job;
     dg_job_prepare(&job, tok, j, len);
@@ -4069,14 +4080,14 @@ static int dg_systemone(DGModel *m, DGTokenizer *tok, const char *j, size_t len,
     DGTensor *emb = dg_tensor(m, "model.decoder.embed_tokens.weight");
 #ifdef JB_PROFILE
     Tokens system_part = dgt_tokenize(tok, job.sys), state_part = dgt_tokenize(tok, rq->state);
-    jb_profile.prompt_tokens = job.pt.n;
-    jb_profile.system_tokens = system_part.n;
-    jb_profile.state_tokens = state_part.n;
+    profile->prompt_tokens = job.pt.n;
+    profile->system_tokens = system_part.n;
+    profile->state_tokens = state_part.n;
     jb_release(system_part.v);
     jb_release(state_part.v);
 #endif
 #ifdef JB_PROFILE
-    jb_profile_hot = 1;
+    profile->hot = 1;
 #endif
     uint64_t start = now_ns();
     DGKV kv[DG_L] = {0};
@@ -4182,7 +4193,7 @@ static int dg_systemone(DGModel *m, DGTokenizer *tok, const char *j, size_t len,
 #endif
     dg_worker_kv_end(workspace, kv, 1);
 #ifdef JB_PROFILE
-    jb_profile_hot = 0;
+    profile->hot = 0;
 #endif
     dg_job_normalize(&job);
     double cand_ms = job.candidate_ns / 1e6, ms = (now_ns() - start) / 1e6;
@@ -4191,19 +4202,19 @@ static int dg_systemone(DGModel *m, DGTokenizer *tok, const char *j, size_t len,
                                 prefill_ns / 1e6, cand_ms, job.reads, job.groups, cache_state,
                                 cache_tokens, processed_tokens, 1, output_length);
 #ifdef JB_PROFILE
-    uint64_t detailed = jb_profile.moe_input_qdq + jb_profile.moe_gate + jb_profile.moe_up +
-                        jb_profile.moe_activation + jb_profile.moe_hidden_qdq + jb_profile.moe_down;
+    uint64_t detailed = profile->moe_input_qdq + profile->moe_gate + profile->moe_up +
+                        profile->moe_activation + profile->moe_hidden_qdq + profile->moe_down;
     double moe_misc =
-        (double)(jb_profile.experts >= detailed ? jb_profile.experts - detailed : 0) / 1e6;
-    uint64_t ad = jb_profile.attention_qkv + jb_profile.attention_prepare +
-                  jb_profile.attention_kv + jb_profile.attention_core + jb_profile.attention_output;
+        (double)(profile->experts >= detailed ? profile->experts - detailed : 0) / 1e6;
+    uint64_t ad = profile->attention_qkv + profile->attention_prepare +
+                  profile->attention_kv + profile->attention_core + profile->attention_output;
     double attention_misc =
-        (double)(jb_profile.attention >= ad ? jb_profile.attention - ad : 0) / 1e6;
-    uint64_t ld = jb_profile.attention + jb_profile.dense + jb_profile.router + jb_profile.experts +
-                  jb_profile.ff_other;
-    double layer_other = (double)(jb_profile.layers >= ld ? jb_profile.layers - ld : 0) / 1e6;
-    double accounted = jb_profile.layers / 1e6 + jb_profile.embedding / 1e6 +
-                       jb_profile.final_norm / 1e6 + jb_profile.kv_free / 1e6 + cand_ms;
+        (double)(profile->attention >= ad ? profile->attention - ad : 0) / 1e6;
+    uint64_t ld = profile->attention + profile->dense + profile->router + profile->experts +
+                  profile->ff_other;
+    double layer_other = (double)(profile->layers >= ld ? profile->layers - ld : 0) / 1e6;
+    double accounted = profile->layers / 1e6 + profile->embedding / 1e6 +
+                       profile->final_norm / 1e6 + profile->kv_free / 1e6 + cand_ms;
     double unaccounted = ms > accounted ? ms - accounted : 0;
     fprintf(
         stderr,
@@ -4215,18 +4226,19 @@ static int dg_systemone(DGModel *m, DGTokenizer *tok, const char *j, size_t len,
         "moe_activation=%.3f moe_hidden_qdq=%.3f moe_down=%.3f moe_misc=%.3f ff_other=%.3f "
         "layer_other=%.3f embedding=%.3f final_norm=%.3f kv_free=%.3f candidates=%.3f "
         "unaccounted=%.3f total=%.3f\n",
-        (unsigned long long)jb_profile.prompt_tokens, (unsigned long long)jb_profile.system_tokens,
-        (unsigned long long)jb_profile.state_tokens, (unsigned long long)jb_profile.omp_regions,
-        (unsigned long long)jb_profile.alloc_calls, (unsigned long long)jb_profile.hot_alloc_calls,
-        jb_profile.alloc_ns / 1e6, workspace->capacity / 1048576.0, kv_mb,
-        jb_profile.attention / 1e6, jb_profile.attention_qkv / 1e6,
-        jb_profile.attention_prepare / 1e6, jb_profile.attention_kv / 1e6,
-        jb_profile.attention_core / 1e6, jb_profile.attention_output / 1e6, attention_misc,
-        jb_profile.dense / 1e6, jb_profile.router / 1e6, jb_profile.experts / 1e6,
-        jb_profile.moe_input_qdq / 1e6, jb_profile.moe_gate / 1e6, jb_profile.moe_up / 1e6,
-        jb_profile.moe_activation / 1e6, jb_profile.moe_hidden_qdq / 1e6, jb_profile.moe_down / 1e6,
-        moe_misc, jb_profile.ff_other / 1e6, layer_other, jb_profile.embedding / 1e6,
-        jb_profile.final_norm / 1e6, jb_profile.kv_free / 1e6, cand_ms, unaccounted, ms);
+        (unsigned long long)profile->prompt_tokens, (unsigned long long)profile->system_tokens,
+        (unsigned long long)profile->state_tokens, (unsigned long long)profile->omp_regions,
+        (unsigned long long)profile->alloc_calls, (unsigned long long)profile->hot_alloc_calls,
+        profile->alloc_ns / 1e6, workspace->capacity / 1048576.0, kv_mb,
+        profile->attention / 1e6, profile->attention_qkv / 1e6,
+        profile->attention_prepare / 1e6, profile->attention_kv / 1e6,
+        profile->attention_core / 1e6, profile->attention_output / 1e6, attention_misc,
+        profile->dense / 1e6, profile->router / 1e6, profile->experts / 1e6,
+        profile->moe_input_qdq / 1e6, profile->moe_gate / 1e6, profile->moe_up / 1e6,
+        profile->moe_activation / 1e6, profile->moe_hidden_qdq / 1e6, profile->moe_down / 1e6,
+        moe_misc, profile->ff_other / 1e6, layer_other, profile->embedding / 1e6,
+        profile->final_norm / 1e6, profile->kv_free / 1e6, cand_ms, unaccounted, ms);
+    jb_profile_active = previous_profile;
 #endif
     dg_job_free(&job);
     return 0;
@@ -4628,7 +4640,7 @@ static jb_status jb_session_decide_json_call(jb_session *session, const char *re
     jb_frame_enter(&frame, JB_ERROR_REQUEST);
     if (setjmp(frame.jump)) {
 #ifdef JB_PROFILE
-        jb_profile_hot = 0;
+        jb_profile_active = NULL;
 #endif
         session->workspace.active = 0;
         session->workspace.kv_active = 0;
@@ -4656,7 +4668,7 @@ static jb_status jb_session_decide_json_batch_call(jb_session *session, const ch
     jb_frame_enter(&frame, JB_ERROR_REQUEST);
     if (setjmp(frame.jump)) {
 #ifdef JB_PROFILE
-        jb_profile_hot = 0;
+        jb_profile_active = NULL;
 #endif
         session->workspace.active = 0;
         session->workspace.kv_active = 0;
