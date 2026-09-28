@@ -125,6 +125,12 @@ of a call. Typed results use one contiguous library allocation and are released
 with `jb_result_free()`. JSON buffers and JSON batch arrays are released with
 `jb_free()`.
 
+Every call returns a `jb_status`. `jb_session_last_error()` describes a
+session's most recent decide call from whichever thread reads it, so it stays
+correct when a session moves between threads. `jb_last_error()` describes the
+calling thread's most recent failure, which covers calls without a session:
+model loading and session creation.
+
 Typed sessions copy their decision schema at creation. `jb_session_decide()`
 accepts a JSON state value plus an optional stable identifier. The equivalent
 `jb_session_decide_json()` accepts the complete OpenJev request shape and
