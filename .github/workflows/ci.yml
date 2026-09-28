@@ -37,6 +37,43 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           .\jb.exe --selftest
 
+  # The README's Windows build. Errors unwind with longjmp, which MinGW's
+  # default SEH setjmp crashed on at -O2, so exercise an error path directly.
+  mingw:
+    name: MinGW gcc -O2 (Windows)
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: msys2 {0}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          install: mingw-w64-ucrt-x86_64-gcc
+
+      - name: Build and test
+        run: |
+          gcc -O2 -std=c11 -Wall -Wextra -pedantic -Werror jb.c -lm -o jb
+          ./jb --selftest
+          rc=0
+          ./jb missing-model decide examples/request.json 2>err.txt || rc=$?
+          cat err.txt
+          test "$rc" -eq 2
+          grep -q '^jb: open: ' err.txt
+
+      - name: Library error path
+        run: |
+          gcc -O2 -std=c11 -Wall -Wextra -pedantic -Werror -DJB_NO_MAIN -I. \
+            examples/library.c jb.c -lm -o library
+          rc=0
+          ./library missing-model 2>err.txt || rc=$?
+          cat err.txt
+          test "$rc" -eq 1
+          grep -q '^jev-bush: model error: open: ' err.txt
+
   # GitHub's x86 runners may lack AVX-512, so run those kernels under Intel's
   # Software Development Emulator, pinned by URL and checksum.
   avx512:
