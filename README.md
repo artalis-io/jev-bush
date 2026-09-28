@@ -99,6 +99,12 @@ The AVX2 tier covers NVFP4 expert projections, BF16 matrices, RMS normalization,
 and attention dot products. The scalar reference and AVX-512 implementations
 remain separately compiled and checked by the same self-test.
 
+Internally, model execution uses one small `DGKernelOps` table for BF16 GEMM,
+NVFP4 quantization/GEMM, RMS normalization, and attention dots. Scalar, AVX2,
+and AVX-512 differ only behind that boundary; inference, validation, benchmarks,
+and JSON output contain no ISA dispatch branches. Selection remains compile-time
+so the portable build does not require runtime CPU detection.
+
 For deployments that accept requests from other processes or users, add the
 usual Linux hardening flags; they do not change results:
 

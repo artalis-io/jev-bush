@@ -18,14 +18,10 @@
 
 #if defined(__AVX512F__) && defined(__AVX512DQ__)
 #define JB_AVX512 1
-#define JB_KERNELS "avx512"
 #include <immintrin.h>
 #elif defined(__AVX2__) && defined(__FMA__)
 #define JB_AVX2 1
-#define JB_KERNELS "avx2"
 #include <immintrin.h>
-#else
-#define JB_KERNELS "scalar"
 #endif
 #ifdef _OPENMP
 #include <omp.h>
@@ -499,6 +495,16 @@ typedef struct {
     uint64_t shape[4], bytes;
     int nd, dtype;
 } DGTensor;
+typedef struct {
+    const char *name;
+    void (*nvfp4_qdq)(float *, const float *, int, int, float);
+    void (*nvfp4_layout)(float *, int, int);
+    void (*nvfp4_mm)(const uint8_t *, const uint8_t *, float, const float *, float *, int, int, int);
+    void (*bf16_mm)(const uint8_t *, const float *, float *, int, int, int);
+    void (*rms)(float *, const float *, const DGTensor *, int);
+    double (*dot)(const float *, const float *, int);
+} DGKernelOps;
+static const DGKernelOps *dg_kernels(void);
 typedef struct{
     DGTensor *wg,*sg,*gg,*ag,*wu,*su,*gu,*wd,*sd,*gd,*ad;
 } DGNvExpert;
@@ -1029,17 +1035,14 @@ static void dg_nvfp4_swizzle(float*out,int tokens,int cols){
         for(int k=0;k<16;k++){y[k]=tmp[k*2];y[16+k]=tmp[k*2+1];}
     }
 }
+static void dg_nvfp4_qdq_avx512(float*out,const float*in,int tokens,int cols,float base){
+    dg_nvfp4_qdq_ref(out,in,tokens,cols,base);
+    dg_nvfp4_swizzle(out,tokens,cols);
+}
 #endif
 /* Produces the activation layout the selected dg_nvfp4_mm kernel expects. */
 static void dg_nvfp4_qdq(float*out,const float*in,int tokens,int cols,float base){
-#if defined(JB_AVX2)
-    dg_nvfp4_qdq_avx2(out,in,tokens,cols,base);
-#else
-    dg_nvfp4_qdq_ref(out,in,tokens,cols,base);
-#endif
-#if defined(JB_AVX512)
-    dg_nvfp4_swizzle(out,tokens,cols);
-#endif
+    dg_kernels()->nvfp4_qdq(out,in,tokens,cols,base);
 }
 /* x in the dg_nvfp4_qdq_ref layout. */
 static void dg_nvfp4_mm_ref(const uint8_t*wd,const uint8_t*sd,float global,const float*x,float*y,int tokens,int rows,int cols){
@@ -1124,13 +1127,7 @@ static void dg_nvfp4_mm(const DGTensor*w,const DGTensor*s,const DGTensor*g,
        s->dtype!=DG_F8E4M3||s->nd!=2||s->shape[0]!=(uint64_t)rows||s->shape[1]!=(uint64_t)cols/16||
        g->dtype!=DG_F32||g->nd!=0||g->bytes!=4||cols%32||rows%2)die2("bad NVFP4 expert tensor",w->name);
     float global;memcpy(&global,g->data,4);
-#if defined(JB_AVX512)
-    dg_nvfp4_mm_avx512(w->data,s->data,global,x,y,tokens,rows,cols);
-#elif defined(JB_AVX2)
-    dg_nvfp4_mm_avx2(w->data,s->data,global,x,y,tokens,rows,cols);
-#else
-    dg_nvfp4_mm_ref(w->data,s->data,global,x,y,tokens,rows,cols);
-#endif
+    dg_kernels()->nvfp4_mm(w->data,s->data,global,x,y,tokens,rows,cols);
 }
 #if defined(JB_AVX512)
 static __m512 dg_bf16x16(const uint8_t *p){
@@ -1184,13 +1181,7 @@ static void dg_mm_data_ref(const uint8_t*data,const float*x,float*y,int tokens,i
 }
 static void dg_mm_data(const uint8_t*data,const float*x,float*y,int tokens,int rows,int cols){
     if(tokens<1||tokens>JB_MAX_CTX)die("DiffusionGemma sequence exceeds context limit");
-#if defined(JB_AVX512)
-    dg_mm_data_avx512(data,x,y,tokens,rows,cols);
-#elif defined(JB_AVX2)
-    dg_mm_data_avx2(data,x,y,tokens,rows,cols);
-#else
-    dg_mm_data_ref(data,x,y,tokens,rows,cols);
-#endif
+    dg_kernels()->bf16_mm(data,x,y,tokens,rows,cols);
 }
 static void dg_mm(const DGTensor*w,const float*x,float*y,int tokens,int rows,int cols){if(w->nd!=2||w->shape[0]!=(uint64_t)rows||w->shape[1]!=(uint64_t)cols)die2("bad matrix shape",w->name);dg_mm_data(w->data,x,y,tokens,rows,cols);}
 static void dg_mv_slice(const DGTensor *w, uint64_t base, const float *x, float *y, int rows, int cols) {
@@ -1279,13 +1270,7 @@ static double dg_hsum4d(__m256d x){__m128d h=_mm_add_pd(_mm256_castpd256_pd128(x
 static void dg_rms_avx2(float*y,const float*x,const DGTensor*scale,int n){__m256d a=_mm256_setzero_pd(),b=a;int i=0;for(;i+7<n;i+=8){__m256 v=_mm256_loadu_ps(x+i);__m256d lo=_mm256_cvtps_pd(_mm256_castps256_ps128(v)),hi=_mm256_cvtps_pd(_mm256_extractf128_ps(v,1));a=_mm256_fmadd_pd(lo,lo,a);b=_mm256_fmadd_pd(hi,hi,b);}double ss=dg_hsum4d(_mm256_add_pd(a,b));for(;i<n;i++)ss+=(double)x[i]*x[i];float q=1.0f/sqrtf((float)(ss/n)+1e-6f);i=0;if(scale)for(;i+7<n;i+=8)_mm256_storeu_ps(y+i,_mm256_mul_ps(_mm256_mul_ps(_mm256_loadu_ps(x+i),_mm256_set1_ps(q)),dg_bf16x8(scale->data+(size_t)i*2)));else for(;i+7<n;i+=8)_mm256_storeu_ps(y+i,_mm256_mul_ps(_mm256_loadu_ps(x+i),_mm256_set1_ps(q)));for(;i<n;i++)y[i]=x[i]*q*(scale?dg_at(scale,i):1.0f);}
 #endif
 static void dg_rms(float *y, const float *x, const DGTensor *scale, int n) {
-#if defined(JB_AVX512)
-    dg_rms_avx512(y, x, scale, n);
-#elif defined(JB_AVX2)
-    dg_rms_avx2(y,x,scale,n);
-#else
-    dg_rms_ref(y, x, scale, n);
-#endif
+    dg_kernels()->rms(y,x,scale,n);
 }
 static float dg_gelu(float x) {
     return .5f * x * (1.0f + tanhf(.7978845608028654f * (x + .044715f * x * x * x)));
@@ -1302,12 +1287,18 @@ static double dg_dot_avx512(const float*a,const float*b,int n){
 static double dg_dot_avx2(const float*a,const float*b,int n){__m256d s0=_mm256_setzero_pd(),s1=s0;int i=0;for(;i+7<n;i+=8){__m256 x=_mm256_loadu_ps(a+i),y=_mm256_loadu_ps(b+i);s0=_mm256_fmadd_pd(_mm256_cvtps_pd(_mm256_castps256_ps128(x)),_mm256_cvtps_pd(_mm256_castps256_ps128(y)),s0);s1=_mm256_fmadd_pd(_mm256_cvtps_pd(_mm256_extractf128_ps(x,1)),_mm256_cvtps_pd(_mm256_extractf128_ps(y,1)),s1);}double s=dg_hsum4d(_mm256_add_pd(s0,s1));for(;i<n;i++)s+=(double)a[i]*b[i];return s;}
 #endif
 static double dg_dot(const float*a,const float*b,int n){
+    return dg_kernels()->dot(a,b,n);
+}
+static const DGKernelOps *dg_kernels(void){
 #if defined(JB_AVX512)
-    return dg_dot_avx512(a,b,n);
+    static const DGKernelOps selected={"avx512",dg_nvfp4_qdq_avx512,dg_nvfp4_swizzle,dg_nvfp4_mm_avx512,dg_mm_data_avx512,dg_rms_avx512,dg_dot_avx512};
+    return &selected;
 #elif defined(JB_AVX2)
-    return dg_dot_avx2(a,b,n);
+    static const DGKernelOps selected={"avx2",dg_nvfp4_qdq_avx2,NULL,dg_nvfp4_mm_avx2,dg_mm_data_avx2,dg_rms_avx2,dg_dot_avx2};
+    return &selected;
 #else
-    return dg_dot_ref(a,b,n);
+    static const DGKernelOps scalar={"scalar",dg_nvfp4_qdq_ref,NULL,dg_nvfp4_mm_ref,dg_mm_data_ref,dg_rms_ref,dg_dot_ref};
+    return &scalar;
 #endif
 }
 static DGTensor *dg_layer_tensor(DGModel *m, int l, const char *tail) {
@@ -1765,7 +1756,7 @@ static char *dg_system_prompt(const char *qj,JTok *qt,int qnt,DecisionWork*w,int
 }
 static char *dg_answer_text_range(DecisionWork*w,int total,int start,int count,const int*pick){DGBuf b={0};db_mem(&b,"",0);for(int z=0;z<count;z++){int i=start+z;if(z)db_ch(&b,total<=10?'\n':' ');db_fmt(&b,total<=10?"q%d: %s":"q%d%s",i+1,w[i].label[pick[i]]);}return b.p;}
 static char *dg_answer_text(DecisionWork*w,int nq,const int*pick){return dg_answer_text_range(w,nq,0,nq,pick);}
-static void dg_print_answers(const char*qj,JTok*qt,int qnt,DecisionWork*w,int nq,const char*id,uint32_t tokens,double ms,double prefill_ms,double cand_ms,int reads,int canvases,const char*cache_state,int cache_tokens,int processed_tokens,int microbatch){printf("{\"model\":\"jev-bush-diffusion-%s\",\"math\":\"%s\",\"kernels\":\"%s\",\"threads\":%d,",JB_VERSION,JB_MATH_MODE,JB_KERNELS,jb_threads());if(id){fputs("\"id\":",stdout);json_print_string(id);putchar(',');}fputs("\"answers\":{",stdout);for(int x=0;x<nq;x++){DecisionWork*d=&w[x];if(x)putchar(',');char*k=jt_string(qj,&qt[d->key]);json_print_string(k);free(k);fputs(":{\"type\":",stdout);json_print_string(d->kind);if(!strcmp(d->kind,"noul"))printf(",\"noul\":%.17g,\"probabilities\":{\"true\":%.17g,\"false\":%.17g},\"confidence\":%.17g",d->prob[0],d->prob[0],d->prob[1],confidence(d->prob,d->nc));else if(!strcmp(d->kind,"choice")){int top=0;for(int i=1;i<d->nc;i++)if(d->prob[i]>d->prob[top])top=i;fputs(",\"choice\":",stdout);json_print_string(d->cand[top]);fputs(",\"probabilities\":{",stdout);for(int i=0;i<d->nc;i++){if(i)putchar(',');json_print_string(d->cand[i]);printf(":%.17g",d->prob[i]);}printf("},\"confidence\":%.17g",confidence(d->prob,d->nc));}else{double ev=0;for(int i=0;i<d->nc;i++)ev+=i*d->prob[i];printf(",\"score\":%.17g,\"legend\":{",ev);int zc=0;for(int z=d->criteria+1;z<qnt;z++)if(qt[z].parent==d->criteria){printf("%s\"%d\":",zc?",":"",zc);zc++;json_print_token(qj,&qt[z]);}fputs("},\"probabilities\":{",stdout);for(int i=0;i<d->nc;i++)printf("%s\"%d\":%.17g",i?",":"",i,d->prob[i]);printf("},\"confidence\":%.17g",confidence(d->prob,d->nc));}putchar('}');}printf("},\"usage\":{\"input_tokens\":%u,\"output_tokens\":0,\"prefill_tokens\":%d},\"timing_ms\":{\"total\":%.3f,\"prefill\":%.3f,\"decode\":%.3f,\"candidates\":%.3f,\"reads\":%d,\"canvases\":%d,\"microbatch\":%d,\"prefix_cache\":\"%s\",\"cache_tokens\":%d}}\n",tokens,processed_tokens,ms,prefill_ms,ms-prefill_ms-cand_ms,cand_ms,reads,canvases,microbatch,cache_state,cache_tokens);}
+static void dg_print_answers(const char*qj,JTok*qt,int qnt,DecisionWork*w,int nq,const char*id,uint32_t tokens,double ms,double prefill_ms,double cand_ms,int reads,int canvases,const char*cache_state,int cache_tokens,int processed_tokens,int microbatch){printf("{\"model\":\"jev-bush-diffusion-%s\",\"math\":\"%s\",\"kernels\":\"%s\",\"threads\":%d,",JB_VERSION,JB_MATH_MODE,dg_kernels()->name,jb_threads());if(id){fputs("\"id\":",stdout);json_print_string(id);putchar(',');}fputs("\"answers\":{",stdout);for(int x=0;x<nq;x++){DecisionWork*d=&w[x];if(x)putchar(',');char*k=jt_string(qj,&qt[d->key]);json_print_string(k);free(k);fputs(":{\"type\":",stdout);json_print_string(d->kind);if(!strcmp(d->kind,"noul"))printf(",\"noul\":%.17g,\"probabilities\":{\"true\":%.17g,\"false\":%.17g},\"confidence\":%.17g",d->prob[0],d->prob[0],d->prob[1],confidence(d->prob,d->nc));else if(!strcmp(d->kind,"choice")){int top=0;for(int i=1;i<d->nc;i++)if(d->prob[i]>d->prob[top])top=i;fputs(",\"choice\":",stdout);json_print_string(d->cand[top]);fputs(",\"probabilities\":{",stdout);for(int i=0;i<d->nc;i++){if(i)putchar(',');json_print_string(d->cand[i]);printf(":%.17g",d->prob[i]);}printf("},\"confidence\":%.17g",confidence(d->prob,d->nc));}else{double ev=0;for(int i=0;i<d->nc;i++)ev+=i*d->prob[i];printf(",\"score\":%.17g,\"legend\":{",ev);int zc=0;for(int z=d->criteria+1;z<qnt;z++)if(qt[z].parent==d->criteria){printf("%s\"%d\":",zc?",":"",zc);zc++;json_print_token(qj,&qt[z]);}fputs("},\"probabilities\":{",stdout);for(int i=0;i<d->nc;i++)printf("%s\"%d\":%.17g",i?",":"",i,d->prob[i]);printf("},\"confidence\":%.17g",confidence(d->prob,d->nc));}putchar('}');}printf("},\"usage\":{\"input_tokens\":%u,\"output_tokens\":0,\"prefill_tokens\":%d},\"timing_ms\":{\"total\":%.3f,\"prefill\":%.3f,\"decode\":%.3f,\"candidates\":%.3f,\"reads\":%d,\"canvases\":%d,\"microbatch\":%d,\"prefix_cache\":\"%s\",\"cache_tokens\":%d}}\n",tokens,processed_tokens,ms,prefill_ms,ms-prefill_ms-cand_ms,cand_ms,reads,canvases,microbatch,cache_state,cache_tokens);}
 
 typedef struct {
     const char *j, *qj;
@@ -1972,7 +1963,7 @@ static void dg_test_mm(uint64_t *rs) {
             if (pass) dg_mm_data(w, x, y, tokens, rows, cols);
             else dg_mm_data_ref(w, x, y, tokens, rows, cols);
             for (int i = 0; i < tokens * rows; i++)
-                jb_check_close(pass ? "BF16 matmul (" JB_KERNELS ")" : "BF16 matmul (ref)", y[i], want[i], 1e-4 * mag[i]);
+                jb_check_close(pass ? dg_kernels()->name : "BF16 matmul (ref)", y[i], want[i], 1e-4 * mag[i]);
         }
         free(w); free(x); free(y); free(want); free(mag);
     }
@@ -2009,17 +2000,15 @@ static void dg_test_nvfp4(uint64_t *rs) {
         /* The production path: QDQ into the selected kernel's layout, then
          * the validated tensor entry point. */
         dg_nvfp4_qdq(xs, x, tokens, cols, base);
-#if defined(JB_AVX512)
-        dg_nvfp4_swizzle(xq, tokens, cols);
-#endif
-        if (memcmp(xs, xq, (size_t)tokens * cols * 4)) die2("kernel self-test failed", "NVFP4 QDQ layout (" JB_KERNELS ")");
+        if(dg_kernels()->nvfp4_layout)dg_kernels()->nvfp4_layout(xq,tokens,cols);
+        if (memcmp(xs, xq, (size_t)tokens * cols * 4)) die2("kernel self-test failed", dg_kernels()->name);
         DGTensor tw = {0}, ts = {0}, tg = {0};
         tw.name = ts.name = tg.name = "selftest";
         tw.data = wd; tw.dtype = DG_U8; tw.nd = 2; tw.shape[0] = (uint64_t)rows; tw.shape[1] = (uint64_t)cols / 2;
         ts.data = sd; ts.dtype = DG_F8E4M3; ts.nd = 2; ts.shape[0] = (uint64_t)rows; ts.shape[1] = (uint64_t)cols / 16;
         tg.data = (const uint8_t *)&global; tg.dtype = DG_F32; tg.bytes = 4;
         dg_nvfp4_mm(&tw, &ts, &tg, xs, y, tokens, rows, cols);
-        for (int i = 0; i < tokens * rows; i++) jb_check_close("NVFP4 matmul (" JB_KERNELS ")", y[i], want[i], 1e-4 * mag[i]);
+        for (int i = 0; i < tokens * rows; i++) jb_check_close(dg_kernels()->name, y[i], want[i], 1e-4 * mag[i]);
         free(wd); free(sd); free(x); free(xq); free(xs); free(y); free(want); free(mag);
     }
 }
@@ -2041,11 +2030,11 @@ static void dg_test_rms_dot(uint64_t *rs) {
             else dg_rms_ref(y, x, sc, n);
             for (int i = 0; i < n; i++) {
                 double want = x[i] * q * (sc ? dg_at(sc, i) : 1.0);
-                jb_check_close(pass & 2 ? "RMS norm (" JB_KERNELS ")" : "RMS norm (ref)", y[i], want, 1e-5 * fabs(want) + 1e-12);
+                jb_check_close(pass & 2 ? dg_kernels()->name : "RMS norm (ref)", y[i], want, 1e-5 * fabs(want) + 1e-12);
             }
         }
         jb_check_close("dot (ref)", dg_dot_ref(x, b, n), dot, 1e-12 * dmag);
-        jb_check_close("dot (" JB_KERNELS ")", dg_dot(x, b, n), dot, 1e-12 * dmag);
+        jb_check_close(dg_kernels()->name, dg_dot(x, b, n), dot, 1e-12 * dmag);
         free(x); free(b); free(y); free(sw);
     }
 }
@@ -2064,7 +2053,7 @@ static double jb_best_ms(uint64_t *ns, int reps) {
     return (double)best / 1e6;
 }
 static int bench_kernels(void) {
-    printf("{\"bench\":\"info\",\"kernels\":\"%s\",\"math\":\"%s\",\"threads\":%d}\n", JB_KERNELS, JB_MATH_MODE, jb_threads());
+    printf("{\"bench\":\"info\",\"kernels\":\"%s\",\"math\":\"%s\",\"threads\":%d}\n", dg_kernels()->name, JB_MATH_MODE, jb_threads());
     uint64_t rs = 0x243f6a8885a308d3ull, ns[3];
     size_t nw = (size_t)1 << 26;
     uint64_t *buf = xmalloc(nw * sizeof *buf), acc = 0;
@@ -2092,9 +2081,7 @@ static int bench_kernels(void) {
     for (size_t k = 0; k < sizeof mm_tokens / sizeof *mm_tokens; k++) {
         int tokens = mm_tokens[k];
         for (int kernel = 0; kernel < 2; kernel++) {
-#if !defined(JB_AVX512) && !defined(JB_AVX2)
-            if (kernel) break;
-#endif
+            if(kernel&&dg_kernels()->bf16_mm==dg_mm_data_ref)break;
             dg_mm_data_ref(w, x, y, tokens, rows, cols);
             for (int rep = 0; rep < 3; rep++) {
                 uint64_t t0 = now_ns();
@@ -2104,7 +2091,7 @@ static int bench_kernels(void) {
             }
             ms = jb_best_ms(ns, 3);
             printf("{\"bench\":\"bf16_mm\",\"kernel\":\"%s\",\"rows\":%d,\"cols\":%d,\"tokens\":%d,\"ms\":%.3f,\"gflops\":%.2f,\"weight_gb_per_s\":%.2f}\n",
-                   kernel ? JB_KERNELS : "ref", rows, cols, tokens, ms, 2.0 * rows * cols * tokens / ms / 1e6, 2.0 * rows * cols / ms / 1e6);
+                   kernel ? dg_kernels()->name : "ref", rows, cols, tokens, ms, 2.0 * rows * cols * tokens / ms / 1e6, 2.0 * rows * cols / ms / 1e6);
         }
     }
     free(w); free(x); free(y);
@@ -2124,26 +2111,18 @@ static int bench_kernels(void) {
     for (size_t k = 0; k < sizeof nv_tokens / sizeof *nv_tokens; k++) {
         int tokens = nv_tokens[k];
         for (int kernel = 0; kernel < 2; kernel++) {
-#if !defined(JB_AVX512) && !defined(JB_AVX2)
-            if (kernel) break;
-#endif
+            if(kernel&&dg_kernels()->nvfp4_mm==dg_nvfp4_mm_ref)break;
             for (int rep = 0; rep < 3; rep++) {
                 uint64_t t0 = now_ns();
                 for (int e = 0; e < experts; e++) {
-#if defined(JB_AVX512)
-                    if (kernel) dg_nvfp4_mm_avx512(wd + wbytes * e, sd + sbytes * e, 0.01f, xs, yo, tokens, nr, nc);
-                    else
-#elif defined(JB_AVX2)
-                    if (kernel) dg_nvfp4_mm_avx2(wd + wbytes * e, sd + sbytes * e, 0.01f, xs, yo, tokens, nr, nc);
-                    else
-#endif
-                        dg_nvfp4_mm_ref(wd + wbytes * e, sd + sbytes * e, 0.01f, xq, yo, tokens, nr, nc);
+                    if(kernel)dg_kernels()->nvfp4_mm(wd+wbytes*e,sd+sbytes*e,0.01f,xs,yo,tokens,nr,nc);
+                    else dg_nvfp4_mm_ref(wd+wbytes*e,sd+sbytes*e,0.01f,xq,yo,tokens,nr,nc);
                 }
                 ns[rep] = now_ns() - t0;
             }
             ms = jb_best_ms(ns, 3);
             printf("{\"bench\":\"nvfp4_mm\",\"kernel\":\"%s\",\"experts\":%d,\"rows\":%d,\"cols\":%d,\"tokens\":%d,\"ms\":%.3f,\"gflops\":%.2f,\"weight_gb_per_s\":%.2f}\n",
-                   kernel ? JB_KERNELS : "ref", experts, nr, nc, tokens, ms, 2.0 * experts * nr * nc * tokens / ms / 1e6,
+                   kernel ? dg_kernels()->name : "ref", experts, nr, nc, tokens, ms, 2.0 * experts * nr * nc * tokens / ms / 1e6,
                    (double)(wbytes + sbytes) * experts / ms / 1e6);
         }
     }
