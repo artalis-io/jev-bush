@@ -12,6 +12,9 @@
  * invariants are not.
  */
 #define _POSIX_C_SOURCE 200809L
+#if defined(__MINGW32__) && !defined(__USE_MINGW_SETJMP_NON_SEH)
+#define __USE_MINGW_SETJMP_NON_SEH
+#endif
 /* Every system header jb.c uses, included before the macros below so they
  * rename calls inside jb.c only, never declarations in system headers. */
 #include <ctype.h>

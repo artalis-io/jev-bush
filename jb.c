@@ -6,6 +6,11 @@
  * The engine reads the exact public DiffusionGemma safetensors layout directly.
  */
 #define _POSIX_C_SOURCE 200809L
+#if defined(__MINGW32__) && !defined(__USE_MINGW_SETJMP_NON_SEH)
+/* MinGW's default setjmp makes longjmp unwind through SEH, which crashes in
+ * optimized builds; errors here only need a plain register restore. */
+#define __USE_MINGW_SETJMP_NON_SEH
+#endif
 #include <ctype.h>
 #include <float.h>
 #include <math.h>
