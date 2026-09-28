@@ -83,6 +83,8 @@ typedef struct {
 
 const char *jb_version(void);
 const char *jb_status_string(jb_status status);
+/* Describes the calling thread's most recent failure. On failure, every
+ * function below sets its non-NULL output parameters to NULL or zero. */
 const char *jb_last_error(void);
 
 jb_status jb_model_load(const char *model_directory, jb_model **out_model);

@@ -4402,9 +4402,10 @@ static jb_status jb_invalid(const char *message) {
 }
 
 jb_status jb_model_load(const char *model_directory, jb_model **out_model) {
+    if (out_model)
+        *out_model = NULL;
     if (!model_directory || !out_model)
         return jb_invalid("model directory and output pointer are required");
-    *out_model = NULL;
     jb_model *volatile model = NULL;
     JBErrorFrame frame;
     jb_frame_enter(&frame, JB_ERROR_MODEL);
@@ -4506,9 +4507,10 @@ static char *jb_schema_json(const jb_schema *schema, size_t *length) {
 
 jb_status jb_session_create_json(jb_model *model, const char *questions_json,
                                  size_t questions_length, jb_session **out_session) {
+    if (out_session)
+        *out_session = NULL;
     if (!model || !out_session || (!questions_json && questions_length))
         return jb_invalid("model, schema, and output pointer are required");
-    *out_session = NULL;
     if (questions_length > JB_MAX_JSON)
         return jb_invalid("schema JSON is too large");
     JBErrorFrame frame;
@@ -4535,6 +4537,8 @@ jb_status jb_session_create_json(jb_model *model, const char *questions_json,
 }
 
 jb_status jb_session_create(jb_model *model, const jb_schema *schema, jb_session **out_session) {
+    if (out_session)
+        *out_session = NULL;
     if (!model || !schema || !out_session)
         return jb_invalid("model, typed schema, and output pointer are required");
     JBErrorFrame frame;
@@ -4577,10 +4581,12 @@ static DGPrefixCache *jb_session_prefix(jb_session *session) {
 
 jb_status jb_session_decide_json(jb_session *session, const char *request_json,
                                  size_t request_length, char **out_json, size_t *out_length) {
+    if (out_json)
+        *out_json = NULL;
+    if (out_length)
+        *out_length = 0;
     if (!session || !request_json || !request_length || !out_json || !out_length)
         return jb_invalid("session, request, and output pointers are required");
-    *out_json = NULL;
-    *out_length = 0;
     if (request_length > JB_MAX_JSON)
         return jb_invalid("request JSON is too large");
     JBErrorFrame frame;
@@ -4604,6 +4610,10 @@ jb_status jb_session_decide_json(jb_session *session, const char *request_json,
 jb_status jb_session_decide_json_batch(jb_session *session, const char *const *request_json,
                                        const size_t *request_lengths, size_t request_count,
                                        char ***out_json, size_t **out_lengths) {
+    if (out_json)
+        *out_json = NULL;
+    if (out_lengths)
+        *out_lengths = NULL;
     if (!session || !request_json || !request_lengths || !request_count || request_count > 16 ||
         !out_json || !out_lengths)
         return jb_invalid("batch arguments are invalid");
@@ -4827,9 +4837,10 @@ static char *jb_typed_request(const jb_session *session, const jb_input *input, 
 }
 
 jb_status jb_session_decide(jb_session *session, const jb_input *input, jb_result **out_result) {
+    if (out_result)
+        *out_result = NULL;
     if (!session || !input || !out_result)
         return jb_invalid("session, input, and output pointer are required");
-    *out_result = NULL;
     JBErrorFrame frame;
     jb_frame_enter(&frame, JB_ERROR_REQUEST);
     if (setjmp(frame.jump))
@@ -4852,9 +4863,10 @@ jb_status jb_session_decide(jb_session *session, const jb_input *input, jb_resul
 
 jb_status jb_session_decide_batch(jb_session *session, const jb_input *inputs, size_t input_count,
                                   jb_result ***out_results) {
+    if (out_results)
+        *out_results = NULL;
     if (!session || !inputs || !input_count || input_count > 16 || !out_results)
         return jb_invalid("typed batch arguments are invalid");
-    *out_results = NULL;
     JBErrorFrame frame;
     jb_frame_enter(&frame, JB_ERROR_REQUEST);
     if (setjmp(frame.jump))
