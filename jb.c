@@ -4390,6 +4390,8 @@ struct jb_session {
     DGWorkspace workspace;
     char *questions_json;
     size_t questions_length;
+    /* The most recent call's error, readable from any thread. */
+    char error[sizeof jb_error_message];
 };
 
 const char *jb_version(void) {
@@ -4612,7 +4614,7 @@ static DGPrefixCache *jb_session_prefix(jb_session *session) {
 #endif
 }
 
-jb_status jb_session_decide_json(jb_session *session, const char *request_json,
+static jb_status jb_session_decide_json_call(jb_session *session, const char *request_json,
                                  size_t request_length, char **out_json, size_t *out_length) {
     if (out_json)
         *out_json = NULL;
@@ -4640,7 +4642,7 @@ jb_status jb_session_decide_json(jb_session *session, const char *request_json,
     return JB_OK;
 }
 
-jb_status jb_session_decide_json_batch(jb_session *session, const char *const *request_json,
+static jb_status jb_session_decide_json_batch_call(jb_session *session, const char *const *request_json,
                                        const size_t *request_lengths, size_t request_count,
                                        char ***out_json, size_t **out_lengths) {
     if (out_json)
@@ -4867,7 +4869,7 @@ static char *jb_typed_request(const jb_session *session, const jb_input *input, 
     return request.p;
 }
 
-jb_status jb_session_decide(jb_session *session, const jb_input *input, jb_result **out_result) {
+static jb_status jb_session_decide_call(jb_session *session, const jb_input *input, jb_result **out_result) {
     if (out_result)
         *out_result = NULL;
     if (!session || !input || !out_result)
@@ -4892,7 +4894,7 @@ jb_status jb_session_decide(jb_session *session, const jb_input *input, jb_resul
     return JB_OK;
 }
 
-jb_status jb_session_decide_batch(jb_session *session, const jb_input *inputs, size_t input_count,
+static jb_status jb_session_decide_batch_call(jb_session *session, const jb_input *inputs, size_t input_count,
                                   jb_result ***out_results) {
     if (out_results)
         *out_results = NULL;
@@ -4929,6 +4931,47 @@ jb_status jb_session_decide_batch(jb_session *session, const jb_input *inputs, s
     jb_frame_leave(&frame);
     *out_results = result;
     return JB_OK;
+}
+
+/* Each session call records its outcome on the session, so the error can be
+ * read from whichever thread handles the session next. */
+static jb_status jb_session_record(jb_session *session, jb_status status) {
+    if (session) {
+        if (status == JB_OK)
+            session->error[0] = 0;
+        else
+            snprintf(session->error, sizeof session->error, "%s", jb_error_message);
+    }
+    return status;
+}
+
+const char *jb_session_last_error(const jb_session *session) {
+    return session ? session->error : "";
+}
+
+jb_status jb_session_decide_json(jb_session *session, const char *request_json,
+                                 size_t request_length, char **out_json, size_t *out_length) {
+    return jb_session_record(session, jb_session_decide_json_call(session, request_json,
+                                                                  request_length, out_json,
+                                                                  out_length));
+}
+
+jb_status jb_session_decide_json_batch(jb_session *session, const char *const *request_json,
+                                       const size_t *request_lengths, size_t request_count,
+                                       char ***out_json, size_t **out_lengths) {
+    return jb_session_record(session, jb_session_decide_json_batch_call(
+                                          session, request_json, request_lengths,
+                                          request_count, out_json, out_lengths));
+}
+
+jb_status jb_session_decide(jb_session *session, const jb_input *input, jb_result **out_result) {
+    return jb_session_record(session, jb_session_decide_call(session, input, out_result));
+}
+
+jb_status jb_session_decide_batch(jb_session *session, const jb_input *inputs, size_t input_count,
+                                  jb_result ***out_results) {
+    return jb_session_record(session,
+                             jb_session_decide_batch_call(session, inputs, input_count, out_results));
 }
 
 void jb_result_free(jb_result *result) {
