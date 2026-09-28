@@ -83,7 +83,8 @@ typedef struct {
 
 const char *jb_version(void);
 const char *jb_status_string(jb_status status);
-/* Describes the calling thread's most recent failure. On failure, every
+/* Describes the calling thread's most recent failure, including calls that
+ * have no session: jb_model_load and session creation. On failure, every
  * function below sets its non-NULL output parameters to NULL or zero. */
 const char *jb_last_error(void);
 
@@ -99,6 +100,11 @@ jb_status jb_session_create(jb_model *model, const jb_schema *schema, jb_session
 jb_status jb_session_create_json(jb_model *model, const char *questions_json,
                                  size_t questions_length, jb_session **out_session);
 void jb_session_free(jb_session *session);
+/* Describes the most recent decide call on this session: set when it fails
+ * and cleared when it succeeds. Unlike jb_last_error it does not depend on
+ * the calling thread, so it stays correct when a session moves between
+ * threads. The string is valid until the session's next call or its free. */
+const char *jb_session_last_error(const jb_session *session);
 
 jb_status jb_session_decide(jb_session *session, const jb_input *input, jb_result **out_result);
 jb_status jb_session_decide_batch(jb_session *session, const jb_input *inputs, size_t input_count,

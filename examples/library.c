@@ -33,7 +33,10 @@ int main(int argc, char **argv) {
     if (status == JB_OK)
         status = jb_session_decide(session, &input, &result);
     if (status != JB_OK) {
-        fprintf(stderr, "jev-bush: %s: %s\n", jb_status_string(status), jb_last_error());
+        /* A session records its own calls' errors; before one exists, the
+         * thread's last error describes the failure. */
+        const char *error = session ? jb_session_last_error(session) : jb_last_error();
+        fprintf(stderr, "jev-bush: %s: %s\n", jb_status_string(status), error);
         jb_session_free(session);
         jb_model_free(model);
         return 1;
