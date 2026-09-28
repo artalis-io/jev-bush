@@ -4530,6 +4530,10 @@ static char *jb_schema_json(const jb_schema *schema, size_t *length) {
         db_ch(&out, '}');
     }
     db_ch(&out, '}');
+    /* Validate with the request parser, so duplicate question or candidate
+     * ids are rejected here rather than when the session parses them. */
+    int nt = 0;
+    jb_release(json_tokens(out.p, out.n, &nt));
     *length = out.n;
     return out.p;
 }
