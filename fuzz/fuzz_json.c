@@ -151,9 +151,9 @@ static void fuzz_canonical(const char *j, JTok *t, int nt, int ascii) {
         for (const char *p = c1; *p; p++)
             if ((unsigned char)*p > 127)
                 abort();
-    fuzz_free(c2);
-    fuzz_free(t2);
-    fuzz_free(c1);
+    jb_release(c2);
+    jb_release(t2);
+    jb_release(c1);
 }
 
 static void fuzz_one(const char *j, size_t n) {
@@ -161,8 +161,8 @@ static void fuzz_one(const char *j, size_t n) {
     JTok *t = json_tokens(j, n, &nt);
     fuzz_canonical(j, t, nt, 1);
     fuzz_canonical(j, t, nt, 0);
-    fuzz_free(dg_text_of(j, t, nt, 0));
-    fuzz_free(t);
+    jb_release(dg_text_of(j, t, nt, 0));
+    jb_release(t);
 
     DGRequest rq;
     dg_request_parse(&rq, j, n);
@@ -179,12 +179,12 @@ static void fuzz_one(const char *j, size_t n) {
     int *pick = fuzz_calloc((size_t)nq, sizeof *pick);
     for (int x = 0; x < nq; x++)
         pick[x] = w[x].nc - 1;
-    fuzz_free(dg_answer_template(w, nq, pick));
+    jb_release(dg_answer_template(w, nq, pick));
     fuzz_free(pick);
-    fuzz_free(sys);
+    jb_release(sys);
     dg_questions_free(w, nq);
     for (int i = 0; i < 128; i++)
-        fuzz_free(labels[i]);
+        jb_release(labels[i]);
     dg_request_free(&rq);
 }
 
