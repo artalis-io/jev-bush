@@ -37,6 +37,19 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           .\jb.exe --selftest
 
+  # Nothing reachable from an OpenMP parallel region may fail or allocate:
+  # die() there exits the host from a worker thread, and allocations escape
+  # the error frame's cleanup.
+  parallel-regions:
+    name: Parallel-region check
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check
+        run: python3 tools/check_parallel_regions.py jb.c
+
   # The README's Windows build. Errors unwind with longjmp, which MinGW's
   # default SEH setjmp crashed on at -O2, so exercise an error path directly.
   mingw:
