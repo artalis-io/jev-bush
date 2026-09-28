@@ -76,6 +76,9 @@
 #define DG_LOCAL_WINDOW 1024
 #define DG_CHOICE_LABELS 128
 #define DG_MAX_QUESTIONS 1024
+/* The automatic reread test scores every answer slot in one pass, which is
+ * limited to 128 slots; explicit samples have no such limit. */
+#define DG_AUTO_READ_MAX_QUESTIONS 128
 #define DG_MAX_SCORE 10
 #define DG_CANVAS_TOKENS 64
 #define DG_CANVAS_ALIGN 16
@@ -1754,7 +1757,7 @@ static void dg_mv_slice(const DGTensor *w, uint64_t base, const float *x, float 
  * full-vocabulary top 20 and the explicitly requested label ids. */
 static double dg_slot_logits_entropy(const DGTensor *w, const float *hidden, int n, int **label_ids,
                                      const int *label_n, double **label_score, float *logits) {
-    if (n < 1 || n > DG_CHOICE_LABELS)
+    if (n < 1 || n > DG_AUTO_READ_MAX_QUESTIONS)
         die("bad DiffusionGemma answer slot count");
     /* vLLM returns top-20 plus the sorted union of requested label ids at
      * every slot, capped at its per-request 128-id limit. OpenJev computes
@@ -3741,6 +3744,9 @@ static DecisionWork *dg_questions(const DGRequest *r, char **choice_label, int *
     int keys[DG_MAX_QUESTIONS], nq = direct_keys(qt, qnt, r->qroot, keys, DG_MAX_QUESTIONS);
     if (nq < 1 || nq > DG_MAX_QUESTIONS)
         die("questions must contain 1..1024 entries");
+    /* Reject before any model work rather than after prefill and a read. */
+    if (!r->requested && nq > DG_AUTO_READ_MAX_QUESTIONS)
+        die("automatic reads support at most 128 questions; set samples");
     DecisionWork *w = xcalloc((size_t)nq, sizeof *w);
     for (int x = 0; x < nq; x++) {
         DecisionWork *d = &w[x];
