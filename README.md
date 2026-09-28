@@ -190,12 +190,13 @@ Run the dependency-free smoke test without downloading a model:
 
 ```console
 $ ./jb --selftest
-{"selftest":"ok"}
+{"selftest":"ok","kernels":"avx2"}
 ```
 
 The selftest also checks every compute kernel, both the portable reference and
 the one selected for the build, against a double-precision oracle on random
-data. CI runs it natively on x86-64 and ARM64, and under Intel's Software
+data, and reports which set it tested: `scalar`, `avx2`, or `avx512`. CI runs
+it natively on x86-64 (scalar and AVX2) and ARM64, and under Intel's Software
 Development Emulator for the AVX-512 kernels. `jb --bench-kernels` reports
 kernel throughput at model shapes next to a memory-read baseline, for comparing
 builds and machines.
