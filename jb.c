@@ -1228,54 +1228,6 @@ static void dg_nvfp4_qdq_ref(float *out, const float *in, int tokens, int cols, 
                 y[k] = dg_e2m1_round(x[k] / s) * s;
         }
 }
-#if defined(JB_AVX2)
-static void dg_nvfp4_qdq_avx2(float *out, const float *in, int tokens, int cols, float base) {
-    if (!jb_finitef(base) || !(base > 0) || cols % 32)
-        die("invalid NVFP4 activation scale");
-    int nb = cols / 16, blocks = tokens * nb;
-#ifdef _OPENMP
-    JB_OMP();
-#pragma omp parallel for schedule(static) if (blocks >= 256)
-#endif
-    for (int z = 0; z < blocks; z++) {
-        int t = z / nb, b = z % nb;
-        const float *x = in + (size_t)t * cols + (size_t)b * 16;
-        float *y = out + (size_t)t * cols + (size_t)b * 16, amax = 0;
-        for (int k = 0; k < 16; k++) {
-            if (!jb_finitef(x[k]))
-                die("non-finite NVFP4 activation");
-            if (fabsf(x[k]) > amax)
-                amax = fabsf(x[k]);
-        }
-        float s = dg_f8e4m3_round((amax / 6) / base) * base;
-        if (s == 0) {
-            memset(y, 0, 16 * sizeof *y);
-            continue;
-        }
-        for (int k = 0; k < 16; k++)
-            y[k] = dg_e2m1_round(x[k] / s) * s;
-    }
-}
-#endif
-#if defined(JB_AVX512)
-/* Match each packed weight byte: low-nibble activations, then high. This
- * one-time swizzle removes two activation permutes per expert row/tile. */
-static void dg_nvfp4_swizzle(float *out, int tokens, int cols) {
-    for (int t = 0; t < tokens; t++)
-        for (int c = 0; c < cols; c += 32) {
-            float *y = out + (size_t)t * cols + c, tmp[32];
-            memcpy(tmp, y, sizeof tmp);
-            for (int k = 0; k < 16; k++) {
-                y[k] = tmp[k * 2];
-                y[16 + k] = tmp[k * 2 + 1];
-            }
-        }
-}
-static void dg_nvfp4_qdq_avx512(float *out, const float *in, int tokens, int cols, float base) {
-    dg_nvfp4_qdq_ref(out, in, tokens, cols, base);
-    dg_nvfp4_swizzle(out, tokens, cols);
-}
-#endif
 /* Produces the activation layout the selected dg_nvfp4_mm kernel expects. */
 static void dg_nvfp4_qdq(float *out, const float *in, int tokens, int cols, float base) {
     dg_kernels()->nvfp4_qdq(out, in, tokens, cols, base);
@@ -1310,105 +1262,6 @@ static void dg_nvfp4_mm_ref(const uint8_t *wd, const uint8_t *sd, float global, 
             y[(size_t)t * rows + r] = sum;
         }
 }
-#if defined(JB_AVX512)
-/* x in the dg_nvfp4_swizzle layout; rows must be even. */
-static void dg_nvfp4_mm_avx512(const uint8_t *wd, const uint8_t *sd, float global, const float *x,
-                               float *y, int tokens, int rows, int cols) {
-    static const float lut[16] = {0, .5f, 1, 1.5f, 2, 3, 4, 6, 0, -.5f, -1, -1.5f, -2, -3, -4, -6};
-    __m512 table = _mm512_loadu_ps(lut);
-#ifdef _OPENMP
-    JB_OMP();
-#pragma omp parallel for schedule(static)
-#endif
-    for (int r = 0; r < rows; r += 2) {
-        const uint8_t *wp0 = wd + (uint64_t)r * cols / 2, *wp1 = wp0 + cols / 2;
-        const uint8_t *sp0 = sd + (uint64_t)r * cols / 16, *sp1 = sp0 + cols / 16;
-        for (int tb = 0; tb < tokens; tb += 8) {
-            int nb = tokens - tb < 8 ? tokens - tb : 8;
-            __m512 a[8], b[8];
-            for (int q = 0; q < nb; q++)
-                a[q] = b[q] = _mm512_setzero_ps();
-            for (int c = 0; c < cols; c += 32) {
-                __m512i z = _mm512_set1_epi32(15),
-                        raw0 =
-                            _mm512_cvtepu8_epi32(_mm_loadu_si128((const __m128i *)(wp0 + c / 2))),
-                        raw1 =
-                            _mm512_cvtepu8_epi32(_mm_loadu_si128((const __m128i *)(wp1 + c / 2)));
-                __m512 wl0 = _mm512_permutexvar_ps(_mm512_and_si512(raw0, z), table),
-                       wh0 = _mm512_permutexvar_ps(_mm512_srli_epi32(raw0, 4), table);
-                __m512 wl1 = _mm512_permutexvar_ps(_mm512_and_si512(raw1, z), table),
-                       wh1 = _mm512_permutexvar_ps(_mm512_srli_epi32(raw1, 4), table);
-                float a0 = dg_f8e4m3(sp0[c / 16]) * global,
-                      a1 = dg_f8e4m3(sp0[c / 16 + 1]) * global,
-                      b0 = dg_f8e4m3(sp1[c / 16]) * global,
-                      b1 = dg_f8e4m3(sp1[c / 16 + 1]) * global;
-                __m512 sv0 = _mm512_mask_blend_ps(0xff00, _mm512_set1_ps(a0), _mm512_set1_ps(a1)),
-                       sv1 = _mm512_mask_blend_ps(0xff00, _mm512_set1_ps(b0), _mm512_set1_ps(b1));
-                wl0 = _mm512_mul_ps(wl0, sv0);
-                wh0 = _mm512_mul_ps(wh0, sv0);
-                wl1 = _mm512_mul_ps(wl1, sv1);
-                wh1 = _mm512_mul_ps(wh1, sv1);
-                for (int q = 0; q < nb; q++) {
-                    const float *xp = x + (size_t)(tb + q) * cols + c;
-                    __m512 xe = _mm512_loadu_ps(xp), xo = _mm512_loadu_ps(xp + 16);
-                    a[q] = _mm512_fmadd_ps(wl0, xe, a[q]);
-                    a[q] = _mm512_fmadd_ps(wh0, xo, a[q]);
-                    b[q] = _mm512_fmadd_ps(wl1, xe, b[q]);
-                    b[q] = _mm512_fmadd_ps(wh1, xo, b[q]);
-                }
-            }
-            for (int q = 0; q < nb; q++) {
-                y[(size_t)(tb + q) * rows + r] = _mm512_reduce_add_ps(a[q]);
-                y[(size_t)(tb + q) * rows + r + 1] = _mm512_reduce_add_ps(b[q]);
-            }
-        }
-    }
-}
-#endif
-#if defined(JB_AVX2)
-static float dg_hsum8(__m256 x);
-static void dg_nvfp4_weights16_avx2(const uint8_t *q, float scale, __m256 *w0, __m256 *w1) {
-    const __m128i lut = _mm_setr_epi8(0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12);
-    const __m128i mask = _mm_set1_epi8(15), raw = _mm_loadl_epi64((const __m128i *)q);
-    __m128i lo = _mm_shuffle_epi8(lut, _mm_and_si128(raw, mask));
-    __m128i hi = _mm_shuffle_epi8(lut, _mm_and_si128(_mm_srli_epi16(raw, 4), mask));
-    __m256 lf = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(lo));
-    __m256 hf = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(hi));
-    __m256 a = _mm256_unpacklo_ps(lf, hf), b = _mm256_unpackhi_ps(lf, hf),
-           s = _mm256_set1_ps(scale * .5f);
-    *w0 = _mm256_mul_ps(_mm256_permute2f128_ps(a, b, 0x20), s);
-    *w1 = _mm256_mul_ps(_mm256_permute2f128_ps(a, b, 0x31), s);
-}
-/* Decode each packed 16-weight block entirely in registers, retaining the
- * reference interleaved lane order and reusing it across four tokens. */
-static void dg_nvfp4_mm_avx2(const uint8_t *wd, const uint8_t *sd, float global, const float *x,
-                             float *y, int tokens, int rows, int cols) {
-#ifdef _OPENMP
-    JB_OMP();
-#pragma omp parallel for schedule(static)
-#endif
-    for (int r = 0; r < rows; r++) {
-        const uint8_t *wp = wd + (uint64_t)r * cols / 2, *sp = sd + (uint64_t)r * cols / 16;
-        for (int tb = 0; tb < tokens; tb += 4) {
-            int nb = tokens - tb < 4 ? tokens - tb : 4;
-            __m256 acc0[4], acc1[4];
-            for (int q = 0; q < nb; q++)
-                acc0[q] = acc1[q] = _mm256_setzero_ps();
-            for (int c = 0; c < cols; c += 16) {
-                __m256 w0, w1;
-                dg_nvfp4_weights16_avx2(wp + c / 2, dg_f8e4m3(sp[c / 16]) * global, &w0, &w1);
-                for (int q = 0; q < nb; q++) {
-                    const float *xp = x + (size_t)(tb + q) * cols + c;
-                    acc0[q] = _mm256_fmadd_ps(w0, _mm256_loadu_ps(xp), acc0[q]);
-                    acc1[q] = _mm256_fmadd_ps(w1, _mm256_loadu_ps(xp + 8), acc1[q]);
-                }
-            }
-            for (int q = 0; q < nb; q++)
-                y[(size_t)(tb + q) * rows + r] = dg_hsum8(_mm256_add_ps(acc0[q], acc1[q]));
-        }
-    }
-}
-#endif
 /* x comes from dg_nvfp4_qdq, in the layout the selected kernel expects. */
 static void dg_nvfp4_mm(const DGTensor *w, const DGTensor *s, const DGTensor *g, const float *x,
                         float *y, int tokens, int rows, int cols) {
@@ -1421,115 +1274,6 @@ static void dg_nvfp4_mm(const DGTensor *w, const DGTensor *s, const DGTensor *g,
     memcpy(&global, g->data, 4);
     dg_kernels()->nvfp4_mm(w->data, s->data, global, x, y, tokens, rows, cols);
 }
-#if defined(JB_AVX512)
-static __m512 dg_bf16x16(const uint8_t *p) {
-    __m256i h = _mm256_loadu_si256((const __m256i *)p);
-    return _mm512_castsi512_ps(_mm512_slli_epi32(_mm512_cvtepu16_epi32(h), 16));
-}
-static void dg_mm_data_avx512(const uint8_t *data, const float *x, float *y, int tokens, int rows,
-                              int cols) {
-    if (rows % 2)
-        die("AVX-512 matrix row count must be even");
-#ifdef _OPENMP
-    JB_OMP();
-#pragma omp parallel for schedule(static)
-#endif
-    for (int r = 0; r < rows; r += 2) {
-        const uint8_t *p0 = data + (uint64_t)r * cols * 2, *p1 = p0 + (uint64_t)cols * 2;
-        int t = 0;
-        for (; t + 7 < tokens; t += 8) {
-            __m512 a[8], b[8];
-            for (int q = 0; q < 8; q++)
-                a[q] = b[q] = _mm512_setzero_ps();
-            int c = 0;
-            for (; c + 15 < cols; c += 16) {
-                __m512 w0 = dg_bf16x16(p0 + c * 2), w1 = dg_bf16x16(p1 + c * 2);
-                for (int q = 0; q < 8; q++) {
-                    __m512 v = _mm512_loadu_ps(x + (size_t)(t + q) * cols + c);
-                    a[q] = _mm512_fmadd_ps(w0, v, a[q]);
-                    b[q] = _mm512_fmadd_ps(w1, v, b[q]);
-                }
-            }
-            for (int q = 0; q < 8; q++) {
-                float z0 = _mm512_reduce_add_ps(a[q]), z1 = _mm512_reduce_add_ps(b[q]);
-                for (int k = (cols & ~15); k < cols; k++) {
-                    float v = x[(size_t)(t + q) * cols + k];
-                    z0 += dg_bf(p0 + k * 2) * v;
-                    z1 += dg_bf(p1 + k * 2) * v;
-                }
-                y[(size_t)(t + q) * rows + r] = z0;
-                y[(size_t)(t + q) * rows + r + 1] = z1;
-            }
-        }
-        for (; t < tokens; t++) {
-            __m512 s0 = _mm512_setzero_ps(), s1 = s0;
-            int c = 0;
-            for (; c + 15 < cols; c += 16) {
-                __m512 v = _mm512_loadu_ps(x + (size_t)t * cols + c);
-                s0 = _mm512_fmadd_ps(dg_bf16x16(p0 + c * 2), v, s0);
-                s1 = _mm512_fmadd_ps(dg_bf16x16(p1 + c * 2), v, s1);
-            }
-            float z0 = _mm512_reduce_add_ps(s0), z1 = _mm512_reduce_add_ps(s1);
-            for (; c < cols; c++) {
-                float v = x[(size_t)t * cols + c];
-                z0 += dg_bf(p0 + c * 2) * v;
-                z1 += dg_bf(p1 + c * 2) * v;
-            }
-            y[(size_t)t * rows + r] = z0;
-            y[(size_t)t * rows + r + 1] = z1;
-        }
-    }
-}
-#endif
-#if defined(JB_AVX2)
-static __m256 dg_bf16x8(const uint8_t *p) {
-    __m128i h = _mm_loadu_si128((const __m128i *)p);
-    return _mm256_castsi256_ps(_mm256_slli_epi32(_mm256_cvtepu16_epi32(h), 16));
-}
-static float dg_hsum8(__m256 x) {
-    __m128 h = _mm_add_ps(_mm256_castps256_ps128(x), _mm256_extractf128_ps(x, 1));
-    h = _mm_hadd_ps(h, h);
-    h = _mm_hadd_ps(h, h);
-    return _mm_cvtss_f32(h);
-}
-static void dg_mm_data_avx2(const uint8_t *data, const float *x, float *y, int tokens, int rows,
-                            int cols) {
-    if (rows % 2)
-        die("AVX2 matrix row count must be even");
-#ifdef _OPENMP
-    JB_OMP();
-#pragma omp parallel for schedule(static)
-#endif
-    for (int r = 0; r < rows; r += 2) {
-        const uint8_t *p0 = data + (uint64_t)r * cols * 2, *p1 = p0 + (uint64_t)cols * 2;
-        for (int tb = 0; tb < tokens; tb += 4) {
-            int nb = tokens - tb < 4 ? tokens - tb : 4;
-            __m256 a[4], b[4];
-            for (int q = 0; q < nb; q++)
-                a[q] = b[q] = _mm256_setzero_ps();
-            int c = 0;
-            for (; c + 7 < cols; c += 8) {
-                __m256 w0 = dg_bf16x8(p0 + c * 2), w1 = dg_bf16x8(p1 + c * 2);
-                for (int q = 0; q < nb; q++) {
-                    __m256 v = _mm256_loadu_ps(x + (size_t)(tb + q) * cols + c);
-                    a[q] = _mm256_fmadd_ps(w0, v, a[q]);
-                    b[q] = _mm256_fmadd_ps(w1, v, b[q]);
-                }
-            }
-            for (int q = 0; q < nb; q++) {
-                float z0 = dg_hsum8(a[q]), z1 = dg_hsum8(b[q]);
-                for (int k = c; k < cols; k++) {
-                    float v = x[(size_t)(tb + q) * cols + k];
-                    z0 += dg_bf(p0 + k * 2) * v;
-                    z1 += dg_bf(p1 + k * 2) * v;
-                }
-                y[(size_t)(tb + q) * rows + r] = z0;
-                y[(size_t)(tb + q) * rows + r + 1] = z1;
-            }
-        }
-    }
-}
-#endif
 static void dg_mm_data_ref(const uint8_t *data, const float *x, float *y, int tokens, int rows,
                            int cols) {
 #ifdef _OPENMP
@@ -1667,39 +1411,139 @@ static void dg_rms_ref(float *y, const float *x, const DGTensor *scale, int n) {
     for (int i = 0; i < n; i++)
         y[i] = x[i] * q * (scale ? dg_at(scale, i) : 1.0f);
 }
-#if defined(JB_AVX512)
-static void dg_rms_avx512(float *y, const float *x, const DGTensor *scale, int n) {
-    __m512d a = _mm512_setzero_pd(), b = a, c = a, d = a;
-    int i = 0;
-    for (; i + 31 < n; i += 32) {
-        __m512 x0 = _mm512_loadu_ps(x + i), x1 = _mm512_loadu_ps(x + i + 16);
-        __m512d q0 = _mm512_cvtps_pd(_mm512_castps512_ps256(x0));
-        __m512d q1 = _mm512_cvtps_pd(_mm512_extractf32x8_ps(x0, 1));
-        __m512d q2 = _mm512_cvtps_pd(_mm512_castps512_ps256(x1));
-        __m512d q3 = _mm512_cvtps_pd(_mm512_extractf32x8_ps(x1, 1));
-        a = _mm512_fmadd_pd(q0, q0, a);
-        b = _mm512_fmadd_pd(q1, q1, b);
-        c = _mm512_fmadd_pd(q2, q2, c);
-        d = _mm512_fmadd_pd(q3, q3, d);
-    }
-    double ss = _mm512_reduce_add_pd(_mm512_add_pd(_mm512_add_pd(a, b), _mm512_add_pd(c, d)));
-    for (; i < n; i++)
-        ss += (double)x[i] * x[i];
-    float q = 1.0f / sqrtf((float)(ss / n) + 1e-6f);
-    i = 0;
-    if (scale)
-        for (; i + 15 < n; i += 16)
-            _mm512_storeu_ps(y + i,
-                             _mm512_mul_ps(_mm512_mul_ps(_mm512_loadu_ps(x + i), _mm512_set1_ps(q)),
-                                           dg_bf16x16(scale->data + (size_t)i * 2)));
-    else
-        for (; i + 15 < n; i += 16)
-            _mm512_storeu_ps(y + i, _mm512_mul_ps(_mm512_loadu_ps(x + i), _mm512_set1_ps(q)));
-    for (; i < n; i++)
-        y[i] = x[i] * q * (scale ? dg_at(scale, i) : 1.0f);
+static void dg_rms(float *y, const float *x, const DGTensor *scale, int n) {
+    dg_kernels()->rms(y, x, scale, n);
 }
-#endif
+static float dg_gelu(float x) {
+    return .5f * x * (1.0f + tanhf(.7978845608028654f * (x + .044715f * x * x * x)));
+}
+static double dg_dot_ref(const float *a, const float *b, int n) {
+    double s = 0;
+    for (int i = 0; i < n; i++)
+        s += (double)a[i] * b[i];
+    return s;
+}
+static double dg_dot(const float *a, const float *b, int n) {
+    return dg_kernels()->dot(a, b, n);
+}
+/* AVX2 backend. */
 #if defined(JB_AVX2)
+static __m256 dg_bf16x8(const uint8_t *p) {
+    __m128i h = _mm_loadu_si128((const __m128i *)p);
+    return _mm256_castsi256_ps(_mm256_slli_epi32(_mm256_cvtepu16_epi32(h), 16));
+}
+static float dg_hsum8(__m256 x) {
+    __m128 h = _mm_add_ps(_mm256_castps256_ps128(x), _mm256_extractf128_ps(x, 1));
+    h = _mm_hadd_ps(h, h);
+    h = _mm_hadd_ps(h, h);
+    return _mm_cvtss_f32(h);
+}
+static void dg_mm_data_avx2(const uint8_t *data, const float *x, float *y, int tokens, int rows,
+                            int cols) {
+    if (rows % 2)
+        die("AVX2 matrix row count must be even");
+#ifdef _OPENMP
+    JB_OMP();
+#pragma omp parallel for schedule(static)
+#endif
+    for (int r = 0; r < rows; r += 2) {
+        const uint8_t *p0 = data + (uint64_t)r * cols * 2, *p1 = p0 + (uint64_t)cols * 2;
+        for (int tb = 0; tb < tokens; tb += 4) {
+            int nb = tokens - tb < 4 ? tokens - tb : 4;
+            __m256 a[4], b[4];
+            for (int q = 0; q < nb; q++)
+                a[q] = b[q] = _mm256_setzero_ps();
+            int c = 0;
+            for (; c + 7 < cols; c += 8) {
+                __m256 w0 = dg_bf16x8(p0 + c * 2), w1 = dg_bf16x8(p1 + c * 2);
+                for (int q = 0; q < nb; q++) {
+                    __m256 v = _mm256_loadu_ps(x + (size_t)(tb + q) * cols + c);
+                    a[q] = _mm256_fmadd_ps(w0, v, a[q]);
+                    b[q] = _mm256_fmadd_ps(w1, v, b[q]);
+                }
+            }
+            for (int q = 0; q < nb; q++) {
+                float z0 = dg_hsum8(a[q]), z1 = dg_hsum8(b[q]);
+                for (int k = c; k < cols; k++) {
+                    float v = x[(size_t)(tb + q) * cols + k];
+                    z0 += dg_bf(p0 + k * 2) * v;
+                    z1 += dg_bf(p1 + k * 2) * v;
+                }
+                y[(size_t)(tb + q) * rows + r] = z0;
+                y[(size_t)(tb + q) * rows + r + 1] = z1;
+            }
+        }
+    }
+}
+static void dg_nvfp4_qdq_avx2(float *out, const float *in, int tokens, int cols, float base) {
+    if (!jb_finitef(base) || !(base > 0) || cols % 32)
+        die("invalid NVFP4 activation scale");
+    int nb = cols / 16, blocks = tokens * nb;
+#ifdef _OPENMP
+    JB_OMP();
+#pragma omp parallel for schedule(static) if (blocks >= 256)
+#endif
+    for (int z = 0; z < blocks; z++) {
+        int t = z / nb, b = z % nb;
+        const float *x = in + (size_t)t * cols + (size_t)b * 16;
+        float *y = out + (size_t)t * cols + (size_t)b * 16, amax = 0;
+        for (int k = 0; k < 16; k++) {
+            if (!jb_finitef(x[k]))
+                die("non-finite NVFP4 activation");
+            if (fabsf(x[k]) > amax)
+                amax = fabsf(x[k]);
+        }
+        float s = dg_f8e4m3_round((amax / 6) / base) * base;
+        if (s == 0) {
+            memset(y, 0, 16 * sizeof *y);
+            continue;
+        }
+        for (int k = 0; k < 16; k++)
+            y[k] = dg_e2m1_round(x[k] / s) * s;
+    }
+}
+static float dg_hsum8(__m256 x);
+static void dg_nvfp4_weights16_avx2(const uint8_t *q, float scale, __m256 *w0, __m256 *w1) {
+    const __m128i lut = _mm_setr_epi8(0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12);
+    const __m128i mask = _mm_set1_epi8(15), raw = _mm_loadl_epi64((const __m128i *)q);
+    __m128i lo = _mm_shuffle_epi8(lut, _mm_and_si128(raw, mask));
+    __m128i hi = _mm_shuffle_epi8(lut, _mm_and_si128(_mm_srli_epi16(raw, 4), mask));
+    __m256 lf = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(lo));
+    __m256 hf = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(hi));
+    __m256 a = _mm256_unpacklo_ps(lf, hf), b = _mm256_unpackhi_ps(lf, hf),
+           s = _mm256_set1_ps(scale * .5f);
+    *w0 = _mm256_mul_ps(_mm256_permute2f128_ps(a, b, 0x20), s);
+    *w1 = _mm256_mul_ps(_mm256_permute2f128_ps(a, b, 0x31), s);
+}
+/* Decode each packed 16-weight block entirely in registers, retaining the
+ * reference interleaved lane order and reusing it across four tokens. */
+static void dg_nvfp4_mm_avx2(const uint8_t *wd, const uint8_t *sd, float global, const float *x,
+                             float *y, int tokens, int rows, int cols) {
+#ifdef _OPENMP
+    JB_OMP();
+#pragma omp parallel for schedule(static)
+#endif
+    for (int r = 0; r < rows; r++) {
+        const uint8_t *wp = wd + (uint64_t)r * cols / 2, *sp = sd + (uint64_t)r * cols / 16;
+        for (int tb = 0; tb < tokens; tb += 4) {
+            int nb = tokens - tb < 4 ? tokens - tb : 4;
+            __m256 acc0[4], acc1[4];
+            for (int q = 0; q < nb; q++)
+                acc0[q] = acc1[q] = _mm256_setzero_ps();
+            for (int c = 0; c < cols; c += 16) {
+                __m256 w0, w1;
+                dg_nvfp4_weights16_avx2(wp + c / 2, dg_f8e4m3(sp[c / 16]) * global, &w0, &w1);
+                for (int q = 0; q < nb; q++) {
+                    const float *xp = x + (size_t)(tb + q) * cols + c;
+                    acc0[q] = _mm256_fmadd_ps(w0, _mm256_loadu_ps(xp), acc0[q]);
+                    acc1[q] = _mm256_fmadd_ps(w1, _mm256_loadu_ps(xp + 8), acc1[q]);
+                }
+            }
+            for (int q = 0; q < nb; q++)
+                y[(size_t)(tb + q) * rows + r] = dg_hsum8(_mm256_add_ps(acc0[q], acc1[q]));
+        }
+    }
+}
 static double dg_hsum4d(__m256d x) {
     __m128d h = _mm_add_pd(_mm256_castpd256_pd128(x), _mm256_extractf128_pd(x, 1));
     h = _mm_hadd_pd(h, h);
@@ -1731,37 +1575,6 @@ static void dg_rms_avx2(float *y, const float *x, const DGTensor *scale, int n) 
     for (; i < n; i++)
         y[i] = x[i] * q * (scale ? dg_at(scale, i) : 1.0f);
 }
-#endif
-static void dg_rms(float *y, const float *x, const DGTensor *scale, int n) {
-    dg_kernels()->rms(y, x, scale, n);
-}
-static float dg_gelu(float x) {
-    return .5f * x * (1.0f + tanhf(.7978845608028654f * (x + .044715f * x * x * x)));
-}
-static double dg_dot_ref(const float *a, const float *b, int n) {
-    double s = 0;
-    for (int i = 0; i < n; i++)
-        s += (double)a[i] * b[i];
-    return s;
-}
-#if defined(JB_AVX512)
-static double dg_dot_avx512(const float *a, const float *b, int n) {
-    __m512d s0 = _mm512_setzero_pd(), s1 = s0;
-    int i = 0;
-    for (; i + 15 < n; i += 16) {
-        __m512 x = _mm512_loadu_ps(a + i), y = _mm512_loadu_ps(b + i);
-        s0 = _mm512_fmadd_pd(_mm512_cvtps_pd(_mm512_castps512_ps256(x)),
-                             _mm512_cvtps_pd(_mm512_castps512_ps256(y)), s0);
-        s1 = _mm512_fmadd_pd(_mm512_cvtps_pd(_mm512_extractf32x8_ps(x, 1)),
-                             _mm512_cvtps_pd(_mm512_extractf32x8_ps(y, 1)), s1);
-    }
-    double s = _mm512_reduce_add_pd(_mm512_add_pd(s0, s1));
-    for (; i < n; i++)
-        s += (double)a[i] * b[i];
-    return s;
-}
-#endif
-#if defined(JB_AVX2)
 static double dg_dot_avx2(const float *a, const float *b, int n) {
     __m256d s0 = _mm256_setzero_pd(), s1 = s0;
     int i = 0;
@@ -1778,9 +1591,184 @@ static double dg_dot_avx2(const float *a, const float *b, int n) {
     return s;
 }
 #endif
-static double dg_dot(const float *a, const float *b, int n) {
-    return dg_kernels()->dot(a, b, n);
+
+/* AVX-512 backend. */
+#if defined(JB_AVX512)
+static __m512 dg_bf16x16(const uint8_t *p) {
+    __m256i h = _mm256_loadu_si256((const __m256i *)p);
+    return _mm512_castsi512_ps(_mm512_slli_epi32(_mm512_cvtepu16_epi32(h), 16));
 }
+static void dg_mm_data_avx512(const uint8_t *data, const float *x, float *y, int tokens, int rows,
+                              int cols) {
+    if (rows % 2)
+        die("AVX-512 matrix row count must be even");
+#ifdef _OPENMP
+    JB_OMP();
+#pragma omp parallel for schedule(static)
+#endif
+    for (int r = 0; r < rows; r += 2) {
+        const uint8_t *p0 = data + (uint64_t)r * cols * 2, *p1 = p0 + (uint64_t)cols * 2;
+        int t = 0;
+        for (; t + 7 < tokens; t += 8) {
+            __m512 a[8], b[8];
+            for (int q = 0; q < 8; q++)
+                a[q] = b[q] = _mm512_setzero_ps();
+            int c = 0;
+            for (; c + 15 < cols; c += 16) {
+                __m512 w0 = dg_bf16x16(p0 + c * 2), w1 = dg_bf16x16(p1 + c * 2);
+                for (int q = 0; q < 8; q++) {
+                    __m512 v = _mm512_loadu_ps(x + (size_t)(t + q) * cols + c);
+                    a[q] = _mm512_fmadd_ps(w0, v, a[q]);
+                    b[q] = _mm512_fmadd_ps(w1, v, b[q]);
+                }
+            }
+            for (int q = 0; q < 8; q++) {
+                float z0 = _mm512_reduce_add_ps(a[q]), z1 = _mm512_reduce_add_ps(b[q]);
+                for (int k = (cols & ~15); k < cols; k++) {
+                    float v = x[(size_t)(t + q) * cols + k];
+                    z0 += dg_bf(p0 + k * 2) * v;
+                    z1 += dg_bf(p1 + k * 2) * v;
+                }
+                y[(size_t)(t + q) * rows + r] = z0;
+                y[(size_t)(t + q) * rows + r + 1] = z1;
+            }
+        }
+        for (; t < tokens; t++) {
+            __m512 s0 = _mm512_setzero_ps(), s1 = s0;
+            int c = 0;
+            for (; c + 15 < cols; c += 16) {
+                __m512 v = _mm512_loadu_ps(x + (size_t)t * cols + c);
+                s0 = _mm512_fmadd_ps(dg_bf16x16(p0 + c * 2), v, s0);
+                s1 = _mm512_fmadd_ps(dg_bf16x16(p1 + c * 2), v, s1);
+            }
+            float z0 = _mm512_reduce_add_ps(s0), z1 = _mm512_reduce_add_ps(s1);
+            for (; c < cols; c++) {
+                float v = x[(size_t)t * cols + c];
+                z0 += dg_bf(p0 + c * 2) * v;
+                z1 += dg_bf(p1 + c * 2) * v;
+            }
+            y[(size_t)t * rows + r] = z0;
+            y[(size_t)t * rows + r + 1] = z1;
+        }
+    }
+}
+/* Match each packed weight byte: low-nibble activations, then high. This
+ * one-time swizzle removes two activation permutes per expert row/tile. */
+static void dg_nvfp4_swizzle(float *out, int tokens, int cols) {
+    for (int t = 0; t < tokens; t++)
+        for (int c = 0; c < cols; c += 32) {
+            float *y = out + (size_t)t * cols + c, tmp[32];
+            memcpy(tmp, y, sizeof tmp);
+            for (int k = 0; k < 16; k++) {
+                y[k] = tmp[k * 2];
+                y[16 + k] = tmp[k * 2 + 1];
+            }
+        }
+}
+static void dg_nvfp4_qdq_avx512(float *out, const float *in, int tokens, int cols, float base) {
+    dg_nvfp4_qdq_ref(out, in, tokens, cols, base);
+    dg_nvfp4_swizzle(out, tokens, cols);
+}
+/* x in the dg_nvfp4_swizzle layout; rows must be even. */
+static void dg_nvfp4_mm_avx512(const uint8_t *wd, const uint8_t *sd, float global, const float *x,
+                               float *y, int tokens, int rows, int cols) {
+    static const float lut[16] = {0, .5f, 1, 1.5f, 2, 3, 4, 6, 0, -.5f, -1, -1.5f, -2, -3, -4, -6};
+    __m512 table = _mm512_loadu_ps(lut);
+#ifdef _OPENMP
+    JB_OMP();
+#pragma omp parallel for schedule(static)
+#endif
+    for (int r = 0; r < rows; r += 2) {
+        const uint8_t *wp0 = wd + (uint64_t)r * cols / 2, *wp1 = wp0 + cols / 2;
+        const uint8_t *sp0 = sd + (uint64_t)r * cols / 16, *sp1 = sp0 + cols / 16;
+        for (int tb = 0; tb < tokens; tb += 8) {
+            int nb = tokens - tb < 8 ? tokens - tb : 8;
+            __m512 a[8], b[8];
+            for (int q = 0; q < nb; q++)
+                a[q] = b[q] = _mm512_setzero_ps();
+            for (int c = 0; c < cols; c += 32) {
+                __m512i z = _mm512_set1_epi32(15),
+                        raw0 =
+                            _mm512_cvtepu8_epi32(_mm_loadu_si128((const __m128i *)(wp0 + c / 2))),
+                        raw1 =
+                            _mm512_cvtepu8_epi32(_mm_loadu_si128((const __m128i *)(wp1 + c / 2)));
+                __m512 wl0 = _mm512_permutexvar_ps(_mm512_and_si512(raw0, z), table),
+                       wh0 = _mm512_permutexvar_ps(_mm512_srli_epi32(raw0, 4), table);
+                __m512 wl1 = _mm512_permutexvar_ps(_mm512_and_si512(raw1, z), table),
+                       wh1 = _mm512_permutexvar_ps(_mm512_srli_epi32(raw1, 4), table);
+                float a0 = dg_f8e4m3(sp0[c / 16]) * global,
+                      a1 = dg_f8e4m3(sp0[c / 16 + 1]) * global,
+                      b0 = dg_f8e4m3(sp1[c / 16]) * global,
+                      b1 = dg_f8e4m3(sp1[c / 16 + 1]) * global;
+                __m512 sv0 = _mm512_mask_blend_ps(0xff00, _mm512_set1_ps(a0), _mm512_set1_ps(a1)),
+                       sv1 = _mm512_mask_blend_ps(0xff00, _mm512_set1_ps(b0), _mm512_set1_ps(b1));
+                wl0 = _mm512_mul_ps(wl0, sv0);
+                wh0 = _mm512_mul_ps(wh0, sv0);
+                wl1 = _mm512_mul_ps(wl1, sv1);
+                wh1 = _mm512_mul_ps(wh1, sv1);
+                for (int q = 0; q < nb; q++) {
+                    const float *xp = x + (size_t)(tb + q) * cols + c;
+                    __m512 xe = _mm512_loadu_ps(xp), xo = _mm512_loadu_ps(xp + 16);
+                    a[q] = _mm512_fmadd_ps(wl0, xe, a[q]);
+                    a[q] = _mm512_fmadd_ps(wh0, xo, a[q]);
+                    b[q] = _mm512_fmadd_ps(wl1, xe, b[q]);
+                    b[q] = _mm512_fmadd_ps(wh1, xo, b[q]);
+                }
+            }
+            for (int q = 0; q < nb; q++) {
+                y[(size_t)(tb + q) * rows + r] = _mm512_reduce_add_ps(a[q]);
+                y[(size_t)(tb + q) * rows + r + 1] = _mm512_reduce_add_ps(b[q]);
+            }
+        }
+    }
+}
+static void dg_rms_avx512(float *y, const float *x, const DGTensor *scale, int n) {
+    __m512d a = _mm512_setzero_pd(), b = a, c = a, d = a;
+    int i = 0;
+    for (; i + 31 < n; i += 32) {
+        __m512 x0 = _mm512_loadu_ps(x + i), x1 = _mm512_loadu_ps(x + i + 16);
+        __m512d q0 = _mm512_cvtps_pd(_mm512_castps512_ps256(x0));
+        __m512d q1 = _mm512_cvtps_pd(_mm512_extractf32x8_ps(x0, 1));
+        __m512d q2 = _mm512_cvtps_pd(_mm512_castps512_ps256(x1));
+        __m512d q3 = _mm512_cvtps_pd(_mm512_extractf32x8_ps(x1, 1));
+        a = _mm512_fmadd_pd(q0, q0, a);
+        b = _mm512_fmadd_pd(q1, q1, b);
+        c = _mm512_fmadd_pd(q2, q2, c);
+        d = _mm512_fmadd_pd(q3, q3, d);
+    }
+    double ss = _mm512_reduce_add_pd(_mm512_add_pd(_mm512_add_pd(a, b), _mm512_add_pd(c, d)));
+    for (; i < n; i++)
+        ss += (double)x[i] * x[i];
+    float q = 1.0f / sqrtf((float)(ss / n) + 1e-6f);
+    i = 0;
+    if (scale)
+        for (; i + 15 < n; i += 16)
+            _mm512_storeu_ps(y + i,
+                             _mm512_mul_ps(_mm512_mul_ps(_mm512_loadu_ps(x + i), _mm512_set1_ps(q)),
+                                           dg_bf16x16(scale->data + (size_t)i * 2)));
+    else
+        for (; i + 15 < n; i += 16)
+            _mm512_storeu_ps(y + i, _mm512_mul_ps(_mm512_loadu_ps(x + i), _mm512_set1_ps(q)));
+    for (; i < n; i++)
+        y[i] = x[i] * q * (scale ? dg_at(scale, i) : 1.0f);
+}
+static double dg_dot_avx512(const float *a, const float *b, int n) {
+    __m512d s0 = _mm512_setzero_pd(), s1 = s0;
+    int i = 0;
+    for (; i + 15 < n; i += 16) {
+        __m512 x = _mm512_loadu_ps(a + i), y = _mm512_loadu_ps(b + i);
+        s0 = _mm512_fmadd_pd(_mm512_cvtps_pd(_mm512_castps512_ps256(x)),
+                             _mm512_cvtps_pd(_mm512_castps512_ps256(y)), s0);
+        s1 = _mm512_fmadd_pd(_mm512_cvtps_pd(_mm512_extractf32x8_ps(x, 1)),
+                             _mm512_cvtps_pd(_mm512_extractf32x8_ps(y, 1)), s1);
+    }
+    double s = _mm512_reduce_add_pd(_mm512_add_pd(s0, s1));
+    for (; i < n; i++)
+        s += (double)a[i] * b[i];
+    return s;
+}
+#endif
+
 static const DGKernelOps *dg_kernels(void) {
 #if defined(JB_AVX512)
     static const DGKernelOps selected = {"avx512",           dg_nvfp4_qdq_avx512, dg_nvfp4_swizzle,
