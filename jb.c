@@ -195,7 +195,27 @@ static _Thread_local char jb_error_message[256];
 static _Thread_local JBAllocation *jb_tracked;
 static _Thread_local uint64_t jb_allocation_sequence;
 
+static int jb_in_parallel(void) {
+#ifdef _OPENMP
+    return omp_in_parallel();
+#else
+    return 0;
+#endif
+}
+
+/* die() must never run inside an OpenMP parallel region: workers have no
+ * error frame, so it would exit the host process, and a longjmp out of the
+ * region is undefined. Reaching it there is an engine bug; stop loudly. */
+static void jb_forbid_parallel(const char *a, const char *b) {
+    if (jb_in_parallel()) {
+        fprintf(stderr, "jb: internal error: failure inside a parallel region: %s%s%s\n", a,
+                b ? ": " : "", b ? b : "");
+        abort();
+    }
+}
+
 static void die(const char *s) {
+    jb_forbid_parallel(s, NULL);
     if (jb_error_frame) {
         snprintf(jb_error_message, sizeof jb_error_message, "%s", s);
         longjmp(jb_error_frame->jump, 1);
@@ -205,6 +225,7 @@ static void die(const char *s) {
 }
 
 static void die2(const char *a, const char *b) {
+    jb_forbid_parallel(a, b);
     if (jb_error_frame) {
         snprintf(jb_error_message, sizeof jb_error_message, "%s: %s", a, b);
         longjmp(jb_error_frame->jump, 1);
@@ -219,14 +240,6 @@ static void flush_output(void) {
         die("cannot write output");
 }
 #endif
-
-static int jb_in_parallel(void) {
-#ifdef _OPENMP
-    return omp_in_parallel();
-#else
-    return 0;
-#endif
-}
 
 static void jb_link(JBAllocation *a) {
     a->link.previous = NULL;
@@ -270,6 +283,14 @@ static void *jb_try_allocate(size_t n, int clear) {
     if (!a)
         return NULL;
     a->link.sequence = ++jb_allocation_sequence;
+#ifndef NDEBUG
+    /* Allocations inside parallel regions stay untracked, so a later failure
+     * of the call could not release them. None exist; keep it that way. */
+    if (jb_error_frame && jb_in_parallel()) {
+        fprintf(stderr, "jb: internal error: allocation inside a parallel region\n");
+        abort();
+    }
+#endif
     a->link.tracked = jb_error_frame && !jb_in_parallel();
     a->link.previous = a->link.next = NULL;
     if (a->link.tracked)
