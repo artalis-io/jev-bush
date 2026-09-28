@@ -104,11 +104,39 @@ jobs:
         run: |
           gcc -O2 -march=skylake-avx512 -std=c11 -Wall -Wextra -pedantic -Werror ${{ matrix.flags }} \
             jb.c -lm -o jb-avx512
-          # Fail if the build silently fell back to the scalar kernels.
-          strings jb-avx512 | grep -qx 'avx512'
+
+      # The selftest reports the kernels it tested; fail on a scalar fallback.
+      - name: Selftest
+        run: |
+          sde/sde64 -skx -- ./jb-avx512 --selftest | tee selftest.json
+          grep -q '"kernels":"avx512"' selftest.json
+
+  # GitHub's x86 runners have AVX2, so those kernels run natively. OpenMP
+  # makes the kernels' parallel paths, including error reporting, run too.
+  avx2:
+    name: AVX2 kernels (${{ matrix.math }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - math: strict
+            flags: ""
+          - math: fast
+            flags: "-ffast-math"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build
+        run: |
+          gcc -O2 -mavx2 -mfma -mno-avx512f -std=c11 -Wall -Wextra -pedantic -Werror \
+            ${{ matrix.flags }} -fopenmp jb.c -lm -o jb-avx2
 
       - name: Selftest
-        run: sde/sde64 -skx -- ./jb-avx512 --selftest
+        run: |
+          OMP_NUM_THREADS=4 ./jb-avx2 --selftest | tee selftest.json
+          grep -q '"kernels":"avx2"' selftest.json
 
   sanitizers:
     name: ASan + UBSan (${{ matrix.math }})

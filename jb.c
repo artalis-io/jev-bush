@@ -5601,7 +5601,7 @@ static int selftest(void) {
     jb_session_free(public_session);
     dg_kernel_selftest();
     dg_test_locale_numbers();
-    puts("{\"selftest\":\"ok\"}");
+    printf("{\"selftest\":\"ok\",\"kernels\":\"%s\"}\n", dg_kernels()->name);
     return 0;
 }
 
