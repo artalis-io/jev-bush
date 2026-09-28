@@ -28,7 +28,9 @@
 #if defined(__AVX512F__) && defined(__AVX512DQ__)
 #define JB_AVX512 1
 #include <immintrin.h>
-#elif defined(__AVX2__) && defined(__FMA__)
+#elif defined(__AVX2__) && (defined(__FMA__) || (defined(_MSC_VER) && !defined(__clang__)))
+/* The AVX2 kernels use FMA. MSVC's /arch:AVX2 enables FMA code generation
+ * but does not define __FMA__. */
 #define JB_AVX2 1
 #include <immintrin.h>
 #endif
