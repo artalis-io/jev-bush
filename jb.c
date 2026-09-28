@@ -1085,10 +1085,20 @@ static void dg_nvfp4_mm_avx512(const uint8_t*wd,const uint8_t*sd,float global,co
 #endif
 #if defined(JB_AVX2)
 static float dg_hsum8(__m256 x);
-/* AVX2 has no convenient cross-lane nibble expansion. Decode one 16-value
- * NVFP4 block to a small stack tile, then reuse it across the token batch. */
+static void dg_nvfp4_weights16_avx2(const uint8_t*q,float scale,__m256*w0,__m256*w1){
+    const __m128i lut=_mm_setr_epi8(0,1,2,3,4,6,8,12,0,-1,-2,-3,-4,-6,-8,-12);
+    const __m128i mask=_mm_set1_epi8(15),raw=_mm_loadl_epi64((const __m128i*)q);
+    __m128i lo=_mm_shuffle_epi8(lut,_mm_and_si128(raw,mask));
+    __m128i hi=_mm_shuffle_epi8(lut,_mm_and_si128(_mm_srli_epi16(raw,4),mask));
+    __m256 lf=_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(lo));
+    __m256 hf=_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(hi));
+    __m256 a=_mm256_unpacklo_ps(lf,hf),b=_mm256_unpackhi_ps(lf,hf),s=_mm256_set1_ps(scale*.5f);
+    *w0=_mm256_mul_ps(_mm256_permute2f128_ps(a,b,0x20),s);
+    *w1=_mm256_mul_ps(_mm256_permute2f128_ps(a,b,0x31),s);
+}
+/* Decode each packed 16-weight block entirely in registers, retaining the
+ * reference interleaved lane order and reusing it across four tokens. */
 static void dg_nvfp4_mm_avx2(const uint8_t*wd,const uint8_t*sd,float global,const float*x,float*y,int tokens,int rows,int cols){
-    static const float lut[16]={0,.5f,1,1.5f,2,3,4,6,0,-.5f,-1,-1.5f,-2,-3,-4,-6};
 #ifdef _OPENMP
     JB_OMP();
 #pragma omp parallel for schedule(static)
@@ -1099,9 +1109,7 @@ static void dg_nvfp4_mm_avx2(const uint8_t*wd,const uint8_t*sd,float global,cons
             int nb=tokens-tb<4?tokens-tb:4;__m256 acc0[4],acc1[4];
             for(int q=0;q<nb;q++)acc0[q]=acc1[q]=_mm256_setzero_ps();
             for(int c=0;c<cols;c+=16){
-                float wv[16],scale=dg_f8e4m3(sp[c/16])*global;const uint8_t*z=wp+c/2;
-                for(int k=0;k<8;k++){uint8_t v=z[k];wv[2*k]=lut[v&15]*scale;wv[2*k+1]=lut[v>>4]*scale;}
-                __m256 w0=_mm256_loadu_ps(wv),w1=_mm256_loadu_ps(wv+8);
+                __m256 w0,w1;dg_nvfp4_weights16_avx2(wp+c/2,dg_f8e4m3(sp[c/16])*global,&w0,&w1);
                 for(int q=0;q<nb;q++){const float*xp=x+(size_t)(tb+q)*cols+c;acc0[q]=_mm256_fmadd_ps(w0,_mm256_loadu_ps(xp),acc0[q]);acc1[q]=_mm256_fmadd_ps(w1,_mm256_loadu_ps(xp+8),acc1[q]);}
             }
             for(int q=0;q<nb;q++)y[(size_t)(tb+q)*rows+r]=dg_hsum8(_mm256_add_ps(acc0[q],acc1[q]));
@@ -1148,16 +1156,17 @@ static void dg_mm_data_avx512(const uint8_t*data,const float*x,float*y,int token
 static __m256 dg_bf16x8(const uint8_t*p){__m128i h=_mm_loadu_si128((const __m128i*)p);return _mm256_castsi256_ps(_mm256_slli_epi32(_mm256_cvtepu16_epi32(h),16));}
 static float dg_hsum8(__m256 x){__m128 h=_mm_add_ps(_mm256_castps256_ps128(x),_mm256_extractf128_ps(x,1));h=_mm_hadd_ps(h,h);h=_mm_hadd_ps(h,h);return _mm_cvtss_f32(h);}
 static void dg_mm_data_avx2(const uint8_t*data,const float*x,float*y,int tokens,int rows,int cols){
+    if(rows%2)die("AVX2 matrix row count must be even");
 #ifdef _OPENMP
     JB_OMP();
 #pragma omp parallel for schedule(static)
 #endif
-    for(int r=0;r<rows;r++){
-        const uint8_t*p=data+(uint64_t)r*cols*2;
-        for(int tb=0;tb<tokens;tb+=8){
-            int nb=tokens-tb<8?tokens-tb:8;__m256 a[8];for(int q=0;q<nb;q++)a[q]=_mm256_setzero_ps();int c=0;
-            for(;c+7<cols;c+=8){__m256 w=dg_bf16x8(p+c*2);for(int q=0;q<nb;q++)a[q]=_mm256_fmadd_ps(w,_mm256_loadu_ps(x+(size_t)(tb+q)*cols+c),a[q]);}
-            for(int q=0;q<nb;q++){float z=dg_hsum8(a[q]);for(int k=c;k<cols;k++)z+=dg_bf(p+k*2)*x[(size_t)(tb+q)*cols+k];y[(size_t)(tb+q)*rows+r]=z;}
+    for(int r=0;r<rows;r+=2){
+        const uint8_t*p0=data+(uint64_t)r*cols*2,*p1=p0+(uint64_t)cols*2;
+        for(int tb=0;tb<tokens;tb+=4){
+            int nb=tokens-tb<4?tokens-tb:4;__m256 a[4],b[4];for(int q=0;q<nb;q++)a[q]=b[q]=_mm256_setzero_ps();int c=0;
+            for(;c+7<cols;c+=8){__m256 w0=dg_bf16x8(p0+c*2),w1=dg_bf16x8(p1+c*2);for(int q=0;q<nb;q++){__m256 v=_mm256_loadu_ps(x+(size_t)(tb+q)*cols+c);a[q]=_mm256_fmadd_ps(w0,v,a[q]);b[q]=_mm256_fmadd_ps(w1,v,b[q]);}}
+            for(int q=0;q<nb;q++){float z0=dg_hsum8(a[q]),z1=dg_hsum8(b[q]);for(int k=c;k<cols;k++){float v=x[(size_t)(tb+q)*cols+k];z0+=dg_bf(p0+k*2)*v;z1+=dg_bf(p1+k*2)*v;}y[(size_t)(tb+q)*rows+r]=z0;y[(size_t)(tb+q)*rows+r+1]=z1;}
         }
     }
 }

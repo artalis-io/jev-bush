@@ -394,9 +394,27 @@ At 64 physical threads the warm non-profiled row now takes 2.32--2.35 seconds,
 down from 2.94--3.00 seconds after matrix tiling and 4.51 seconds before it.
 In the instrumented run, GELU fell from 602 to 164 ms, input QDQ from 97 to
 4 ms, and hidden QDQ from 209 to 84 ms. The full answer object remains byte-
-identical to the pre-optimization strict AVX2 path. This puts AVX2 within about
-7% of the measured 2.18-second AVX-512 result for this warm row, although the
-two ISA paths retain their own deterministic FP reduction order.
+identical to the pre-optimization strict AVX2 path. At that stage this put AVX2
+within about 7% of the earlier 2.18-second AVX-512 result, before remeasuring
+both backends with the shared GELU change. The two ISA paths retain their own
+deterministic FP reduction order.
+
+The next AVX2 matrix pass removes the last scalar NVFP4 weight decoder from the
+hot loop. `vpshufb` maps packed E2M1 nibbles to signed integer magnitudes, which
+are expanded and interleaved as FP32 entirely in registers before the existing
+FMA accumulation. The retained topology is one output row by four tokens: a
+two-row/two-token experiment fell from about 29 to 19 GFLOP/s because AVX2 has
+only 16 vector registers. NVFP4 now reaches 10.2 GFLOP/s at one token and about
+29 GFLOP/s for multi-token work, versus 6.9 and 20 before register decoding.
+
+BF16 has only one accumulator per output row and therefore benefits from a
+two-row/four-token tile. It reaches 86.4 GFLOP/s at 256 tokens, up from 53.1,
+while reusing each activation load across two rows. Combined warm latency is
+1.98--1.99 seconds at 64 physical threads, down from 2.29 seconds immediately
+before this matrix pass. The refreshed AVX-512 baseline is 1.82 seconds, leaving
+AVX2 about 9% behind on this row. All retained changes preserve byte-identical
+strict AVX2 answer objects; the two ISA tiers still have distinct reduction
+orders.
 
 
 ## Expected outcome
