@@ -814,6 +814,9 @@ static void json_check_keys(const char *s, const JTok *t, int nt) {
 }
 
 static JTok *json_tokens(const char *s, size_t n, int *nt) {
+    /* Token offsets are int; every caller also enforces this limit earlier. */
+    if (n > JB_MAX_JSON)
+        die("JSON input is too large");
     JParser parser = {s, n, 0, 0, 0, 0, 0};
     JParser *p = &parser;
     json_parse_value(p, -1);
@@ -4504,6 +4507,8 @@ jb_status jb_session_decide_json(jb_session *session, const char *request_json,
         return jb_invalid("session, request, and output pointers are required");
     *out_json = NULL;
     *out_length = 0;
+    if (request_length > JB_MAX_JSON)
+        return jb_invalid("request JSON is too large");
     JBErrorFrame frame;
     jb_frame_enter(&frame, JB_ERROR_REQUEST);
     if (setjmp(frame.jump)) {
@@ -4545,6 +4550,8 @@ jb_status jb_session_decide_json_batch(jb_session *session, const char *const *r
     for (size_t i = 0; i < request_count; i++) {
         if (!request_json[i] || !request_lengths[i])
             die("batch request is empty");
+        if (request_lengths[i] > JB_MAX_JSON)
+            die("batch request JSON is too large");
         mutable_request[i] = (char *)request_json[i];
     }
     int batched = request_count > 1 &&
@@ -4700,6 +4707,8 @@ static char *jb_typed_request(const jb_session *session, const jb_input *input, 
         die("typed inference requires a typed or JSON session schema");
     if (!input || !input->state_json.data || !input->state_json.length)
         die("typed input needs state_json");
+    if (input->state_json.length > JB_MAX_JSON || input->id.length > JB_MAX_JSON)
+        die("typed input is too large");
     int nt = 0;
     JTok *state = json_tokens(input->state_json.data, input->state_json.length, &nt);
     if (!nt || state[0].parent != -1)
