@@ -382,6 +382,22 @@ seconds at 48 threads, so AVX2 is now within 1.35x on this workload. A warm
 activation quantization total 0.91 seconds and are the clearest remaining AVX2
 targets. These figures are from the 9980X with physical-core placement.
 
+Those activation targets are now implemented without approximating either
+operation. Routed GELU retains the existing `tanhf` expression and distributes
+large independent activation arrays over the OpenMP team. NVFP4 QDQ retains
+the scalar E2M1 rounding and scale calculation byte for byte, while distributing
+independent 16-value quantization blocks. An attempted fully vectorized E2M1
+path was rejected because small intermediate differences changed final
+probabilities.
+
+At 64 physical threads the warm non-profiled row now takes 2.32--2.35 seconds,
+down from 2.94--3.00 seconds after matrix tiling and 4.51 seconds before it.
+In the instrumented run, GELU fell from 602 to 164 ms, input QDQ from 97 to
+4 ms, and hidden QDQ from 209 to 84 ms. The full answer object remains byte-
+identical to the pre-optimization strict AVX2 path. This puts AVX2 within about
+7% of the measured 2.18-second AVX-512 result for this warm row, although the
+two ISA paths retain their own deterministic FP reduction order.
+
 
 ## Expected outcome
 

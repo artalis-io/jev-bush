@@ -1002,6 +1002,24 @@ static void dg_nvfp4_qdq_ref(float*out,const float*in,int tokens,int cols,float 
         if(s==0){memset(y,0,16*sizeof*y);continue;}for(int k=0;k<16;k++)y[k]=dg_e2m1_round(x[k]/s)*s;
     }
 }
+#if defined(JB_AVX2)
+static void dg_nvfp4_qdq_avx2(float*out,const float*in,int tokens,int cols,float base){
+    if(!jb_finitef(base)||!(base>0)||cols%32)die("invalid NVFP4 activation scale");
+    int nb=cols/16,blocks=tokens*nb;
+#ifdef _OPENMP
+    JB_OMP();
+#pragma omp parallel for schedule(static) if(blocks>=256)
+#endif
+    for(int z=0;z<blocks;z++){
+        int t=z/nb,b=z%nb;
+        const float*x=in+(size_t)t*cols+(size_t)b*16;float*y=out+(size_t)t*cols+(size_t)b*16,amax=0;
+        for(int k=0;k<16;k++){if(!jb_finitef(x[k]))die("non-finite NVFP4 activation");if(fabsf(x[k])>amax)amax=fabsf(x[k]);}
+        float s=dg_f8e4m3_round((amax/6)/base)*base;
+        if(s==0){memset(y,0,16*sizeof*y);continue;}
+        for(int k=0;k<16;k++)y[k]=dg_e2m1_round(x[k]/s)*s;
+    }
+}
+#endif
 #if defined(JB_AVX512)
 /* Match each packed weight byte: low-nibble activations, then high. This
  * one-time swizzle removes two activation permutes per expert row/tile. */
@@ -1014,7 +1032,11 @@ static void dg_nvfp4_swizzle(float*out,int tokens,int cols){
 #endif
 /* Produces the activation layout the selected dg_nvfp4_mm kernel expects. */
 static void dg_nvfp4_qdq(float*out,const float*in,int tokens,int cols,float base){
+#if defined(JB_AVX2)
+    dg_nvfp4_qdq_avx2(out,in,tokens,cols,base);
+#else
     dg_nvfp4_qdq_ref(out,in,tokens,cols,base);
+#endif
 #if defined(JB_AVX512)
     dg_nvfp4_swizzle(out,tokens,cols);
 #endif
@@ -1444,7 +1466,13 @@ static void dg_ff(DGModel *m, int l, float *x, int n) {
         if(m->nvfp4){DGNvExpert*v=&m->nvexpert[l*128+e];float*qh=xmalloc((size_t)ne*DG_MOE*4);
             JB_TICK(gate_start);dg_nvfp4_mm(v->wg,v->sg,v->gg,gather,gu,ne,DG_MOE,DG_H);JB_TO(moe_gate,gate_start);
             JB_TICK(up_start);dg_nvfp4_mm(v->wu,v->su,v->gu,gather,hid,ne,DG_MOE,DG_H);JB_TO(moe_up,up_start);
-            JB_TICK(act_start);for(int q=0;q<ne;q++)for(int i=0;i<DG_MOE;i++)hid[(size_t)q*DG_MOE+i]=dg_gelu(gu[(size_t)q*DG_MOE+i])*hid[(size_t)q*DG_MOE+i];JB_TO(moe_activation,act_start);
+            JB_TICK(act_start);
+#ifdef _OPENMP
+            JB_OMP();
+#pragma omp parallel for schedule(static) if(ne*DG_MOE>=4096)
+#endif
+            for(int qi=0;qi<ne*DG_MOE;qi++)hid[qi]=dg_gelu(gu[qi])*hid[qi];
+            JB_TO(moe_activation,act_start);
             JB_TICK(hidden_qdq_start);dg_nvfp4_qdq(qh,hid,ne,DG_MOE,m->nv_a2[l]);JB_TO(moe_hidden_qdq,hidden_qdq_start);
             JB_TICK(down_start);dg_nvfp4_mm(v->wd,v->sd,v->gd,qh,eo,ne,DG_H,DG_MOE);JB_TO(moe_down,down_start);free(qh);
         }else{const uint8_t*gp=eg->data+(uint64_t)e*1408*DG_H*2,*dp=ed->data+(uint64_t)e*DG_H*DG_MOE*2;dg_mm_data(gp,gather,gu,ne,1408,DG_H);for(int q=0;q<ne;q++)for(int i=0;i<DG_MOE;i++)hid[(size_t)q*DG_MOE+i]=dg_gelu(gu[(size_t)q*1408+i])*gu[(size_t)q*1408+DG_MOE+i];dg_mm_data(dp,hid,eo,ne,DG_H,DG_MOE);}
