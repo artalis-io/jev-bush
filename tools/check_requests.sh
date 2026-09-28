@@ -87,6 +87,21 @@ expect 2 array-trailing-comma.json
 printf '{"state":01,%s}' "$Q" >"$DIR/bad-number.json"
 expect 2 bad-number.json
 
+# Automatic reads score every answer slot in one pass, limited to 128; the
+# limit must apply before any model work, and not to explicit samples.
+questions() {
+    printf '{"state":"x",%s"questions":{"q0":{"type":"noul"}' "$2"
+    i=1
+    while [ $i -lt "$1" ]; do printf ',"q%d":{"type":"noul"}' $i; i=$((i + 1)); done
+    printf '}}'
+}
+questions 128 '' >"$DIR/auto-128.json"
+expect 0 auto-128.json
+questions 129 '' >"$DIR/auto-129.json"
+expect 2 auto-129.json
+questions 129 '"samples":1,' >"$DIR/samples-129.json"
+expect 0 samples-129.json
+
 # The file-size gate must reject an oversized request before allocating or
 # parsing it. This sparse fixture costs no proportional disk space.
 dd if=/dev/zero of="$DIR/oversized.json" bs=1 count=0 seek=67108865 2>/dev/null
