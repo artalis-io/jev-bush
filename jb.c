@@ -1743,20 +1743,26 @@ static void dg_mm_data_avx2(const uint8_t *data, const float *x, float *y, int t
 static void dg_nvfp4_qdq_avx2(float *out, const float *in, int tokens, int cols, float base) {
     if (!jb_finitef(base) || !(base > 0) || cols % 32)
         die("invalid NVFP4 activation scale");
-    int nb = cols / 16, blocks = tokens * nb;
+    int nb = cols / 16, blocks = tokens * nb, nonfinite = 0;
+    /* die() must not run inside the parallel region: OpenMP workers have no
+     * error frame, so it would exit the host process, and a longjmp out of
+     * the region is undefined. Record the failure and report it afterwards. */
 #ifdef _OPENMP
     JB_OMP();
-#pragma omp parallel for schedule(static) if (blocks >= 256)
+#pragma omp parallel for schedule(static) if (blocks >= 256) reduction(| : nonfinite)
 #endif
     for (int z = 0; z < blocks; z++) {
-        int t = z / nb, b = z % nb;
+        int t = z / nb, b = z % nb, bad = 0;
         const float *x = in + (size_t)t * cols + (size_t)b * 16;
         float *y = out + (size_t)t * cols + (size_t)b * 16, amax = 0;
         for (int k = 0; k < 16; k++) {
-            if (!jb_finitef(x[k]))
-                die("non-finite NVFP4 activation");
+            bad |= !jb_finitef(x[k]);
             if (fabsf(x[k]) > amax)
                 amax = fabsf(x[k]);
+        }
+        if (bad) {
+            nonfinite = 1;
+            continue;
         }
         float s = dg_f8e4m3_round((amax / 6) / base) * base;
         if (s == 0) {
@@ -1766,6 +1772,8 @@ static void dg_nvfp4_qdq_avx2(float *out, const float *in, int tokens, int cols,
         for (int k = 0; k < 16; k++)
             y[k] = dg_e2m1_round(x[k] / s) * s;
     }
+    if (nonfinite)
+        die("non-finite NVFP4 activation");
 }
 
 static float dg_hsum8(__m256 x);
@@ -5019,11 +5027,36 @@ static void dg_test_rms_dot(uint64_t *rs) {
     }
 }
 
+/* A non-finite activation must come back through the error frame, even when
+ * the kernel runs its blocks in parallel and a worker thread finds it. */
+static void dg_test_nonfinite_activation(void) {
+    enum { tokens = 8 };
+    uint32_t nan_bits = 0x7fc00000u;
+    float *in = xcalloc((size_t)tokens * DG_H, sizeof *in);
+    float *out = xmalloc((size_t)tokens * DG_H * sizeof *out);
+    memcpy(&in[(size_t)tokens * DG_H - 1], &nan_bits, sizeof nan_bits);
+    JBErrorFrame frame;
+    memset(&frame, 0, sizeof frame);
+    frame.previous = jb_error_frame;
+    jb_error_frame = &frame;
+    if (!setjmp(frame.jump)) {
+        dg_nvfp4_qdq(out, in, tokens, DG_H, 1.0f);
+        jb_error_frame = frame.previous;
+        die("kernel self-test failed: non-finite NVFP4 activation accepted");
+    }
+    jb_error_frame = frame.previous;
+    if (strcmp(jb_error_message, "non-finite NVFP4 activation"))
+        die2("kernel self-test failed: unexpected error", jb_error_message);
+    free(in);
+    free(out);
+}
+
 static void dg_kernel_selftest(void) {
     uint64_t rs = 0x9e3779b97f4a7c15ull;
     dg_test_mm(&rs);
     dg_test_nvfp4(&rs);
     dg_test_rms_dot(&rs);
+    dg_test_nonfinite_activation();
 }
 
 /* Kernel throughput at model shapes, for comparing ISA paths and builds.
