@@ -5071,6 +5071,12 @@ static void jb_put_bf16(uint8_t *p, float v) {
     p[1] = (uint8_t)(u >> 24);
 }
 
+/* Fill a kernel's output with NaN before each call, so an output the kernel
+ * fails to write cannot inherit a correct value from an earlier pass. */
+static void jb_poison(float *y, size_t count) {
+    memset(y, 0xff, count * sizeof *y);
+}
+
 static void jb_check_close(const char *what, double got, double want, double bound) {
     if (!jb_finite(got) || fabs(got - want) > bound) {
         char z[160];
@@ -5105,6 +5111,7 @@ static void dg_test_mm(uint64_t *rs) {
                 mag[(size_t)t * rows + r] = a;
             }
         for (int pass = 0; pass < 2; pass++) {
+            jb_poison(y, (size_t)tokens * rows);
             if (pass)
                 dg_mm_data(w, x, y, tokens, rows, cols);
             else
@@ -5154,6 +5161,7 @@ static void dg_test_nvfp4(uint64_t *rs) {
                 want[(size_t)t * rows + r] = s;
                 mag[(size_t)t * rows + r] = a;
             }
+        jb_poison(y, (size_t)tokens * rows);
         dg_nvfp4_mm_ref(wd, sd, global, xq, y, tokens, rows, cols);
         for (int i = 0; i < tokens * rows; i++)
             jb_check_close("NVFP4 matmul (ref)", y[i], want[i], 1e-4 * mag[i]);
@@ -5179,6 +5187,7 @@ static void dg_test_nvfp4(uint64_t *rs) {
         tg.data = (const uint8_t *)&global;
         tg.dtype = DG_F32;
         tg.bytes = 4;
+        jb_poison(y, (size_t)tokens * rows);
         dg_nvfp4_mm(&tw, &ts, &tg, xs, y, tokens, rows, cols);
         for (int i = 0; i < tokens * rows; i++)
             jb_check_close(dg_kernels()->name, y[i], want[i], 1e-4 * mag[i]);
@@ -5220,6 +5229,7 @@ static void dg_test_rms_dot(uint64_t *rs) {
         double q = 1.0 / sqrt(ss / n + 1e-6);
         for (int pass = 0; pass < 4; pass++) {
             const DGTensor *sc = pass & 1 ? &scale : NULL;
+            jb_poison(y, (size_t)n);
             if (pass & 2)
                 dg_rms(y, x, sc, n);
             else
