@@ -131,6 +131,11 @@ static void die2(const char *a, const char *b) {
     exit(2);
 }
 
+static void flush_output(void) {
+    if (fflush(stdout) == EOF || ferror(stdout))
+        die("cannot write output");
+}
+
 static void *xmalloc(size_t n) {
 #ifdef JB_PROFILE
     uint64_t start = now_ns();
@@ -292,6 +297,8 @@ static int cmp_merge(const void *a, const void *b) {
 
 static void push(Tokens *t, int x) {
     if (t->n == t->cap) {
+        if (t->cap > UINT32_MAX / 2)
+            die("token array size overflow");
         t->cap = t->cap ? t->cap * 2 : 64;
         t->v = xrealloc(t->v, (size_t)t->cap * sizeof *t->v);
     }
@@ -359,6 +366,8 @@ static char *jt_string(const char *j, const JTok *t);
 
 static int jt_new(JParser *p, int type, int start, int parent) {
     if (p->nt == p->cap) {
+        if (p->cap > INT32_MAX / 2)
+            die("JSON token array size overflow");
         p->cap = p->cap ? p->cap * 2 : 256;
         p->t = xrealloc(p->t, (size_t)p->cap * sizeof *p->t);
     }
@@ -502,13 +511,16 @@ static void json_check_keys(const char *s, const JTok *t, int nt) {
         for (int i = obj + 1; i < nt && t[i].parent >= obj; i++)
             if (t[i].parent == obj) {
                 if (nk == cap) {
+                    if (cap > INT32_MAX / 2)
+                        die("JSON key array size overflow");
                     cap = cap ? cap * 2 : 64;
                     keys = xrealloc(keys, (size_t)cap * sizeof *keys);
                 }
                 keys[nk++] = jt_string(s, &t[i]);
                 i++;
             }
-        qsort(keys, (size_t)nk, sizeof *keys, cmp_str);
+        if (nk > 1)
+            qsort(keys, (size_t)nk, sizeof *keys, cmp_str);
         for (int i = 0; i < nk; i++) {
             if (i && !strcmp(keys[i - 1], keys[i]))
                 die2("duplicate JSON object key", keys[i]);
@@ -642,6 +654,8 @@ static uint64_t jt_u64(const char *j, const JTok *t, const char *name) {
 
 static void dg_push_tensor(DGModel *m, DGTensor t) {
     if (m->nt == m->cap) {
+        if (m->cap > SIZE_MAX / 2 / sizeof *m->tensor)
+            die("tensor descriptor array size overflow");
         m->cap = m->cap ? m->cap * 2 : 1024;
         m->tensor = xrealloc(m->tensor, m->cap * sizeof *m->tensor);
     }
@@ -1943,7 +1957,7 @@ static void dg_attention_segments(DGModel *m, int l, float *x, int segments, int
 
 static void dg_attention(DGModel *m, int l, float *x, int n, int pos0, const DGKV *cache, DGKV *out,
                          int mode, int batch) {
-    if (n % batch || (out && batch != 1))
+    if (batch <= 0 || n < 0 || n % batch || (out && batch != 1))
         die("invalid attention batch");
     const DGKV *one_cache;
     int one_len;
@@ -3544,7 +3558,7 @@ static int dg_systemone(DGModel *m, DGTokenizer *tok, const char *j, size_t len,
         moe_misc, jb_profile.ff_other / 1e6, layer_other, jb_profile.embedding / 1e6,
         jb_profile.final_norm / 1e6, jb_profile.kv_free / 1e6, cand_ms, unaccounted, ms);
 #endif
-    fflush(stdout);
+    flush_output();
     dg_job_free(&job);
     return 0;
 }
@@ -3651,7 +3665,7 @@ static int dg_system_batch(DGModel *m, DGTokenizer *tok, char **row, size_t *len
                          batch);
         dg_job_free(&g[b]);
     }
-    fflush(stdout);
+    flush_output();
     free(kv);
     free(g);
     return 1;
@@ -4209,21 +4223,27 @@ static void usage(void) {
             JB_VERSION);
 }
 
+static int finish_output(int rc) {
+    if (!rc)
+        flush_output();
+    return rc;
+}
+
 int main(int ac, char **av) {
     if (ac == 2 && !strcmp(av[1], "--selftest"))
-        return selftest();
+        return finish_output(selftest());
     if (ac == 2 && !strcmp(av[1], "--bench-kernels"))
-        return bench_kernels();
+        return finish_output(bench_kernels());
     if (ac == 3 && !strcmp(av[1], "--check-request"))
-        return dg_check_request(av[2]);
+        return finish_output(dg_check_request(av[2]));
     if (ac < 3) {
         usage();
         return 2;
     }
     if (!strcmp(av[2], "decide") && ac == 4)
-        return dg_decide_file(av[1], av[3]);
+        return finish_output(dg_decide_file(av[1], av[3]));
     if (!strcmp(av[2], "eval") && ac == 4)
-        return dg_eval_file(av[1], av[3]);
+        return finish_output(dg_eval_file(av[1], av[3]));
     usage();
     return 2;
 }

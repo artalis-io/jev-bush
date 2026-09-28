@@ -87,4 +87,9 @@ expect 2 array-trailing-comma.json
 printf '{"state":01,%s}' "$Q" >"$DIR/bad-number.json"
 expect 2 bad-number.json
 
+# The file-size gate must reject an oversized request before allocating or
+# parsing it. This sparse fixture costs no proportional disk space.
+dd if=/dev/zero of="$DIR/oversized.json" bs=1 count=0 seek=67108865 2>/dev/null
+expect 2 oversized.json
+
 exit $fail

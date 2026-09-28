@@ -105,14 +105,19 @@ and AVX-512 differ only behind that boundary; inference, validation, benchmarks,
 and JSON output contain no ISA dispatch branches. Selection remains compile-time
 so the portable build does not require runtime CPU detection.
 
-For deployments that accept requests from other processes or users, add the
-usual Linux hardening flags; they do not change results:
+For Linux release builds, use the hardened command below. These flags are part
+of the release contract rather than an optional deployment tweak; they do not
+change numerical results:
 
 ```sh
 cc -O3 -march=native -ffast-math -std=c11 -Wall -Wextra -pedantic \
   -fstack-protector-strong -D_FORTIFY_SOURCE=3 -fPIE -pie \
   -Wl,-z,relro,-z,now,-z,noexecstack -fopenmp jb.c -lm -o jb
 ```
+
+CI verifies that this produces PIE with stack protection, FORTIFY, full RELRO,
+immediate binding, and a non-executable stack. Platform-specific development
+commands below remain intentionally minimal and portable.
 
 Portable Linux or macOS:
 

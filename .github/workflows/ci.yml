@@ -108,6 +108,29 @@ jobs:
           ASAN_OPTIONS: detect_leaks=0
         run: sh tools/check_requests.sh ./jb-asan
 
+  hardening:
+    name: Hardened Linux build
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build hardened binary
+        run: |
+          cc -O2 -std=c11 -Wall -Wextra -pedantic -Werror \
+            -fstack-protector-strong -D_FORTIFY_SOURCE=3 -fPIE -pie \
+            -Wl,-z,relro,-z,now,-z,noexecstack jb.c -lm -o jb-hardened
+          ./jb-hardened --selftest
+
+      - name: Verify ELF hardening
+        run: |
+          readelf -W -h jb-hardened | grep -q 'Type:.*DYN'
+          readelf -W -l jb-hardened | grep 'GNU_STACK' | grep -q ' RW '
+          readelf -W -l jb-hardened | grep -q 'GNU_RELRO'
+          readelf -W -d jb-hardened | grep -q 'BIND_NOW'
+          nm -u jb-hardened | grep -q '__stack_chk_fail'
+          nm -u jb-hardened | grep -q '_chk@'
+
   fuzz:
     name: Fuzz JSON reader
     runs-on: ubuntu-latest
@@ -125,7 +148,7 @@ jobs:
       - name: Fuzz
         run: |
           mkdir -p corpus artifacts
-          ./fuzz_json -max_total_time=120 -max_len=16384 -dict=fuzz/json.dict \
+          ./fuzz_json -max_total_time=120 -max_len=1048576 -dict=fuzz/json.dict \
             -artifact_prefix=artifacts/ corpus fuzz/corpus
 
       - name: Upload crashing inputs
