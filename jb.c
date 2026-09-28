@@ -4432,6 +4432,24 @@ void jb_model_free(jb_model *model) {
     jb_release(model);
 }
 
+/* Copy a caller's counted string, rejecting what would otherwise be read
+ * through NULL or cut short at an embedded NUL by the JSON writer. */
+static char *jb_counted_string(jb_string s, const char *what, int required) {
+    if (s.length && !s.data)
+        die2("typed string has a NULL pointer", what);
+    if (required && !s.length)
+        die2("typed string is required", what);
+    if (s.length > JB_MAX_JSON)
+        die2("typed string is too large", what);
+    if (s.length && memchr(s.data, 0, s.length))
+        die2("typed string contains NUL", what);
+    char *z = xmalloc(s.length + 1);
+    if (s.length)
+        memcpy(z, s.data, s.length);
+    z[s.length] = 0;
+    return z;
+}
+
 static char *jb_schema_json(const jb_schema *schema, size_t *length) {
     if (!schema || !schema->questions || !schema->question_count ||
         schema->question_count > DG_MAX_QUESTIONS)
@@ -4440,17 +4458,15 @@ static char *jb_schema_json(const jb_schema *schema, size_t *length) {
     db_ch(&out, '{');
     for (size_t q = 0; q < schema->question_count; q++) {
         const jb_question *question = &schema->questions[q];
-        if (!question->id.data || !question->id.length || !question->predicate.data ||
-            !question->predicate.length)
-            die("typed question needs id and predicate");
+        if (question->type != JB_DECISION_BOOLEAN && question->type != JB_DECISION_CHOICE &&
+            question->type != JB_DECISION_SCORE)
+            die("unknown typed decision type");
+        if (question->candidate_count && !question->candidates)
+            die("typed question has a NULL candidate array");
         if (q)
             db_ch(&out, ',');
-        char *id = xmalloc(question->id.length + 1);
-        memcpy(id, question->id.data, question->id.length);
-        id[question->id.length] = 0;
-        char *predicate = xmalloc(question->predicate.length + 1);
-        memcpy(predicate, question->predicate.data, question->predicate.length);
-        predicate[question->predicate.length] = 0;
+        char *id = jb_counted_string(question->id, "question id", 1);
+        char *predicate = jb_counted_string(question->predicate, "question predicate", 1);
         db_json_string(&out, id, 0);
         db_mem(&out, ":{\"type\":", 9);
         const char *type = question->type == JB_DECISION_BOOLEAN  ? "noul"
@@ -4474,26 +4490,24 @@ static char *jb_schema_json(const jb_schema *schema, size_t *length) {
             const jb_candidate *candidate = &question->candidates[c];
             if (c)
                 db_ch(&out, ',');
-            if (question->type != JB_DECISION_SCORE) {
-                const char *candidate_id = question->type == JB_DECISION_BOOLEAN
-                                               ? (c ? "false" : "true")
-                                               : candidate->id.data;
-                size_t candidate_length = question->type == JB_DECISION_BOOLEAN
-                                              ? strlen(candidate_id)
-                                              : candidate->id.length;
-                if (!candidate_id || !candidate_length)
-                    die("typed candidate needs id");
-                char *z = xmalloc(candidate_length + 1);
-                memcpy(z, candidate_id, candidate_length);
-                z[candidate_length] = 0;
+            if (question->type == JB_DECISION_BOOLEAN) {
+                /* Boolean candidates are fixed; an id, if given, must match. */
+                const char *fixed = c ? "false" : "true";
+                char *given = jb_counted_string(candidate->id, "boolean candidate id", 0);
+                int mismatch = *given && strcmp(given, fixed);
+                jb_release(given);
+                if (mismatch)
+                    die("boolean candidates are \"true\" then \"false\"");
+                db_json_string(&out, fixed, 0);
+                db_ch(&out, ':');
+            } else if (question->type == JB_DECISION_CHOICE) {
+                char *z = jb_counted_string(candidate->id, "candidate id", 1);
                 db_json_string(&out, z, 0);
                 db_ch(&out, ':');
                 jb_release(z);
             }
-            char *description = xmalloc(candidate->description.length + 1);
-            if (candidate->description.length)
-                memcpy(description, candidate->description.data, candidate->description.length);
-            description[candidate->description.length] = 0;
+            char *description =
+                jb_counted_string(candidate->description, "candidate description", 0);
             db_json_string(&out, description, 0);
             jb_release(description);
         }
@@ -4816,10 +4830,8 @@ static char *jb_typed_request(const jb_session *session, const jb_input *input, 
     jb_release(state);
     DGBuf request = {0};
     db_ch(&request, '{');
-    if (input->id.data && input->id.length) {
-        char *id = xmalloc(input->id.length + 1);
-        memcpy(id, input->id.data, input->id.length);
-        id[input->id.length] = 0;
+    if (input->id.length) {
+        char *id = jb_counted_string(input->id, "input id", 0);
         db_mem(&request, "\"id\":", 5);
         db_json_string(&request, id, 0);
         db_ch(&request, ',');
