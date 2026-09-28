@@ -226,9 +226,11 @@ static void jb_out_of_memory(void) {
     die("out of memory");
 }
 
-static void *jb_allocate(size_t n, int clear) {
+/* Returns NULL on failure, for callers that must release something else
+ * (an open file) before reporting out of memory. */
+static void *jb_try_allocate(size_t n, int clear) {
     if (n > SIZE_MAX - sizeof(JBAllocation))
-        jb_out_of_memory();
+        return NULL;
 #ifdef JB_PROFILE
     uint64_t start = now_ns();
 #endif
@@ -239,13 +241,20 @@ static void *jb_allocate(size_t n, int clear) {
     jb_profile.hot_alloc_calls += (uint64_t)jb_profile_hot;
 #endif
     if (!a)
-        jb_out_of_memory();
+        return NULL;
     a->link.sequence = ++jb_allocation_sequence;
     a->link.tracked = jb_error_frame && !jb_in_parallel();
     a->link.previous = a->link.next = NULL;
     if (a->link.tracked)
         jb_link(a);
     return a + 1;
+}
+
+static void *jb_allocate(size_t n, int clear) {
+    void *p = jb_try_allocate(n, clear);
+    if (!p)
+        jb_out_of_memory();
+    return p;
 }
 
 static void *xmalloc(size_t n) {
@@ -485,8 +494,10 @@ static void map_file(FileMap *m, const char *path) {
 #if defined(_WIN32)
     LARGE_INTEGER z;
     m->hf = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
-    if (m->hf == INVALID_HANDLE_VALUE)
+    if (m->hf == INVALID_HANDLE_VALUE) {
+        m->hf = NULL;
         die2("open", path);
+    }
     if (!GetFileSizeEx(m->hf, &z) || z.QuadPart <= 0)
         die("GetFileSizeEx failed");
     m->size = (uint64_t)z.QuadPart;
@@ -500,10 +511,16 @@ static void map_file(FileMap *m, const char *path) {
 #else
     int fd = open(path, O_RDONLY);
     struct stat st;
-    if (fd < 0 || fstat(fd, &st))
+    if (fd < 0)
         die2("open", path);
-    if (st.st_size <= 0 || (uintmax_t)st.st_size > SIZE_MAX)
+    if (fstat(fd, &st)) {
+        close(fd);
+        die2("open", path);
+    }
+    if (st.st_size <= 0 || (uintmax_t)st.st_size > SIZE_MAX) {
+        close(fd);
         die("invalid model size");
+    }
     m->size = (uint64_t)st.st_size;
     m->map = mmap(NULL, (size_t)m->size, PROT_READ, MAP_PRIVATE, fd, 0);
     close(fd);
@@ -513,13 +530,14 @@ static void map_file(FileMap *m, const char *path) {
         m->map = NULL;
 #endif
     if (!m->map) {
+        m->map = xmalloc((size_t)m->size);
         FILE *f = fopen(path, "rb");
         if (!f)
             die2("open", path);
-        m->map = xmalloc((size_t)m->size);
-        if (fread(m->map, 1, (size_t)m->size, f) != (size_t)m->size)
-            die("short read");
+        size_t got = fread(m->map, 1, (size_t)m->size, f);
         fclose(f);
+        if (got != (size_t)m->size)
+            die("short read");
     }
 }
 
@@ -1194,10 +1212,17 @@ static char *read_whole(const char *path, size_t *n) {
     FILE *f = fopen(path, "rb");
     if (!f)
         die2("cannot open", path);
-    if (fseek(f, 0, SEEK_END) || (*n = (size_t)ftell(f)) > JB_MAX_JSON || fseek(f, 0, SEEK_SET))
+    if (fseek(f, 0, SEEK_END) || (*n = (size_t)ftell(f)) > JB_MAX_JSON || fseek(f, 0, SEEK_SET)) {
+        fclose(f);
         die2("invalid JSON file size", path);
-    char *p = xmalloc(*n + 1);
-    if (fread(p, 1, *n, f) != *n || fclose(f))
+    }
+    char *p = jb_try_allocate(*n + 1, 0);
+    if (!p) {
+        fclose(f);
+        jb_out_of_memory();
+    }
+    size_t got = fread(p, 1, *n, f);
+    if (fclose(f) || got != *n)
         die2("cannot read", path);
     p[*n] = 0;
     return p;
@@ -1218,10 +1243,11 @@ static void dgt_load(DGTokenizer *d, const char *dir) {
     if (model < 0 || vocab < 0 || merges < 0 || added < 0 || t[vocab].type != JT_OBJECT ||
         t[merges].type != JT_ARRAY || t[added].type != JT_ARRAY)
         die("unsupported DiffusionGemma tokenizer JSON");
-    d->nv = (uint32_t)(t[vocab].size / 2);
-    if (d->nv != 262144)
+    uint32_t nv = (uint32_t)(t[vocab].size / 2);
+    if (nv != 262144)
         die("unexpected DiffusionGemma vocabulary size");
-    d->vocab = xcalloc(d->nv, sizeof *d->vocab);
+    d->vocab = xcalloc(nv, sizeof *d->vocab);
+    d->nv = nv;
     uint32_t vi = 0;
     for (int i = vocab + 1; i + 1 < nt; i++) {
         if (t[i].parent < vocab)
@@ -1308,7 +1334,7 @@ static void dgt_load(DGTokenizer *d, const char *dir) {
 }
 
 static void dgt_free(DGTokenizer *d) {
-    for (uint32_t i = 0; i < d->nv; i++)
+    for (uint32_t i = 0; d->vocab && i < d->nv; i++)
         jb_release(d->vocab[i].s);
     jb_release(d->vocab);
     jb_release(d->by_id);
