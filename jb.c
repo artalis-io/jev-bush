@@ -625,8 +625,14 @@ static void json_check_keys(const char *s, const JTok *t, int nt) {
         if (nk > 1)
             qsort(keys, (size_t)nk, sizeof *keys, cmp_str);
         for (int i = 0; i < nk; i++) {
-            if (i && !strcmp(keys[i - 1], keys[i]))
-                die2("duplicate JSON object key", keys[i]);
+            if (i && !strcmp(keys[i - 1], keys[i])) {
+                char message[256];
+                snprintf(message, sizeof message, "duplicate JSON object key: %s", keys[i]);
+                for (int k = 0; k < nk; k++)
+                    free(keys[k]);
+                free(keys);
+                die(message);
+            }
         }
         for (int i = 0; i < nk; i++)
             free(keys[i]);
@@ -635,15 +641,32 @@ static void json_check_keys(const char *s, const JTok *t, int nt) {
 }
 
 static JTok *json_tokens(const char *s, size_t n, int *nt) {
-    JParser p = {s, n, 0, 0, 0, 0, 0};
-    json_parse_value(&p, -1);
-    while (p.pos < n && isspace((unsigned char)s[p.pos]))
-        p.pos++;
-    if (p.pos != n)
+    volatile JParser parser = {s, n, 0, 0, 0, 0, 0};
+    JParser *p = (JParser *)&parser;
+    JBErrorFrame *outer = jb_error_frame;
+    JBErrorFrame cleanup;
+    if (outer) {
+        memset(&cleanup, 0, sizeof cleanup);
+        cleanup.previous = outer;
+        cleanup.status = outer->status;
+        jb_error_frame = &cleanup;
+        if (setjmp(cleanup.jump)) {
+            jb_error_frame = outer;
+            outer->status = cleanup.status;
+            free(parser.t);
+            longjmp(outer->jump, 1);
+        }
+    }
+    json_parse_value(p, -1);
+    while (p->pos < n && isspace((unsigned char)s[p->pos]))
+        p->pos++;
+    if (p->pos != n)
         die("trailing JSON data");
-    json_check_keys(s, p.t, p.nt);
-    *nt = p.nt;
-    return p.t;
+    json_check_keys(s, p->t, p->nt);
+    *nt = p->nt;
+    if (outer)
+        jb_error_frame = outer;
+    return p->t;
 }
 
 static int jt_eq(const char *j, const JTok *t, const char *z) {
@@ -4269,8 +4292,10 @@ jb_status jb_session_create_json(jb_model *model, const char *questions_json,
     if (questions_json) {
         int nt = 0;
         JTok *tokens = json_tokens(questions_json, questions_length, &nt);
-        if (!nt || tokens[0].type != JT_OBJECT)
+        if (!nt || tokens[0].type != JT_OBJECT) {
+            free(tokens);
             die("session schema must be a JSON object");
+        }
         free(tokens);
         session->questions_json = xmalloc(questions_length + 1);
         memcpy(session->questions_json, questions_json, questions_length);
