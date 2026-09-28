@@ -44,6 +44,30 @@
 #define JB_MAX_JSON (64u * 1024u * 1024u)
 #define JB_MAX_DEPTH 256
 
+#define DG_H 2816
+#define DG_L 30
+#define DG_HEADS 16
+#define DG_VOCAB 262144
+#define DG_DENSE 2112
+#define DG_MOE 704
+#define DG_TOPK 8
+#define DG_EXPERTS 128
+#define DG_EXPERT_PAIR (2 * DG_MOE)
+#define DG_FULL_EVERY 6
+#define DG_FULL_HEAD_DIM 512
+#define DG_LOCAL_HEAD_DIM 256
+#define DG_FULL_KV_HEADS 2
+#define DG_LOCAL_KV_HEADS 8
+#define DG_FULL_ROPE_DIM 64
+#define DG_LOCAL_WINDOW 1024
+#define DG_CHOICE_LABELS 128
+#define DG_MAX_QUESTIONS 1024
+#define DG_MAX_SCORE 10
+#define DG_CANVAS_TOKENS 64
+#define DG_CANVAS_ALIGN 16
+#define DG_CANVAS_GROUP 8
+#define DG_CANVAS_MASK_TOKEN 106
+
 #if defined(__FAST_MATH__)
 #define JB_MATH_MODE "fast"
 #else
@@ -586,7 +610,7 @@ typedef struct {
     size_t nt, cap;
     int nshard, nvfp4;
     DGNvExpert *nvexpert;
-    float nv_a13[30], nv_a2[30];
+    float nv_a13[DG_L], nv_a2[DG_L];
 } DGModel;
 
 enum { DG_UNKNOWN = -1, DG_BF16, DG_U8, DG_F8E4M3, DG_F32 };
@@ -791,49 +815,53 @@ static void dg_load(DGModel *m, const char *dir) {
     for (size_t i = 1; i < m->nt; i++)
         if (!strcmp(m->tensor[i - 1].name, m->tensor[i].name))
             die2("duplicate DiffusionGemma tensor", m->tensor[i].name);
-    dg_expect(m, "model.decoder.embed_tokens.weight", DG_BF16, 2, 262144, 2816, 0);
-    dg_expect_count(m, "model.decoder.norm.weight", DG_BF16, 2816);
+    dg_expect(m, "model.decoder.embed_tokens.weight", DG_BF16, 2, DG_VOCAB, DG_H, 0);
+    dg_expect_count(m, "model.decoder.norm.weight", DG_BF16, DG_H);
     /* Validate every layer, not a sample: kernels index these tensors by the
      * shapes below without further bounds checks. */
-    for (int l = 0; l < 30; l++) {
-        int full = l % 6 == 5, hd = full ? 512 : 256, kn = (full ? 2 : 8) * hd;
-        dg_expect_layer(m, l, "self_attn.q_proj.weight", 2, 16u * hd, 2816, 0);
-        dg_expect_layer(m, l, "self_attn.k_proj.weight", 2, kn, 2816, 0);
+    for (int l = 0; l < DG_L; l++) {
+        int full = l % DG_FULL_EVERY == DG_FULL_EVERY - 1;
+        int hd = full ? DG_FULL_HEAD_DIM : DG_LOCAL_HEAD_DIM;
+        int kn = (full ? DG_FULL_KV_HEADS : DG_LOCAL_KV_HEADS) * hd;
+        dg_expect_layer(m, l, "self_attn.q_proj.weight", 2, DG_HEADS * hd, DG_H, 0);
+        dg_expect_layer(m, l, "self_attn.k_proj.weight", 2, kn, DG_H, 0);
         if (!full)
-            dg_expect_layer(m, l, "self_attn.v_proj.weight", 2, kn, 2816, 0);
-        dg_expect_layer(m, l, "self_attn.o_proj.weight", 2, 2816, 16u * hd, 0);
+            dg_expect_layer(m, l, "self_attn.v_proj.weight", 2, kn, DG_H, 0);
+        dg_expect_layer(m, l, "self_attn.o_proj.weight", 2, DG_H, DG_HEADS * hd, 0);
         dg_expect_layer_count(m, l, "self_attn.q_norm.weight", hd);
         dg_expect_layer_count(m, l, "self_attn.k_norm.weight", hd);
-        dg_expect_layer_count(m, l, "input_layernorm.weight", 2816);
-        dg_expect_layer_count(m, l, "post_attention_layernorm.weight", 2816);
-        dg_expect_layer_count(m, l, "pre_feedforward_layernorm.weight", 2816);
-        dg_expect_layer_count(m, l, "post_feedforward_layernorm_1.weight", 2816);
-        dg_expect_layer_count(m, l, "pre_feedforward_layernorm_2.weight", 2816);
-        dg_expect_layer_count(m, l, "post_feedforward_layernorm_2.weight", 2816);
-        dg_expect_layer_count(m, l, "post_feedforward_layernorm.weight", 2816);
-        dg_expect_layer(m, l, "mlp.gate_proj.weight", 2, 2112, 2816, 0);
-        dg_expect_layer(m, l, "mlp.up_proj.weight", 2, 2112, 2816, 0);
-        dg_expect_layer(m, l, "mlp.down_proj.weight", 2, 2816, 2112, 0);
-        dg_expect_layer(m, l, "router.proj.weight", 2, 128, 2816, 0);
-        dg_expect_layer_count(m, l, "router.scale", 2816);
-        dg_expect_layer_count(m, l, "router.per_expert_scale", 128);
+        dg_expect_layer_count(m, l, "input_layernorm.weight", DG_H);
+        dg_expect_layer_count(m, l, "post_attention_layernorm.weight", DG_H);
+        dg_expect_layer_count(m, l, "pre_feedforward_layernorm.weight", DG_H);
+        dg_expect_layer_count(m, l, "post_feedforward_layernorm_1.weight", DG_H);
+        dg_expect_layer_count(m, l, "pre_feedforward_layernorm_2.weight", DG_H);
+        dg_expect_layer_count(m, l, "post_feedforward_layernorm_2.weight", DG_H);
+        dg_expect_layer_count(m, l, "post_feedforward_layernorm.weight", DG_H);
+        dg_expect_layer(m, l, "mlp.gate_proj.weight", 2, DG_DENSE, DG_H, 0);
+        dg_expect_layer(m, l, "mlp.up_proj.weight", 2, DG_DENSE, DG_H, 0);
+        dg_expect_layer(m, l, "mlp.down_proj.weight", 2, DG_H, DG_DENSE, 0);
+        dg_expect_layer(m, l, "router.proj.weight", 2, DG_EXPERTS, DG_H, 0);
+        dg_expect_layer_count(m, l, "router.scale", DG_H);
+        dg_expect_layer_count(m, l, "router.per_expert_scale", DG_EXPERTS);
         dg_expect_layer(m, l, "layer_scalar", 1, 1, 0, 0);
         if (!m->nvfp4) {
-            dg_expect_layer(m, l, "experts.gate_up_proj", 3, 128, 1408, 2816);
-            dg_expect_layer(m, l, "experts.down_proj", 3, 128, 2816, 704);
+            dg_expect_layer(m, l, "experts.gate_up_proj", 3, DG_EXPERTS, DG_EXPERT_PAIR, DG_H);
+            dg_expect_layer(m, l, "experts.down_proj", 3, DG_EXPERTS, DG_H, DG_MOE);
         }
     }
     if (m->nvfp4) {
-        dg_expect(m, "model.decoder.layers.0.experts.0.gate_proj.weight", DG_U8, 2, 704, 1408, 0);
-        dg_expect(m, "model.decoder.layers.0.experts.0.gate_proj.weight_scale", DG_F8E4M3, 2, 704,
-                  176, 0);
+        dg_expect(m, "model.decoder.layers.0.experts.0.gate_proj.weight", DG_U8, 2, DG_MOE,
+                  DG_EXPERT_PAIR, 0);
+        dg_expect(m, "model.decoder.layers.0.experts.0.gate_proj.weight_scale", DG_F8E4M3, 2,
+                  DG_MOE, DG_MOE / 4, 0);
         dg_expect(m, "model.decoder.layers.0.experts.0.gate_proj.weight_scale_2", DG_F32, 0, 0, 0,
                   0);
-        dg_expect(m, "model.decoder.layers.0.experts.0.down_proj.weight", DG_U8, 2, 2816, 352, 0);
-        m->nvexpert = xcalloc(30u * 128, sizeof *m->nvexpert);
-        for (int l = 0; l < 30; l++)
-            for (int e = 0; e < 128; e++) {
-                DGNvExpert *v = &m->nvexpert[l * 128 + e];
+        dg_expect(m, "model.decoder.layers.0.experts.0.down_proj.weight", DG_U8, 2, DG_H,
+                  DG_MOE / 2, 0);
+        m->nvexpert = xcalloc((size_t)DG_L * DG_EXPERTS, sizeof *m->nvexpert);
+        for (int l = 0; l < DG_L; l++)
+            for (int e = 0; e < DG_EXPERTS; e++) {
+                DGNvExpert *v = &m->nvexpert[l * DG_EXPERTS + e];
                 v->wg = dg_expert_tensor(m, l, e, "gate_proj.weight");
                 v->sg = dg_expert_tensor(m, l, e, "gate_proj.weight_scale");
                 v->gg = dg_expert_tensor(m, l, e, "gate_proj.weight_scale_2");
@@ -1156,14 +1184,6 @@ static Tokens dgt_tokenize(DGTokenizer *d, const char *s) {
     return out;
 }
 
-#define DG_H 2816
-#define DG_L 30
-#define DG_HEADS 16
-#define DG_VOCAB 262144
-#define DG_DENSE 2112
-#define DG_MOE 704
-#define DG_TOPK 8
-
 typedef struct {
     float *k, *v;
     int n;
@@ -1407,13 +1427,13 @@ static void dg_mv_slice(const DGTensor *w, uint64_t base, const float *x, float 
  * full-vocabulary top 20 and the explicitly requested label ids. */
 static double dg_slot_logits_entropy(const DGTensor *w, const float *hidden, int n, int **label_ids,
                                      const int *label_n, double **label_score) {
-    if (n < 1 || n > 128)
+    if (n < 1 || n > DG_CHOICE_LABELS)
         die("bad DiffusionGemma answer slot count");
     /* vLLM returns top-20 plus the sorted union of requested label ids at
      * every slot, capped at its per-request 128-id limit. OpenJev computes
      * entropy over that entire returned set. Keep the 128 smallest unique
      * ids without allocating a vocabulary-sized bitmap. */
-    int requested[128], nr = 0;
+    int requested[DG_CHOICE_LABELS], nr = 0;
     for (int t = 0; t < n; t++)
         for (int c = 0; c < label_n[t]; c++) {
             int id = label_ids[t][c], at = 0;
@@ -1421,12 +1441,13 @@ static double dg_slot_logits_entropy(const DGTensor *w, const float *hidden, int
                 at++;
             if (at < nr && requested[at] == id)
                 continue;
-            if (nr < 128) {
+            if (nr < DG_CHOICE_LABELS) {
                 memmove(requested + at + 1, requested + at, (size_t)(nr - at) * sizeof *requested);
                 requested[at] = id;
                 nr++;
-            } else if (at < 128) {
-                memmove(requested + at + 1, requested + at, (size_t)(127 - at) * sizeof *requested);
+            } else if (at < DG_CHOICE_LABELS) {
+                memmove(requested + at + 1, requested + at,
+                        (size_t)(DG_CHOICE_LABELS - 1 - at) * sizeof *requested);
                 requested[at] = id;
             }
         }
@@ -1917,10 +1938,39 @@ static void dg_norm_heads(float *x, int heads, int hd, DGTensor *scale) {
 
 enum { DG_CAUSAL, DG_CANVAS, DG_SUFFIX };
 
+static void dg_attention_segments(DGModel *m, int l, float *x, int segments, int seq, int pos0,
+                                  const DGKV *const *cache, const int *lens, DGKV *out, int mode);
+
 static void dg_attention(DGModel *m, int l, float *x, int n, int pos0, const DGKV *cache, DGKV *out,
                          int mode, int batch) {
+    if (n % batch || (out && batch != 1))
+        die("invalid attention batch");
+    const DGKV *one_cache;
+    int one_len;
+    const DGKV **caches = batch == 1 ? &one_cache : xmalloc((size_t)batch * sizeof *caches);
+    int *lens = batch == 1 ? &one_len : xmalloc((size_t)batch * sizeof *lens);
+    for (int b = 0; b < batch; b++) {
+        caches[b] = mode != DG_CAUSAL ? cache : NULL;
+        lens[b] = n / batch;
+    }
+    dg_attention_segments(m, l, x, batch, n / batch, pos0, caches[0] ? caches : NULL, lens, out,
+                          mode);
+    if (batch != 1) {
+        free(lens);
+        free(caches);
+    }
+}
+
+/* Execute independent equal-stride sequences through one set of projections.
+ * Attention never crosses a segment boundary.  Suffix segments may have
+ * different useful lengths; padding is computed but never copied into K/V. */
+static void dg_attention_segments(DGModel *m, int l, float *x, int segments, int seq, int pos0,
+                                  const DGKV *const *cache, const int *lens, DGKV *out, int mode) {
+    int n = segments * seq;
     JB_TICK(qkv_start);
-    int full = l % 6 == 5, hd = full ? 512 : 256, kvh = full ? 2 : 8;
+    int full = l % DG_FULL_EVERY == DG_FULL_EVERY - 1;
+    int hd = full ? DG_FULL_HEAD_DIM : DG_LOCAL_HEAD_DIM;
+    int kvh = full ? DG_FULL_KV_HEADS : DG_LOCAL_KV_HEADS;
     int qn = DG_HEADS * hd, kn = kvh * hd;
     DGTensor *qw = dg_layer_tensor(m, l, "self_attn.q_proj.weight");
     DGTensor *kw = dg_layer_tensor(m, l, "self_attn.k_proj.weight");
@@ -1937,129 +1987,8 @@ static void dg_attention(DGModel *m, int l, float *x, int n, int pos0, const DGK
         memcpy(v, k, (size_t)n * kn * 4);
     JB_TO(attention_qkv, qkv_start);
     JB_TICK(prepare_start);
-    int half = hd / 2, rotated = full ? 64 : half;
-    float inv[256];
-    for (int i = 0; i < half; i++)
-        inv[i] = i < rotated ? powf(full ? 1000000.0f : 10000.0f, -(float)(2 * i) / hd) : 0.0f;
-    int seq = n / batch;
-#ifdef _OPENMP
-    JB_OMP();
-#pragma omp parallel for schedule(static)
-#endif
-    for (int t = 0; t < n; t++) {
-        int pos = t % seq;
-        float cv[256], sv[256];
-        for (int i = 0; i < half; i++) {
-            cv[i] = cosf((pos0 + pos) * inv[i]);
-            sv[i] = sinf((pos0 + pos) * inv[i]);
-        }
-        dg_norm_heads(q + (size_t)t * qn, DG_HEADS, hd, qnrm);
-        dg_norm_heads(k + (size_t)t * kn, kvh, hd, knrm);
-        dg_norm_heads(v + (size_t)t * kn, kvh, hd, NULL);
-        dg_rope(q + (size_t)t * qn, DG_HEADS, hd, cv, sv);
-        dg_rope(k + (size_t)t * kn, kvh, hd, cv, sv);
-    }
-    JB_TO(attention_prepare, prepare_start);
-    JB_TICK(kv_start);
-    int old = mode != DG_CAUSAL && cache ? cache->n : 0;
-    float *a = xcalloc((size_t)n * qn, 4), *score = xmalloc((size_t)n * (old + seq) * 4);
-    JB_TO(attention_kv, kv_start);
-    JB_TICK(core_start);
-#ifdef _OPENMP
-    JB_OMP();
-#pragma omp parallel for schedule(static)
-#endif
-    for (int ti = 0; ti < n; ti++)
-        for (int h = 0; h < DG_HEADS; h++) {
-            int b = ti / seq, t = ti % seq;
-            float *tscore = score + (size_t)ti * (old + seq);
-            int kh = h / (DG_HEADS / kvh), end = mode == DG_CANVAS ? old + seq : old + t + 1,
-                start = 0;
-            if (!full) {
-                if (mode == DG_CANVAS) {
-                    /* OpenJev's non-causal decoder symmetrizes Gemma's 1024-token
-                     * window around each absolute query position. */
-                    int pos = old + t;
-                    start = pos >= 1024 ? pos - 1024 + 1 : 0;
-                    if (end > pos + 1024)
-                        end = pos + 1024;
-                } else
-                    start = end > 1024 ? end - 1024 : 0;
-            }
-            float mx = -FLT_MAX;
-            const float *qq = q + (size_t)ti * qn + (size_t)h * hd;
-            for (int j = start; j < end; j++) {
-                const float *kk = j < old ? cache->k + (size_t)j * kn + (size_t)kh * hd
-                                          : k + ((size_t)b * seq + j - old) * kn + (size_t)kh * hd;
-                tscore[j] = (float)dg_dot(qq, kk, hd);
-                if (tscore[j] > mx)
-                    mx = tscore[j];
-            }
-            float den = 0;
-            for (int j = start; j < end; j++)
-                den += expf(tscore[j] - mx);
-            float *oo = a + (size_t)ti * qn + (size_t)h * hd;
-            for (int j = start; j < end; j++) {
-                float p = expf(tscore[j] - mx) / den;
-                const float *vv = j < old ? cache->v + (size_t)j * kn + (size_t)kh * hd
-                                          : v + ((size_t)b * seq + j - old) * kn + (size_t)kh * hd;
-                for (int d = 0; d < hd; d++)
-                    oo[d] += p * vv[d];
-            }
-        }
-    JB_TO(attention_core, core_start);
-    JB_TICK(output_start);
-    DGTensor *ow = dg_layer_tensor(m, l, "self_attn.o_proj.weight");
-    dg_mm(ow, a, x, n, DG_H, qn);
-    JB_TO(attention_output, output_start);
-    if (out) {
-        out->n = old + n;
-        if (!old) {
-            out->k = k;
-            out->v = v;
-            k = v = NULL;
-        } else {
-            out->k = xmalloc((size_t)(old + n) * kn * 4);
-            out->v = xmalloc((size_t)(old + n) * kn * 4);
-            memcpy(out->k, cache->k, (size_t)old * kn * 4);
-            memcpy(out->v, cache->v, (size_t)old * kn * 4);
-            memcpy(out->k + (size_t)old * kn, k, (size_t)n * kn * 4);
-            memcpy(out->v + (size_t)old * kn, v, (size_t)n * kn * 4);
-        }
-    }
-    free(q);
-    free(k);
-    free(v);
-    free(a);
-    free(score);
-}
-
-/* Execute independent equal-stride sequences through one set of projections.
- * Attention never crosses a segment boundary.  Suffix segments may have
- * different useful lengths; padding is computed but never copied into K/V. */
-static void dg_attention_multi(DGModel *m, int l, float *x, int segments, int seq,
-                               const DGKV *const *cache, const int *lens, DGKV *out, int mode) {
-    int n = segments * seq;
-    JB_TICK(qkv_start);
-    int full = l % 6 == 5, hd = full ? 512 : 256, kvh = full ? 2 : 8, qn = DG_HEADS * hd,
-        kn = kvh * hd;
-    DGTensor *qw = dg_layer_tensor(m, l, "self_attn.q_proj.weight");
-    DGTensor *kw = dg_layer_tensor(m, l, "self_attn.k_proj.weight");
-    DGTensor *vw = full ? NULL : dg_layer_tensor(m, l, "self_attn.v_proj.weight");
-    DGTensor *qnrm = dg_layer_tensor(m, l, "self_attn.q_norm.weight");
-    DGTensor *knrm = dg_layer_tensor(m, l, "self_attn.k_norm.weight");
-    float *q = xmalloc((size_t)n * qn * 4), *k = xmalloc((size_t)n * kn * 4),
-          *v = xmalloc((size_t)n * kn * 4);
-    dg_mm(qw, x, q, n, qn, DG_H);
-    dg_mm(kw, x, k, n, kn, DG_H);
-    if (vw)
-        dg_mm(vw, x, v, n, kn, DG_H);
-    else
-        memcpy(v, k, (size_t)n * kn * 4);
-    JB_TO(attention_qkv, qkv_start);
-    JB_TICK(prepare_start);
-    int half = hd / 2, rotated = full ? 64 : half;
-    float inv[256];
+    int half = hd / 2, rotated = full ? DG_FULL_ROPE_DIM : half;
+    float inv[DG_FULL_HEAD_DIM / 2];
     for (int i = 0; i < half; i++)
         inv[i] = i < rotated ? powf(full ? 1000000.0f : 10000.0f, -(float)(2 * i) / hd) : 0;
 #ifdef _OPENMP
@@ -2067,8 +1996,9 @@ static void dg_attention_multi(DGModel *m, int l, float *x, int segments, int se
 #pragma omp parallel for schedule(static)
 #endif
     for (int ti = 0; ti < n; ti++) {
-        int s = ti / seq, t = ti % seq, pos = cache[s]->n + t;
-        float cv[256], sv[256];
+        int s = ti / seq, t = ti % seq, old = cache ? cache[s]->n : 0,
+            pos = (cache ? old : pos0) + t;
+        float cv[DG_FULL_HEAD_DIM / 2], sv[DG_FULL_HEAD_DIM / 2];
         for (int i = 0; i < half; i++) {
             cv[i] = cosf(pos * inv[i]);
             sv[i] = sinf(pos * inv[i]);
@@ -2082,9 +2012,10 @@ static void dg_attention_multi(DGModel *m, int l, float *x, int segments, int se
     JB_TO(attention_prepare, prepare_start);
     JB_TICK(kv_start);
     int maxold = 0;
-    for (int s = 0; s < segments; s++)
-        if (cache[s]->n > maxold)
-            maxold = cache[s]->n;
+    if (cache)
+        for (int s = 0; s < segments; s++)
+            if (cache[s]->n > maxold)
+                maxold = cache[s]->n;
     float *a = xcalloc((size_t)n * qn, 4), *score = xmalloc((size_t)n * (maxold + seq) * 4);
     JB_TO(attention_kv, kv_start);
     JB_TICK(core_start);
@@ -2094,16 +2025,17 @@ static void dg_attention_multi(DGModel *m, int l, float *x, int segments, int se
 #endif
     for (int ti = 0; ti < n; ti++)
         for (int h = 0; h < DG_HEADS; h++) {
-            int s = ti / seq, t = ti % seq, old = cache[s]->n, kh = h / (DG_HEADS / kvh),
-                end = mode == DG_CANVAS ? old + seq : old + t + 1, start = 0;
+            int s = ti / seq, t = ti % seq, old = cache ? cache[s]->n : 0,
+                kh = h / (DG_HEADS / kvh), end = mode == DG_CANVAS ? old + seq : old + t + 1,
+                start = 0;
             if (!full) {
                 if (mode == DG_CANVAS) {
                     int pos = old + t;
-                    start = pos >= 1024 ? pos - 1024 + 1 : 0;
-                    if (end > pos + 1024)
-                        end = pos + 1024;
+                    start = pos >= DG_LOCAL_WINDOW ? pos - DG_LOCAL_WINDOW + 1 : 0;
+                    if (end > pos + DG_LOCAL_WINDOW)
+                        end = pos + DG_LOCAL_WINDOW;
                 } else
-                    start = end > 1024 ? end - 1024 : 0;
+                    start = end > DG_LOCAL_WINDOW ? end - DG_LOCAL_WINDOW : 0;
             }
             float *ts = score + (size_t)ti * (maxold + seq), mx = -FLT_MAX;
             const float *qq = q + (size_t)ti * qn + (size_t)h * hd;
@@ -2133,12 +2065,14 @@ static void dg_attention_multi(DGModel *m, int l, float *x, int segments, int se
     JB_TO(attention_output, output_start);
     if (out)
         for (int s = 0; s < segments; s++) {
-            int old = cache[s]->n, keep = lens[s];
+            int old = cache ? cache[s]->n : 0, keep = lens[s];
             out[s].n = old + keep;
             out[s].k = xmalloc((size_t)(old + keep) * kn * 4);
             out[s].v = xmalloc((size_t)(old + keep) * kn * 4);
-            memcpy(out[s].k, cache[s]->k, (size_t)old * kn * 4);
-            memcpy(out[s].v, cache[s]->v, (size_t)old * kn * 4);
+            if (old) {
+                memcpy(out[s].k, cache[s]->k, (size_t)old * kn * 4);
+                memcpy(out[s].v, cache[s]->v, (size_t)old * kn * 4);
+            }
             memcpy(out[s].k + (size_t)old * kn, k + (size_t)s * seq * kn, (size_t)keep * kn * 4);
             memcpy(out[s].v + (size_t)old * kn, v + (size_t)s * seq * kn, (size_t)keep * kn * 4);
         }
@@ -2167,7 +2101,7 @@ static void dg_ff(DGModel *m, int l, float *x, int n) {
     float *z1 = xcalloc((size_t)n * DG_H, 4), *g = xmalloc((size_t)n * DG_DENSE * 4),
           *u = xmalloc((size_t)n * DG_DENSE * 4), *d = xmalloc((size_t)n * DG_H * 4),
           *z2 = xmalloc((size_t)n * DG_H * 4), *rin = xcalloc((size_t)n * DG_H, 4),
-          *route = xmalloc((size_t)n * 128 * 4);
+          *route = xmalloc((size_t)n * DG_EXPERTS * sizeof *route);
 #ifdef _OPENMP
     JB_OMP();
 #pragma omp parallel for schedule(static)
@@ -2197,8 +2131,8 @@ static void dg_ff(DGModel *m, int l, float *x, int n) {
         for (int i = 0; i < DG_H; i++)
             rin[(size_t)t * DG_H + i] *= dg_at(rs, i) / sqrtf(DG_H);
     }
-    dg_mm(rw, rin, route, n, 128, DG_H);
-    for (size_t i = 0; i < (size_t)n * 128; i++)
+    dg_mm(rw, rin, route, n, DG_EXPERTS, DG_H);
+    for (size_t i = 0; i < (size_t)n * DG_EXPERTS; i++)
         if (!jb_finitef(route[i]))
             die("non-finite DiffusionGemma router logits");
     int *top = xmalloc((size_t)n * DG_TOPK * sizeof *top);
@@ -2208,14 +2142,14 @@ static void dg_ff(DGModel *m, int l, float *x, int n) {
 #pragma omp parallel for schedule(static)
 #endif
     for (int t = 0; t < n; t++) {
-        float *rt = route + (size_t)t * 128;
+        float *rt = route + (size_t)t * DG_EXPERTS;
         int ix[DG_TOPK];
         float ev[DG_TOPK];
         for (int k = 0; k < DG_TOPK; k++) {
             ix[k] = k;
             ev[k] = -FLT_MAX;
         }
-        for (int e = 0; e < 128; e++)
+        for (int e = 0; e < DG_EXPERTS; e++)
             for (int k = 0; k < DG_TOPK; k++)
                 if (rt[e] > ev[k]) {
                     for (int q = DG_TOPK - 1; q > k; q--) {
@@ -2227,11 +2161,11 @@ static void dg_ff(DGModel *m, int l, float *x, int n) {
                     break;
                 }
         float mx = rt[0];
-        for (int e = 1; e < 128; e++)
+        for (int e = 1; e < DG_EXPERTS; e++)
             if (rt[e] > mx)
                 mx = rt[e];
         double all = 0, sel = 0;
-        for (int e = 0; e < 128; e++)
+        for (int e = 0; e < DG_EXPERTS; e++)
             all += exp((double)rt[e] - mx);
         for (int k = 0; k < DG_TOPK; k++) {
             ev[k] = (float)(exp((double)ev[k] - mx) / all);
@@ -2245,7 +2179,8 @@ static void dg_ff(DGModel *m, int l, float *x, int n) {
     JB_TO(router, router_start);
     JB_TICK(expert_start);
     float *contrib = xcalloc((size_t)n * DG_TOPK * DG_H, 4),
-          *gather = xmalloc((size_t)n * DG_H * 4), *gu = xmalloc((size_t)n * 1408 * 4),
+          *gather = xmalloc((size_t)n * DG_H * 4),
+          *gu = xmalloc((size_t)n * DG_EXPERT_PAIR * sizeof *gu),
           *hid = xmalloc((size_t)n * DG_MOE * 4), *eo = xmalloc((size_t)n * DG_H * 4),
           *qz2 = m->nvfp4 ? xmalloc((size_t)n * DG_H * 4) : NULL;
     int *owner = xmalloc((size_t)n * 2 * sizeof *owner);
@@ -2254,7 +2189,7 @@ static void dg_ff(DGModel *m, int l, float *x, int n) {
         dg_nvfp4_qdq(qz2, z2, n, DG_H, m->nv_a13[l]);
         JB_TO(moe_input_qdq, input_qdq_start);
     }
-    for (int e = 0; e < 128; e++) {
+    for (int e = 0; e < DG_EXPERTS; e++) {
         int ne = 0;
         for (int t = 0; t < n; t++)
             for (int k = 0; k < DG_TOPK; k++)
@@ -2268,7 +2203,7 @@ static void dg_ff(DGModel *m, int l, float *x, int n) {
         if (!ne)
             continue;
         if (m->nvfp4) {
-            DGNvExpert *v = &m->nvexpert[l * 128 + e];
+            DGNvExpert *v = &m->nvexpert[l * DG_EXPERTS + e];
             float *qh = xmalloc((size_t)ne * DG_MOE * 4);
             JB_TICK(gate_start);
             dg_nvfp4_mm(v->wg, v->sg, v->gg, gather, gu, ne, DG_MOE, DG_H);
@@ -2292,13 +2227,13 @@ static void dg_ff(DGModel *m, int l, float *x, int n) {
             JB_TO(moe_down, down_start);
             free(qh);
         } else {
-            const uint8_t *gp = eg->data + (uint64_t)e * 1408 * DG_H * 2,
+            const uint8_t *gp = eg->data + (uint64_t)e * DG_EXPERT_PAIR * DG_H * 2,
                           *dp = ed->data + (uint64_t)e * DG_H * DG_MOE * 2;
-            dg_mm_data(gp, gather, gu, ne, 1408, DG_H);
+            dg_mm_data(gp, gather, gu, ne, DG_EXPERT_PAIR, DG_H);
             for (int q = 0; q < ne; q++)
                 for (int i = 0; i < DG_MOE; i++)
-                    hid[(size_t)q * DG_MOE + i] =
-                        dg_gelu(gu[(size_t)q * 1408 + i]) * gu[(size_t)q * 1408 + DG_MOE + i];
+                    hid[(size_t)q * DG_MOE + i] = dg_gelu(gu[(size_t)q * DG_EXPERT_PAIR + i]) *
+                                                  gu[(size_t)q * DG_EXPERT_PAIR + DG_MOE + i];
             dg_mm_data(dp, hid, eo, ne, DG_H, DG_MOE);
         }
         for (int q = 0; q < ne; q++) {
@@ -2397,7 +2332,7 @@ static void dg_layer_multi(DGModel *m, int l, float *x, int segments, int seq,
     for (int t = 0; t < n; t++)
         dg_rms(z + (size_t)t * DG_H, x + (size_t)t * DG_H, in, DG_H);
     JB_TICK(attention_start);
-    dg_attention_multi(m, l, z, segments, seq, cache, lens, out, mode);
+    dg_attention_segments(m, l, z, segments, seq, 0, cache, lens, out, mode);
     JB_TO(attention, attention_start);
 #ifdef _OPENMP
     JB_OMP();
@@ -2986,10 +2921,10 @@ static void dg_choice_candidate(int ci, char label[3]) {
     }
 }
 
-static int dg_choice_inventory(DGTokenizer *tok, char *out[128]) {
+static int dg_choice_inventory(DGTokenizer *tok, char *out[DG_CHOICE_LABELS]) {
     Tokens base = dgt_tokenize(tok, "q1: A");
-    int seen[128], n = 0;
-    for (int ci = 0; ci < 728 && n < 128; ci++) {
+    int seen[DG_CHOICE_LABELS], n = 0;
+    for (int ci = 0; ci < 728 && n < DG_CHOICE_LABELS; ci++) {
         char label[3], text[16];
         dg_choice_candidate(ci, label);
         snprintf(text, sizeof text, "q1: %s", label);
@@ -3234,8 +3169,8 @@ static DecisionWork *dg_questions(const DGRequest *r, char **choice_label, int *
     const char *qj = r->qj;
     JTok *qt = r->qt;
     int qnt = r->qnt;
-    int keys[1024], nq = direct_keys(qt, qnt, r->qroot, keys, 1024);
-    if (nq < 1 || nq > 1024)
+    int keys[DG_MAX_QUESTIONS], nq = direct_keys(qt, qnt, r->qroot, keys, DG_MAX_QUESTIONS);
+    if (nq < 1 || nq > DG_MAX_QUESTIONS)
         die("questions must contain 1..1024 entries");
     DecisionWork *w = xcalloc((size_t)nq, sizeof *w);
     for (int x = 0; x < nq; x++) {
@@ -3262,7 +3197,7 @@ static DecisionWork *dg_questions(const DGRequest *r, char **choice_label, int *
                 die("score needs criteria array");
             for (int z = d->criteria + 1; z < qnt; z++)
                 if (qt[z].parent == d->criteria) {
-                    if (d->nc >= 10)
+                    if (d->nc >= DG_MAX_SCORE)
                         die("decision candidate count out of range");
                     char b[16];
                     snprintf(b, sizeof b, "%d", d->nc);
@@ -3270,7 +3205,8 @@ static DecisionWork *dg_questions(const DGRequest *r, char **choice_label, int *
                 }
         } else
             die("unknown question type");
-        if (d->nc < 2 || d->nc > 128 || (!strcmp(d->kind, "score") && d->nc > 10))
+        if (d->nc < 2 || d->nc > DG_CHOICE_LABELS ||
+            (!strcmp(d->kind, "score") && d->nc > DG_MAX_SCORE))
             die("decision candidate count out of range");
         d->label = xcalloc((size_t)d->nc, sizeof *d->label);
         for (int i = 0; i < d->nc; i++)
@@ -3330,9 +3266,9 @@ static void dg_job_prepare(DGJob *g, DGTokenizer *tok, const char *j, size_t len
     dg_request_parse(&g->rq, j, len);
     g->requested = g->rq.requested;
     g->seed = dg_request_seed(&g->rq);
-    char *choice[128];
+    char *choice[DG_CHOICE_LABELS];
     int nc = dg_choice_inventory(tok, choice);
-    if (nc != 128)
+    if (nc != DG_CHOICE_LABELS)
         die("cannot construct OpenJev choice labels");
     g->w = dg_questions(&g->rq, choice, &g->nq);
     for (int i = 0; i < nc; i++)
@@ -3349,7 +3285,7 @@ static void dg_job_prepare(DGJob *g, DGTokenizer *tok, const char *j, size_t len
     if (g->pt.n > JB_MAX_CTX)
         die("prompt exceeds DiffusionGemma context");
     int *zero = xcalloc((size_t)g->nq, sizeof *zero);
-    g->group_cap = g->nq <= 16 ? g->nq : 8;
+    g->group_cap = g->nq <= DG_CANVAS_ALIGN ? g->nq : DG_CANVAS_GROUP;
     g->groups = (g->nq + g->group_cap - 1) / g->group_cap;
     g->cv = xcalloc((size_t)g->groups, sizeof *g->cv);
     g->slot = xmalloc((size_t)g->nq * sizeof *g->slot);
@@ -3361,9 +3297,9 @@ static void dg_job_prepare(DGJob *g, DGTokenizer *tok, const char *j, size_t len
         char *text = dg_answer_template_range(g->w, g->nq, c->start, c->count, zero);
         c->base = dgt_tokenize(tok, text);
         free(text);
-        if (c->base.n + 1 > 64)
+        if (c->base.n + 1 > DG_CANVAS_TOKENS)
             die("OpenJev answer template exceeds 64-token canvas");
-        int cw = (int)(((c->base.n + 1 + 15) / 16) * 16);
+        int cw = (int)(((c->base.n + 1 + DG_CANVAS_ALIGN - 1) / DG_CANVAS_ALIGN) * DG_CANVAS_ALIGN);
         if (cw > g->width)
             g->width = cw;
         for (int x = c->start; x < c->start + c->count; x++) {
@@ -3426,126 +3362,97 @@ static void dg_job_free(DGJob *g) {
     memset(g, 0, sizeof *g);
 }
 
+static void dg_job_score(DGTensor *emb, DGJob *g, const float *h, int segment0, int read) {
+    uint64_t start = now_ns();
+    double entropy = 0;
+    double **score = xmalloc((size_t)g->nq * sizeof *score);
+    for (int x = 0; x < g->nq; x++)
+        score[x] = xmalloc((size_t)g->w[x].nc * sizeof **score);
+    if (!g->requested && read == 0) {
+        float *answer_h = xmalloc((size_t)g->nq * DG_H * sizeof *answer_h);
+        int *label_n = xmalloc((size_t)g->nq * sizeof *label_n);
+        for (int x = 0; x < g->nq; x++) {
+            memcpy(answer_h + (size_t)x * DG_H,
+                   h + ((size_t)(segment0 + x / g->group_cap) * g->width + g->slot[x]) * DG_H,
+                   DG_H * sizeof *answer_h);
+            label_n[x] = g->w[x].nc;
+        }
+        entropy = dg_slot_logits_entropy(emb, answer_h, g->nq, g->ids, label_n, score);
+        free(label_n);
+        free(answer_h);
+    } else
+        for (int x = 0; x < g->nq; x++)
+            for (int c = 0; c < g->w[x].nc; c++) {
+                float z;
+                dg_mv_slice(emb, (uint64_t)g->ids[x][c] * DG_H,
+                            h + ((size_t)(segment0 + x / g->group_cap) * g->width + g->slot[x]) *
+                                    DG_H,
+                            &z, 1, DG_H);
+                score[x][c] = 30 * tanh(z / 30);
+            }
+    for (int x = 0; x < g->nq; x++) {
+        double *prob = xmalloc((size_t)g->w[x].nc * sizeof *prob);
+        normalize_scores(score[x], g->w[x].nc, prob);
+        for (int c = 0; c < g->w[x].nc; c++)
+            g->w[x].prob[c] += prob[c];
+        free(prob);
+        free(score[x]);
+    }
+    free(score);
+    g->candidate_ns += now_ns() - start;
+    g->reads++;
+    if (!g->requested && read == 0 && !(entropy > .1))
+        g->active = 0;
+}
+
+static void dg_job_normalize(DGJob *g) {
+    for (int x = 0; x < g->nq; x++)
+        for (int c = 0; c < g->w[x].nc; c++)
+            g->w[x].prob[c] /= g->reads;
+}
+
 static int dg_systemone(DGModel *m, DGTokenizer *tok, const char *j, size_t len,
                         const char *line_id, DGPrefixCache *prefix_cache) {
 #ifdef JB_PROFILE
     memset(&jb_profile, 0, sizeof jb_profile);
 #endif
-    DGRequest rq;
-    dg_request_parse(&rq, j, len);
-    const char *qj = rq.qj;
-    JTok *qt = rq.qt;
-    int qnt = rq.qnt, requested = rq.requested;
-    uint32_t seed0 = dg_request_seed(&rq);
-    char *choice_label[128];
-    int nchoice = dg_choice_inventory(tok, choice_label);
-    if (nchoice != 128)
-        die("cannot construct OpenJev choice labels");
-    int nq;
-    DecisionWork *w = dg_questions(&rq, choice_label, &nq);
-    for (int i = 0; i < nchoice; i++)
-        free(choice_label[i]);
-    /* Request text is spliced into the chat template and tokenized as one
-     * string, so special-token spellings inside state, instructions, or
-     * criteria are encoded as control tokens. This mirrors OpenJev, whose
-     * rendered chat template is tokenized the same way, and is kept for
-     * parity: callers must not treat request text as a trust boundary. */
-    char *sys = dg_system_prompt(qj, qt, qnt, w, nq);
-    DGBuf pre = {0}, pb = {0};
-    db_fmt(&pre, "<bos><|turn>system\n%s<turn|>\n<|turn>user\n", sys);
-    db_fmt(&pb, "%s%s<turn|>\n<|turn>model\n", pre.p, rq.state);
-    char *prompt = pb.p;
-    /* A token covers at most maxlen bytes, so a longer prompt cannot fit the
-     * context; reject it before spending time on tokenization. */
-    if (strlen(prompt) > (size_t)JB_MAX_CTX * tok->maxlen)
-        die("prompt exceeds DiffusionGemma context");
-    Tokens pt = dgt_tokenize(tok, prompt);
-    if (pt.n > JB_MAX_CTX)
-        die("prompt exceeds DiffusionGemma context");
+    DGJob job;
+    dg_job_prepare(&job, tok, j, len);
+    DGRequest *rq = &job.rq;
+    DGTensor *emb = dg_tensor(m, "model.decoder.embed_tokens.weight");
 #ifdef JB_PROFILE
-    Tokens system_part = dgt_tokenize(tok, sys), state_part = dgt_tokenize(tok, rq.state);
-    jb_profile.prompt_tokens = pt.n;
+    Tokens system_part = dgt_tokenize(tok, job.sys), state_part = dgt_tokenize(tok, rq->state);
+    jb_profile.prompt_tokens = job.pt.n;
     jb_profile.system_tokens = system_part.n;
     jb_profile.state_tokens = state_part.n;
     free(system_part.v);
     free(state_part.v);
 #endif
-    int *zero = xcalloc((size_t)nq, sizeof *zero), group_cap = nq <= 16 ? nq : 8,
-        groups = (nq + group_cap - 1) / group_cap, width = 0;
-    DGCanvas *cv = xcalloc((size_t)groups, sizeof *cv);
-    int *slot = xmalloc((size_t)nq * sizeof *slot);
-    int **ids = xcalloc((size_t)nq, sizeof *ids);
-    for (int b = 0; b < groups; b++) {
-        DGCanvas *c = &cv[b];
-        c->start = b * group_cap;
-        c->count = nq - c->start < group_cap ? nq - c->start : group_cap;
-        char *text = dg_answer_template_range(w, nq, c->start, c->count, zero);
-        c->base = dgt_tokenize(tok, text);
-        free(text);
-        if (c->base.n + 1 > 64)
-            die("OpenJev answer template exceeds 64-token canvas");
-        int cw = (int)(((c->base.n + 1 + 15) / 16) * 16);
-        if (cw > width)
-            width = cw;
-        for (int x = c->start; x < c->start + c->count; x++) {
-            ids[x] = xmalloc((size_t)w[x].nc * sizeof **ids);
-            slot[x] = -1;
-            for (int q = 1; q < w[x].nc; q++) {
-                int old = zero[x];
-                zero[x] = q;
-                char *a = dg_answer_template_range(w, nq, c->start, c->count, zero);
-                Tokens v = dgt_tokenize(tok, a);
-                free(a);
-                zero[x] = old;
-                if (v.n != c->base.n)
-                    die("labels do not share one template slot");
-                int diff = -1;
-                for (uint32_t z = 0; z < v.n; z++)
-                    if (v.v[z] != c->base.v[z]) {
-                        if (diff >= 0)
-                            die("label changes more than one template token");
-                        diff = (int)z;
-                    }
-                if (diff < 0)
-                    die("duplicate label token");
-                if (slot[x] >= 0 && diff != slot[x])
-                    die("labels do not share one template slot");
-                slot[x] = diff;
-                ids[x][q] = v.v[diff];
-                free(v.v);
-            }
-            if (slot[x] < 0)
-                die("cannot resolve label slot");
-            ids[x][0] = c->base.v[slot[x]];
-        }
-    }
-    if ((uint64_t)width * groups > JB_MAX_CTX)
-        die("batched answer canvases exceed DiffusionGemma context");
-    int *canvas = xcalloc((size_t)width * groups, sizeof *canvas);
-    DGTensor *emb = dg_tensor(m, "model.decoder.embed_tokens.weight");
-    uint64_t start = now_ns(), candidate_ns = 0;
+    uint64_t start = now_ns();
     DGKV kv[DG_L] = {0};
     const char *cache_state = "off";
-    int cache_tokens = 0, processed_tokens = (int)pt.n;
+    int cache_tokens = 0, processed_tokens = (int)job.pt.n;
     if (prefix_cache) {
-        Tokens prefix = dgt_tokenize(tok, pre.p);
-        uint32_t common = 0, lim = prefix.n < pt.n ? prefix.n : pt.n;
-        while (common < lim && prefix.v[common] == pt.v[common])
+        Tokens prefix = dgt_tokenize(tok, job.pre);
+        uint32_t common = 0, lim = prefix.n < job.pt.n ? prefix.n : job.pt.n;
+        while (common < lim && prefix.v[common] == job.pt.v[common])
             common++;
-        int hit = prefix_cache->schema && !strcmp(prefix_cache->schema, sys) &&
-                  prefix_cache->n <= (int)pt.n &&
-                  !memcmp(prefix_cache->ids, pt.v, (size_t)prefix_cache->n * sizeof *pt.v);
+        int hit = prefix_cache->schema && !strcmp(prefix_cache->schema, job.sys) &&
+                  prefix_cache->n <= (int)job.pt.n &&
+                  !memcmp(prefix_cache->ids, job.pt.v, (size_t)prefix_cache->n * sizeof *job.pt.v);
         if (!hit) {
-            if (!common || common >= pt.n)
+            if (!common || common >= job.pt.n)
                 die("cannot construct reusable schema prefix");
             dg_prefix_free(prefix_cache);
-            prefix_cache->schema = xstrdup(sys);
+            prefix_cache->schema = xstrdup(job.sys);
             prefix_cache->n = (int)common;
             prefix_cache->ids = xmalloc((size_t)common * sizeof *prefix_cache->ids);
-            memcpy(prefix_cache->ids, pt.v, (size_t)common * sizeof *prefix_cache->ids);
-            dg_prefill(m, pt.v, (int)pt.n, kv);
+            memcpy(prefix_cache->ids, job.pt.v, (size_t)common * sizeof *prefix_cache->ids);
+            dg_prefill(m, job.pt.v, (int)job.pt.n, kv);
             for (int l = 0; l < DG_L; l++) {
-                int full = l % 6 == 5, kn = (full ? 2 : 8) * (full ? 512 : 256);
+                int full = l % DG_FULL_EVERY == DG_FULL_EVERY - 1;
+                int kn = (full ? DG_FULL_KV_HEADS : DG_LOCAL_KV_HEADS) *
+                         (full ? DG_FULL_HEAD_DIM : DG_LOCAL_HEAD_DIM);
                 prefix_cache->kv[l].n = (int)common;
                 prefix_cache->kv[l].k = xmalloc((size_t)common * kn * 4);
                 prefix_cache->kv[l].v = xmalloc((size_t)common * kn * 4);
@@ -3555,92 +3462,52 @@ static int dg_systemone(DGModel *m, DGTokenizer *tok, const char *j, size_t len,
             cache_state = "miss";
         } else {
             cache_state = "hit";
-            processed_tokens = (int)pt.n - prefix_cache->n;
-            int suffix = (int)pt.n - prefix_cache->n;
+            processed_tokens = (int)job.pt.n - prefix_cache->n;
+            int suffix = (int)job.pt.n - prefix_cache->n;
             if (suffix <= 0)
                 die("schema prefix consumes complete prompt");
-            dg_prefill_suffix(m, pt.v + prefix_cache->n, suffix, prefix_cache->kv, kv);
+            dg_prefill_suffix(m, job.pt.v + prefix_cache->n, suffix, prefix_cache->kv, kv);
         }
         cache_tokens = prefix_cache->n;
         free(prefix.v);
     } else
-        dg_prefill(m, pt.v, (int)pt.n, kv);
+        dg_prefill(m, job.pt.v, (int)job.pt.n, kv);
     uint64_t prefill_ns = now_ns() - start;
-    for (int x = 0; x < nq; x++)
-        memset(w[x].prob, 0, (size_t)w[x].nc * sizeof *w[x].prob);
-    int reads = 0, max_reads = requested ? requested : 4, auto_all = 0;
-    for (int r = 0; r < max_reads; r++) {
-        memset(canvas, 0, (size_t)width * groups * sizeof *canvas);
-        for (int b = 0; b < groups; b++) {
-            memcpy(canvas + (size_t)b * width, cv[b].base.v, (size_t)cv[b].base.n * sizeof *canvas);
-            canvas[(size_t)b * width + cv[b].base.n] = 106;
+    for (int r = 0; r < job.max_reads; r++) {
+        memset(job.canvas, 0, (size_t)job.width * job.groups * sizeof *job.canvas);
+        for (int b = 0; b < job.groups; b++) {
+            memcpy(job.canvas + (size_t)b * job.width, job.cv[b].base.v,
+                   (size_t)job.cv[b].base.n * sizeof *job.canvas);
+            job.canvas[(size_t)b * job.width + job.cv[b].base.n] = DG_CANVAS_MASK_TOKEN;
         }
         DGMT rng;
-        dg_mt_seed(&rng, seed0 + (uint32_t)r * 7919u);
-        for (int x = 0; x < nq; x++)
-            canvas[(size_t)(x / group_cap) * width + slot[x]] = (int)dg_mt_vocab(&rng);
+        dg_mt_seed(&rng, job.seed + (uint32_t)r * 7919u);
+        for (int x = 0; x < job.nq; x++)
+            job.canvas[(size_t)(x / job.group_cap) * job.width + job.slot[x]] =
+                (int)dg_mt_vocab(&rng);
 #ifdef JB_CANVAS_SEQUENTIAL
-        float *h = xmalloc((size_t)groups * width * DG_H * sizeof *h);
-        for (int b = 0; b < groups; b++) {
-            float *one = dg_decode(m, kv, (int)pt.n, canvas + (size_t)b * width, width, 1);
-            memcpy(h + (size_t)b * width * DG_H, one, (size_t)width * DG_H * sizeof *h);
+        float *h = xmalloc((size_t)job.groups * job.width * DG_H * sizeof *h);
+        for (int b = 0; b < job.groups; b++) {
+            float *one =
+                dg_decode(m, kv, (int)job.pt.n, job.canvas + (size_t)b * job.width, job.width, 1);
+            memcpy(h + (size_t)b * job.width * DG_H, one, (size_t)job.width * DG_H * sizeof *h);
             free(one);
         }
 #else
-        float *h = dg_decode(m, kv, (int)pt.n, canvas, width, groups);
+        float *h = dg_decode(m, kv, (int)job.pt.n, job.canvas, job.width, job.groups);
 #endif
-        uint64_t cs = now_ns();
-        double max_entropy = 0;
-        double **sc = xmalloc((size_t)nq * sizeof *sc);
-        for (int x = 0; x < nq; x++)
-            sc[x] = xmalloc((size_t)w[x].nc * sizeof **sc);
-        if (!requested && r == 0) {
-            float *answer_h = xmalloc((size_t)nq * DG_H * sizeof *answer_h);
-            int *label_n = xmalloc((size_t)nq * sizeof *label_n);
-            for (int x = 0; x < nq; x++) {
-                memcpy(answer_h + (size_t)x * DG_H,
-                       h + ((size_t)(x / group_cap) * width + slot[x]) * DG_H,
-                       DG_H * sizeof *answer_h);
-                label_n[x] = w[x].nc;
-            }
-            max_entropy = dg_slot_logits_entropy(emb, answer_h, nq, ids, label_n, sc);
-            free(label_n);
-            free(answer_h);
-        } else
-            for (int x = 0; x < nq; x++)
-                for (int c = 0; c < w[x].nc; c++) {
-                    float z;
-                    dg_mv_slice(emb, (uint64_t)ids[x][c] * DG_H,
-                                h + ((size_t)(x / group_cap) * width + slot[x]) * DG_H, &z, 1,
-                                DG_H);
-                    sc[x][c] = 30 * tanh(z / 30);
-                }
-        for (int x = 0; x < nq; x++) {
-            double *pr = xmalloc((size_t)w[x].nc * sizeof *pr);
-            normalize_scores(sc[x], w[x].nc, pr);
-            for (int c = 0; c < w[x].nc; c++)
-                w[x].prob[c] += pr[c];
-            free(pr);
-            free(sc[x]);
-        }
-        free(sc);
-        candidate_ns += now_ns() - cs;
+        dg_job_score(emb, &job, h, 0, r);
         free(h);
-        reads++;
-        if (!requested && r == 0) {
-            auto_all = max_entropy > .1;
-            if (!auto_all)
-                break;
-        }
+        if (!job.active)
+            break;
     }
     dg_free_kv(kv);
-    for (int x = 0; x < nq; x++)
-        for (int c = 0; c < w[x].nc; c++)
-            w[x].prob[c] /= reads;
-    double cand_ms = candidate_ns / 1e6, ms = (now_ns() - start) / 1e6;
-    uint32_t billed = pt.n * (requested ? reads : 1);
-    dg_print_answers(qj, qt, qnt, w, nq, line_id ? line_id : rq.reqid, billed, ms, prefill_ns / 1e6,
-                     cand_ms, reads, groups, cache_state, cache_tokens, processed_tokens, 1);
+    dg_job_normalize(&job);
+    double cand_ms = job.candidate_ns / 1e6, ms = (now_ns() - start) / 1e6;
+    uint32_t billed = job.pt.n * (job.requested ? job.reads : 1);
+    dg_print_answers(rq->qj, rq->qt, rq->qnt, job.w, job.nq, line_id ? line_id : rq->reqid, billed,
+                     ms, prefill_ns / 1e6, cand_ms, job.reads, job.groups, cache_state,
+                     cache_tokens, processed_tokens, 1);
 #ifdef JB_PROFILE
     uint64_t detailed = jb_profile.moe_input_qdq + jb_profile.moe_gate + jb_profile.moe_up +
                         jb_profile.moe_activation + jb_profile.moe_hidden_qdq + jb_profile.moe_down;
@@ -3678,21 +3545,7 @@ static int dg_systemone(DGModel *m, DGTokenizer *tok, const char *j, size_t len,
         jb_profile.final_norm / 1e6, jb_profile.kv_free / 1e6, cand_ms, unaccounted, ms);
 #endif
     fflush(stdout);
-    for (int x = 0; x < nq; x++)
-        free(ids[x]);
-    for (int b = 0; b < groups; b++)
-        free(cv[b].base.v);
-    free(cv);
-    free(ids);
-    free(slot);
-    free(canvas);
-    free(pt.v);
-    free(zero);
-    free(prompt);
-    free(pre.p);
-    free(sys);
-    dg_questions_free(w, nq);
-    dg_request_free(&rq);
+    dg_job_free(&job);
     return 0;
 }
 
@@ -3764,7 +3617,7 @@ static int dg_system_batch(DGModel *m, DGTokenizer *tok, char **row, size_t *len
             for (int q = 0; q < g[b].groups; q++) {
                 memcpy(g[b].canvas + (size_t)q * width, g[b].cv[q].base.v,
                        (size_t)g[b].cv[q].base.n * sizeof *g[b].canvas);
-                g[b].canvas[(size_t)q * width + g[b].cv[q].base.n] = 106;
+                g[b].canvas[(size_t)q * width + g[b].cv[q].base.n] = DG_CANVAS_MASK_TOKEN;
             }
             DGMT rng;
             dg_mt_seed(&rng, g[b].seed + (uint32_t)r * 7919u);
@@ -3782,48 +3635,7 @@ static int dg_system_batch(DGModel *m, DGTokenizer *tok, char **row, size_t *len
         free(doc);
         for (int b = 0; b < batch; b++)
             if (base[b] >= 0) {
-                uint64_t cs = now_ns();
-                double entropy = 0;
-                double **sc = xmalloc((size_t)g[b].nq * sizeof *sc);
-                for (int x = 0; x < g[b].nq; x++)
-                    sc[x] = xmalloc((size_t)g[b].w[x].nc * sizeof **sc);
-                if (!g[b].requested && r == 0) {
-                    float *ah = xmalloc((size_t)g[b].nq * DG_H * sizeof *ah);
-                    int *ln = xmalloc((size_t)g[b].nq * sizeof *ln);
-                    for (int x = 0; x < g[b].nq; x++) {
-                        memcpy(ah + (size_t)x * DG_H,
-                               h + ((size_t)(base[b] + x / g[b].group_cap) * width + g[b].slot[x]) *
-                                       DG_H,
-                               DG_H * sizeof *ah);
-                        ln[x] = g[b].w[x].nc;
-                    }
-                    entropy = dg_slot_logits_entropy(emb, ah, g[b].nq, g[b].ids, ln, sc);
-                    free(ln);
-                    free(ah);
-                } else
-                    for (int x = 0; x < g[b].nq; x++)
-                        for (int c = 0; c < g[b].w[x].nc; c++) {
-                            float z;
-                            dg_mv_slice(emb, (uint64_t)g[b].ids[x][c] * DG_H,
-                                        h + ((size_t)(base[b] + x / g[b].group_cap) * width +
-                                             g[b].slot[x]) *
-                                                DG_H,
-                                        &z, 1, DG_H);
-                            sc[x][c] = 30 * tanh(z / 30);
-                        }
-                for (int x = 0; x < g[b].nq; x++) {
-                    double *pr = xmalloc((size_t)g[b].w[x].nc * sizeof *pr);
-                    normalize_scores(sc[x], g[b].w[x].nc, pr);
-                    for (int c = 0; c < g[b].w[x].nc; c++)
-                        g[b].w[x].prob[c] += pr[c];
-                    free(pr);
-                    free(sc[x]);
-                }
-                free(sc);
-                g[b].candidate_ns += now_ns() - cs;
-                g[b].reads++;
-                if (!g[b].requested && r == 0 && !((entropy > .1)))
-                    g[b].active = 0;
+                dg_job_score(emb, &g[b], h, base[b], r);
             }
         free(base);
         free(h);
@@ -3831,9 +3643,7 @@ static int dg_system_batch(DGModel *m, DGTokenizer *tok, char **row, size_t *len
     uint64_t total_ns = now_ns() - start;
     for (int b = 0; b < batch; b++) {
         dg_free_kv(kv + (size_t)b * DG_L);
-        for (int x = 0; x < g[b].nq; x++)
-            for (int c = 0; c < g[b].w[x].nc; c++)
-                g[b].w[x].prob[c] /= g[b].reads;
+        dg_job_normalize(&g[b]);
         uint32_t billed = g[b].pt.n * (g[b].requested ? g[b].reads : 1);
         dg_print_answers(g[b].rq.qj, g[b].rq.qt, g[b].rq.qnt, g[b].w, g[b].nq, g[b].rq.reqid,
                          billed, total_ns / 1e6, prefill_ns / 1e6, g[b].candidate_ns / 1e6,
@@ -3962,15 +3772,15 @@ static int dg_check_request(const char *path) {
     DGRequest rq;
     dg_request_parse(&rq, j, n);
     (void)dg_request_seed(&rq);
-    char *labels[128];
-    for (int i = 0; i < 128; i++) {
+    char *labels[DG_CHOICE_LABELS];
+    for (int i = 0; i < DG_CHOICE_LABELS; i++) {
         char l[3];
         dg_choice_candidate(i, l);
         labels[i] = xstrdup(l);
     }
     int nq;
     DecisionWork *w = dg_questions(&rq, labels, &nq);
-    for (int i = 0; i < 128; i++)
+    for (int i = 0; i < DG_CHOICE_LABELS; i++)
         free(labels[i]);
     char *sys = dg_system_prompt(rq.qj, rq.qt, rq.qnt, w, nq);
     int *zero = xcalloc((size_t)nq, sizeof *zero);
@@ -4253,7 +4063,7 @@ static int bench_kernels(void) {
     /* All 128 experts of one gate projection, so weights stream from memory
      * as in the model rather than staying cache-resident. */
     static const int nv_tokens[] = {1, 4, 16, 64};
-    int experts = 128, nr = DG_MOE, nc = DG_H;
+    int experts = DG_EXPERTS, nr = DG_MOE, nc = DG_H;
     size_t wbytes = (size_t)nr * nc / 2, sbytes = (size_t)nr * nc / 16;
     uint8_t *wd = xmalloc(wbytes * experts), *sd = xmalloc(sbytes * experts);
     float *xr = xmalloc((size_t)64 * nc * 4), *xs = xmalloc((size_t)64 * nc * 4),
