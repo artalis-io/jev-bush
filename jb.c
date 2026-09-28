@@ -9,12 +9,15 @@
 #include <ctype.h>
 #include <float.h>
 #include <math.h>
+#include <setjmp.h>
 #include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+
+#include "jb.h"
 
 #if defined(__AVX512F__) && defined(__AVX512DQ__)
 #define JB_AVX512 1
@@ -82,10 +85,11 @@ typedef struct {
     uint64_t moe_input_qdq, moe_gate, moe_up, moe_activation;
     uint64_t moe_hidden_qdq, moe_down;
     uint64_t prompt_tokens, system_tokens, state_tokens;
-    uint64_t omp_regions, alloc_calls, alloc_ns;
+    uint64_t omp_regions, alloc_calls, hot_alloc_calls, alloc_ns;
 } JBProfile;
 
 static JBProfile jb_profile;
+static int jb_profile_hot;
 #define JB_TICK(name) uint64_t name = now_ns()
 #define JB_TO(field, name) (jb_profile.field += now_ns() - (name))
 #define JB_OMP() (jb_profile.omp_regions++)
@@ -119,22 +123,47 @@ typedef struct {
     uint32_t n, cap;
 } Tokens;
 
+typedef struct {
+    void *allocation;
+    unsigned char *base;
+    size_t size, used, peak;
+} JBArena;
+
 static uint64_t now_ns(void);
 
+typedef struct JBErrorFrame {
+    jmp_buf jump;
+    struct JBErrorFrame *previous;
+    jb_status status;
+} JBErrorFrame;
+
+static _Thread_local JBErrorFrame *jb_error_frame;
+static _Thread_local char jb_error_message[256];
+
 static void die(const char *s) {
+    if (jb_error_frame) {
+        snprintf(jb_error_message, sizeof jb_error_message, "%s", s);
+        longjmp(jb_error_frame->jump, 1);
+    }
     fprintf(stderr, "jb: %s\n", s);
     exit(2);
 }
 
 static void die2(const char *a, const char *b) {
+    if (jb_error_frame) {
+        snprintf(jb_error_message, sizeof jb_error_message, "%s: %s", a, b);
+        longjmp(jb_error_frame->jump, 1);
+    }
     fprintf(stderr, "jb: %s: %s\n", a, b);
     exit(2);
 }
 
+#ifndef JB_NO_MAIN
 static void flush_output(void) {
     if (fflush(stdout) == EOF || ferror(stdout))
         die("cannot write output");
 }
+#endif
 
 static void *xmalloc(size_t n) {
 #ifdef JB_PROFILE
@@ -144,9 +173,13 @@ static void *xmalloc(size_t n) {
 #ifdef JB_PROFILE
     jb_profile.alloc_ns += now_ns() - start;
     jb_profile.alloc_calls++;
+    jb_profile.hot_alloc_calls += (uint64_t)jb_profile_hot;
 #endif
-    if (!p)
+    if (!p) {
+        if (jb_error_frame)
+            jb_error_frame->status = JB_ERROR_OUT_OF_MEMORY;
         die("out of memory");
+    }
     return p;
 }
 
@@ -158,9 +191,13 @@ static void *xcalloc(size_t n, size_t z) {
 #ifdef JB_PROFILE
     jb_profile.alloc_ns += now_ns() - start;
     jb_profile.alloc_calls++;
+    jb_profile.hot_alloc_calls += (uint64_t)jb_profile_hot;
 #endif
-    if (!p)
+    if (!p) {
+        if (jb_error_frame)
+            jb_error_frame->status = JB_ERROR_OUT_OF_MEMORY;
         die("out of memory");
+    }
     return p;
 }
 
@@ -179,11 +216,77 @@ static void *xrealloc(void *p, size_t n) {
 #ifdef JB_PROFILE
     jb_profile.alloc_ns += now_ns() - start;
     jb_profile.alloc_calls++;
+    jb_profile.hot_alloc_calls += (uint64_t)jb_profile_hot;
 #endif
-    if (!p)
+    if (!p) {
+        if (jb_error_frame)
+            jb_error_frame->status = JB_ERROR_OUT_OF_MEMORY;
         die("out of memory");
+    }
     return p;
 }
+
+static size_t jb_size_add(size_t a, size_t b) {
+    if (b > SIZE_MAX - a)
+        die("allocation size overflow");
+    return a + b;
+}
+
+static size_t jb_size_mul(size_t a, size_t b) {
+    if (a && b > SIZE_MAX / a)
+        die("allocation size overflow");
+    return a * b;
+}
+
+static size_t jb_align_up(size_t n, size_t alignment) {
+    if (!alignment || (alignment & (alignment - 1)))
+        die("invalid arena alignment");
+    return jb_size_add(n, alignment - 1) & ~(alignment - 1);
+}
+
+static void jb_arena_init(JBArena *a, size_t size) {
+    const size_t alignment = 64;
+    size_t allocation_size = jb_size_add(size ? size : 1, alignment - 1);
+    a->allocation = xmalloc(allocation_size);
+    uintptr_t p = (uintptr_t)a->allocation;
+    a->base = (unsigned char *)((p + alignment - 1) & ~(uintptr_t)(alignment - 1));
+    a->size = size;
+    a->used = 0;
+    a->peak = 0;
+}
+
+static void *jb_arena_alloc(JBArena *a, size_t count, size_t element_size, int clear) {
+    const size_t alignment = 64;
+    size_t start = jb_align_up(a->used, alignment);
+    size_t bytes = jb_size_mul(count, element_size);
+    size_t end = jb_size_add(start, bytes);
+    if (end > a->size)
+        die("inference workspace plan is too small");
+    void *p = a->base + start;
+    a->used = end;
+    if (end > a->peak)
+        a->peak = end;
+    if (clear)
+        memset(p, 0, bytes);
+    return p;
+}
+
+static size_t jb_arena_mark(const JBArena *a) {
+    return a->used;
+}
+
+static void jb_arena_reset(JBArena *a, size_t mark) {
+    if (mark > a->used)
+        die("invalid arena reset");
+    a->used = mark;
+}
+
+static void jb_arena_free(JBArena *a) {
+    free(a->allocation);
+    memset(a, 0, sizeof *a);
+}
+
+static void jb_workspace_plan(size_t *used, size_t count, size_t element_size);
 
 /* Bit-level finiteness tests: -ffast-math lets the compiler assume NaN and
  * infinity never occur, which can fold isfinite() and NaN comparisons away. */
@@ -1070,7 +1173,19 @@ static void dgt_bpe_push(DGTokenizer *d, DGBpeCand *heap, size_t *nh, const uint
 }
 
 static void dgt_piece(DGTokenizer *d, const char *s, size_t n, Tokens *out) {
-    uint32_t *ids = xmalloc((n ? n : 1) * sizeof *ids);
+    size_t slots = n ? n : 1, bytes = 0;
+    jb_workspace_plan(&bytes, slots, sizeof(uint32_t));
+    jb_workspace_plan(&bytes, slots, sizeof(uint32_t));
+    jb_workspace_plan(&bytes, slots, sizeof(uint32_t));
+    jb_workspace_plan(&bytes, jb_size_mul(slots, 3), sizeof(DGBpeCand));
+    jb_workspace_plan(&bytes, jb_size_mul((size_t)d->maxlen, 2), sizeof(char));
+    JBArena scratch;
+    jb_arena_init(&scratch, bytes);
+    uint32_t *ids = jb_arena_alloc(&scratch, slots, sizeof *ids, 0);
+    uint32_t *next = jb_arena_alloc(&scratch, slots, sizeof *next, 0);
+    uint32_t *prev = jb_arena_alloc(&scratch, slots, sizeof *prev, 0);
+    DGBpeCand *heap = jb_arena_alloc(&scratch, jb_size_mul(slots, 3), sizeof *heap, 0);
+    char *joined = jb_arena_alloc(&scratch, jb_size_mul((size_t)d->maxlen, 2), sizeof *joined, 0);
     uint32_t k = 0;
     for (size_t p = 0; p < n;) {
         size_t q = p;
@@ -1094,13 +1209,10 @@ static void dgt_piece(DGTokenizer *d, const char *s, size_t n, Tokens *out) {
     /* Repeatedly merge the lowest-rank adjacent pair, leftmost first. A heap
      * ordered by (rank, original position) with lazy invalidation picks the
      * same pair as a full rescan, in O(k log k) instead of O(k^2). */
-    uint32_t *next = xmalloc((size_t)(k ? k : 1) * sizeof *next),
-             *prev = xmalloc((size_t)(k ? k : 1) * sizeof *prev);
     for (uint32_t i = 0; i < k; i++) {
         next[i] = i + 1 < k ? i + 1 : UINT32_MAX;
         prev[i] = i ? i - 1 : UINT32_MAX;
     }
-    DGBpeCand *heap = xmalloc((size_t)(k ? k : 1) * 3 * sizeof *heap);
     size_t nh = 0;
     for (uint32_t i = 0; i + 1 < k; i++)
         dgt_bpe_push(d, heap, &nh, ids, i, i + 1);
@@ -1124,11 +1236,12 @@ static void dgt_piece(DGTokenizer *d, const char *s, size_t n, Tokens *out) {
         if (ids[at] != c.a || bt == UINT32_MAX || ids[bt] != c.b)
             continue;
         Vocab *a = d->by_id[c.a], *b = d->by_id[c.b];
-        char *z = xmalloc((size_t)a->n + b->n);
-        memcpy(z, a->s, a->n);
-        memcpy(z + a->n, b->s, b->n);
-        Vocab *v = dgt_vfind(d, z, (size_t)a->n + b->n);
-        free(z);
+        size_t joined_n = jb_size_add((size_t)a->n, b->n);
+        if (joined_n > (size_t)d->maxlen * 2)
+            die("DiffusionGemma BPE merge exceeds tokenizer scratch");
+        memcpy(joined, a->s, a->n);
+        memcpy(joined + a->n, b->s, b->n);
+        Vocab *v = dgt_vfind(d, joined, joined_n);
         if (!v)
             die("DiffusionGemma merged token absent");
         ids[at] = (uint32_t)v->id;
@@ -1143,10 +1256,7 @@ static void dgt_piece(DGTokenizer *d, const char *s, size_t n, Tokens *out) {
     }
     for (uint32_t i = 0; i < k; i = next[i])
         push(out, (int)ids[i]);
-    free(heap);
-    free(prev);
-    free(next);
-    free(ids);
+    jb_arena_free(&scratch);
 }
 
 static Tokens dgt_tokenize(DGTokenizer *d, const char *s) {
@@ -1207,6 +1317,7 @@ typedef struct {
     char *schema;
     int *ids, n;
     DGKV kv[DG_L];
+    JBArena metadata, kv_storage;
 } DGPrefixCache;
 
 typedef struct {
@@ -1440,7 +1551,7 @@ static void dg_mv_slice(const DGTensor *w, uint64_t base, const float *x, float 
  * OpenJev's automatic reread test is entropy over the union of the
  * full-vocabulary top 20 and the explicitly requested label ids. */
 static double dg_slot_logits_entropy(const DGTensor *w, const float *hidden, int n, int **label_ids,
-                                     const int *label_n, double **label_score) {
+                                     const int *label_n, double **label_score, float *logits) {
     if (n < 1 || n > DG_CHOICE_LABELS)
         die("bad DiffusionGemma answer slot count");
     /* vLLM returns top-20 plus the sorted union of requested label ids at
@@ -1465,7 +1576,6 @@ static double dg_slot_logits_entropy(const DGTensor *w, const float *hidden, int
                 requested[at] = id;
             }
         }
-    float *logits = xmalloc((size_t)n * DG_VOCAB * sizeof *logits);
     dg_mm_data(w->data, hidden, logits, n, DG_VOCAB, DG_H);
     double max_entropy = 0;
     for (int t = 0; t < n; t++) {
@@ -1519,7 +1629,6 @@ static double dg_slot_logits_entropy(const DGTensor *w, const float *hidden, int
         if (entropy > max_entropy)
             max_entropy = entropy;
     }
-    free(logits);
     return max_entropy;
 }
 
@@ -1911,11 +2020,21 @@ static double dg_dot_avx512(const float *a, const float *b, int n) {
 
 static const DGKernelOps *dg_kernels(void) {
 #if defined(JB_AVX512)
+    (void)dg_nvfp4_qdq_ref;
+    (void)dg_nvfp4_mm_ref;
+    (void)dg_mm_data_ref;
+    (void)dg_rms_ref;
+    (void)dg_dot_ref;
     static const DGKernelOps selected = {"avx512",           dg_nvfp4_qdq_avx512, dg_nvfp4_swizzle,
                                          dg_nvfp4_mm_avx512, dg_mm_data_avx512,   dg_rms_avx512,
                                          dg_dot_avx512};
     return &selected;
 #elif defined(JB_AVX2)
+    (void)dg_nvfp4_qdq_ref;
+    (void)dg_nvfp4_mm_ref;
+    (void)dg_mm_data_ref;
+    (void)dg_rms_ref;
+    (void)dg_dot_ref;
     static const DGKernelOps selected = {"avx2",           dg_nvfp4_qdq_avx2, NULL,
                                          dg_nvfp4_mm_avx2, dg_mm_data_avx2,   dg_rms_avx2,
                                          dg_dot_avx2};
@@ -1952,34 +2071,257 @@ static void dg_norm_heads(float *x, int heads, int hd, DGTensor *scale) {
 
 enum { DG_CAUSAL, DG_CANVAS, DG_SUFFIX };
 
+static void jb_workspace_plan(size_t *used, size_t count, size_t element_size) {
+    *used = jb_align_up(*used, 64);
+    *used = jb_size_add(*used, jb_size_mul(count, element_size));
+}
+
+static size_t dg_attention_workspace_bytes(int n, int old, int seq, int segments,
+                                           int wrapper_arrays) {
+    size_t used = 0;
+    if (wrapper_arrays && segments > 1) {
+        jb_workspace_plan(&used, (size_t)segments, sizeof(DGKV *));
+        jb_workspace_plan(&used, (size_t)segments, sizeof(int));
+    }
+    /* Full attention has the largest Q/K/V projections in this model. */
+    int qn = DG_HEADS * DG_FULL_HEAD_DIM;
+    int kn = DG_FULL_KV_HEADS * DG_FULL_HEAD_DIM;
+    jb_workspace_plan(&used, (size_t)n * qn, sizeof(float));
+    jb_workspace_plan(&used, (size_t)n * kn, sizeof(float));
+    jb_workspace_plan(&used, (size_t)n * kn, sizeof(float));
+    jb_workspace_plan(&used, (size_t)n * qn, sizeof(float));
+    jb_workspace_plan(&used, (size_t)n * (old + seq), sizeof(float));
+    return used;
+}
+
+static size_t dg_ff_workspace_bytes(const DGModel *m, int n) {
+    size_t used = 0;
+#define DG_PLAN_FLOAT(count) jb_workspace_plan(&used, (size_t)(count), sizeof(float))
+#define DG_PLAN_INT(count) jb_workspace_plan(&used, (size_t)(count), sizeof(int))
+    DG_PLAN_FLOAT((size_t)n * DG_H);       /* z1 */
+    DG_PLAN_FLOAT((size_t)n * DG_DENSE);   /* gate */
+    DG_PLAN_FLOAT((size_t)n * DG_DENSE);   /* up */
+    DG_PLAN_FLOAT((size_t)n * DG_H);       /* dense output */
+    DG_PLAN_FLOAT((size_t)n * DG_H);       /* z2 */
+    DG_PLAN_FLOAT((size_t)n * DG_H);       /* router input */
+    DG_PLAN_FLOAT((size_t)n * DG_EXPERTS); /* router output */
+    DG_PLAN_INT((size_t)n * DG_TOPK);
+    DG_PLAN_FLOAT((size_t)n * DG_TOPK);
+    DG_PLAN_FLOAT((size_t)n * DG_TOPK * DG_H); /* expert contributions */
+    DG_PLAN_FLOAT((size_t)n * DG_H);           /* gathered inputs */
+    DG_PLAN_FLOAT((size_t)n * DG_EXPERT_PAIR); /* gate/up output */
+    DG_PLAN_FLOAT((size_t)n * DG_MOE);         /* hidden */
+    DG_PLAN_FLOAT((size_t)n * DG_H);           /* expert output */
+    if (m->nvfp4)
+        DG_PLAN_FLOAT((size_t)n * DG_H); /* quantized expert input */
+    DG_PLAN_INT((size_t)n * 2);          /* token/slot owner */
+    if (m->nvfp4)
+        DG_PLAN_FLOAT((size_t)n * DG_MOE); /* quantized hidden */
+    DG_PLAN_FLOAT(DG_H);                   /* MoE sum */
+    DG_PLAN_FLOAT(DG_H);                   /* FF sum */
+#undef DG_PLAN_INT
+#undef DG_PLAN_FLOAT
+    return used;
+}
+
+static size_t dg_workspace_bytes(const DGModel *m, int n, int old, int seq, int segments,
+                                 int wrapper_arrays) {
+    size_t persistent = 0;
+    jb_workspace_plan(&persistent, (size_t)n * DG_H, sizeof(float));
+    jb_workspace_plan(&persistent, (size_t)n * DG_H, sizeof(float));
+    size_t attention = dg_attention_workspace_bytes(n, old, seq, segments, wrapper_arrays);
+    size_t ff = dg_ff_workspace_bytes(m, n);
+    return jb_size_add(persistent, attention > ff ? attention : ff);
+}
+
+typedef struct {
+    JBArena arena;
+    JBArena kv_arena;
+    JBArena control_arena;
+    size_t capacity, kv_capacity, control_capacity;
+    int active, kv_active, control_active;
+} DGWorkspace;
+
+static JBArena *dg_workspace_begin(DGWorkspace *workspace, size_t required) {
+    if (workspace->active)
+        die("inference workspace is already active");
+    if (required > workspace->capacity) {
+        if (workspace->arena.allocation)
+            jb_arena_free(&workspace->arena);
+        jb_arena_init(&workspace->arena, required);
+        workspace->capacity = required;
+    } else {
+        workspace->arena.size = required;
+        workspace->arena.used = 0;
+        workspace->arena.peak = 0;
+    }
+    workspace->active = 1;
+    return &workspace->arena;
+}
+
+static void dg_workspace_end(DGWorkspace *workspace) {
+    if (!workspace->active || workspace->arena.used ||
+        workspace->arena.peak != workspace->arena.size)
+        die("inference workspace plan mismatch");
+    workspace->active = 0;
+}
+
+static void dg_workspace_destroy(DGWorkspace *workspace) {
+    if (workspace->active || workspace->kv_active || workspace->control_active)
+        die("destroying active inference workspace");
+    if (workspace->arena.allocation)
+        jb_arena_free(&workspace->arena);
+    if (workspace->kv_arena.allocation)
+        jb_arena_free(&workspace->kv_arena);
+    if (workspace->control_arena.allocation)
+        jb_arena_free(&workspace->control_arena);
+    memset(workspace, 0, sizeof *workspace);
+}
+
+static JBArena *dg_control_begin(DGWorkspace *workspace, size_t required) {
+    if (workspace->control_active)
+        die("worker control storage is already active");
+    if (required > workspace->control_capacity) {
+        if (workspace->control_arena.allocation)
+            jb_arena_free(&workspace->control_arena);
+        jb_arena_init(&workspace->control_arena, required);
+        workspace->control_capacity = required;
+    } else {
+        workspace->control_arena.size = required;
+        workspace->control_arena.used = 0;
+        workspace->control_arena.peak = 0;
+    }
+    workspace->control_active = 1;
+    return &workspace->control_arena;
+}
+
+static void dg_control_end(DGWorkspace *workspace) {
+    if (!workspace->control_active ||
+        workspace->control_arena.used != workspace->control_arena.size ||
+        workspace->control_arena.peak != workspace->control_arena.size)
+        die("corrupt worker control storage");
+    workspace->control_active = 0;
+}
+
+static size_t dg_forward_workspace_bytes(const DGModel *m, int n, int old, int seq, int segments,
+                                         int wrapper_arrays, size_t tail) {
+    size_t output = 0;
+    jb_workspace_plan(&output, (size_t)n * DG_H, sizeof(float));
+    size_t layers = dg_workspace_bytes(m, n, old, seq, segments, wrapper_arrays);
+    return jb_size_add(output, layers > tail ? layers : tail);
+}
+
+static int dg_kv_width(int layer) {
+    int full = layer % DG_FULL_EVERY == DG_FULL_EVERY - 1;
+    return (full ? DG_FULL_KV_HEADS : DG_LOCAL_KV_HEADS) *
+           (full ? DG_FULL_HEAD_DIM : DG_LOCAL_HEAD_DIM);
+}
+
+static size_t dg_kv_bytes(int documents, const int *lengths) {
+    if (documents < 1)
+        die("invalid K/V document count");
+    size_t bytes = 0;
+    for (int d = 0; d < documents; d++)
+        for (int l = 0; l < DG_L; l++) {
+            size_t count = jb_size_mul((size_t)lengths[d], (size_t)dg_kv_width(l));
+            jb_workspace_plan(&bytes, count, sizeof(float));
+            jb_workspace_plan(&bytes, count, sizeof(float));
+        }
+    return bytes;
+}
+
+static void dg_kv_bind(JBArena *storage, DGKV *kv, int documents, const int *lengths) {
+    for (int d = 0; d < documents; d++)
+        for (int l = 0; l < DG_L; l++) {
+            DGKV *one = &kv[(size_t)d * DG_L + l];
+            size_t count = jb_size_mul((size_t)lengths[d], (size_t)dg_kv_width(l));
+            one->n = lengths[d];
+            one->k = jb_arena_alloc(storage, count, sizeof *one->k, 0);
+            one->v = jb_arena_alloc(storage, count, sizeof *one->v, 0);
+        }
+    if (storage->peak != storage->size)
+        die("K/V storage plan mismatch");
+}
+
+/* Prefix K/V has its own immutable lifetime and therefore owns an exact slab. */
+static void dg_kv_init(JBArena *storage, DGKV *kv, int documents, const int *lengths) {
+    if (storage->allocation)
+        die("K/V storage initialized twice");
+    jb_arena_init(storage, dg_kv_bytes(documents, lengths));
+    dg_kv_bind(storage, kv, documents, lengths);
+}
+
+/* Per-request K/V reuses a grow-only worker slab across evaluation rows. */
+static void dg_worker_kv_begin(DGWorkspace *workspace, DGKV *kv, int documents,
+                               const int *lengths) {
+    if (workspace->kv_active)
+        die("worker K/V storage is already active");
+    size_t required = dg_kv_bytes(documents, lengths);
+    if (required > workspace->kv_capacity) {
+        if (workspace->kv_arena.allocation)
+            jb_arena_free(&workspace->kv_arena);
+        jb_arena_init(&workspace->kv_arena, required);
+        workspace->kv_capacity = required;
+    } else {
+        workspace->kv_arena.size = required;
+        workspace->kv_arena.used = 0;
+        workspace->kv_arena.peak = 0;
+    }
+    workspace->kv_active = 1;
+    dg_kv_bind(&workspace->kv_arena, kv, documents, lengths);
+}
+
+static void dg_worker_kv_end(DGWorkspace *workspace, DGKV *kv, int documents) {
+    JB_TICK(kv_free_start);
+    if (!workspace->kv_active || workspace->kv_arena.used != workspace->kv_arena.size ||
+        workspace->kv_arena.peak != workspace->kv_arena.size)
+        die("corrupt worker K/V ownership");
+    workspace->kv_active = 0;
+    memset(kv, 0, jb_size_mul(jb_size_mul((size_t)documents, DG_L), sizeof *kv));
+    JB_TO(kv_free, kv_free_start);
+}
+
+static void dg_kv_free(JBArena *storage, DGKV *kv, int documents) {
+    JB_TICK(kv_free_start);
+    if (!storage->allocation)
+        return;
+    if (storage->used != storage->size || storage->peak != storage->size)
+        die("corrupt K/V storage ownership");
+    jb_arena_free(storage);
+    memset(kv, 0, jb_size_mul(jb_size_mul((size_t)documents, DG_L), sizeof *kv));
+    JB_TO(kv_free, kv_free_start);
+}
+
 static void dg_attention_segments(DGModel *m, int l, float *x, int segments, int seq, int pos0,
-                                  const DGKV *const *cache, const int *lens, DGKV *out, int mode);
+                                  const DGKV *const *cache, const int *lens, DGKV *out, int mode,
+                                  JBArena *workspace);
 
 static void dg_attention(DGModel *m, int l, float *x, int n, int pos0, const DGKV *cache, DGKV *out,
-                         int mode, int batch) {
+                         int mode, int batch, JBArena *workspace) {
     if (batch <= 0 || n < 0 || n % batch || (out && batch != 1))
         die("invalid attention batch");
     const DGKV *one_cache;
     int one_len;
-    const DGKV **caches = batch == 1 ? &one_cache : xmalloc((size_t)batch * sizeof *caches);
-    int *lens = batch == 1 ? &one_len : xmalloc((size_t)batch * sizeof *lens);
+    size_t mark = jb_arena_mark(workspace);
+    const DGKV **caches =
+        batch == 1 ? &one_cache : jb_arena_alloc(workspace, (size_t)batch, sizeof *caches, 0);
+    int *lens = batch == 1 ? &one_len : jb_arena_alloc(workspace, (size_t)batch, sizeof *lens, 0);
     for (int b = 0; b < batch; b++) {
         caches[b] = mode != DG_CAUSAL ? cache : NULL;
         lens[b] = n / batch;
     }
     dg_attention_segments(m, l, x, batch, n / batch, pos0, caches[0] ? caches : NULL, lens, out,
-                          mode);
-    if (batch != 1) {
-        free(lens);
-        free(caches);
-    }
+                          mode, workspace);
+    jb_arena_reset(workspace, mark);
 }
 
 /* Execute independent equal-stride sequences through one set of projections.
  * Attention never crosses a segment boundary.  Suffix segments may have
  * different useful lengths; padding is computed but never copied into K/V. */
 static void dg_attention_segments(DGModel *m, int l, float *x, int segments, int seq, int pos0,
-                                  const DGKV *const *cache, const int *lens, DGKV *out, int mode) {
+                                  const DGKV *const *cache, const int *lens, DGKV *out, int mode,
+                                  JBArena *workspace) {
+    size_t mark = jb_arena_mark(workspace);
     int n = segments * seq;
     JB_TICK(qkv_start);
     int full = l % DG_FULL_EVERY == DG_FULL_EVERY - 1;
@@ -1991,8 +2333,9 @@ static void dg_attention_segments(DGModel *m, int l, float *x, int segments, int
     DGTensor *vw = full ? NULL : dg_layer_tensor(m, l, "self_attn.v_proj.weight");
     DGTensor *qnrm = dg_layer_tensor(m, l, "self_attn.q_norm.weight");
     DGTensor *knrm = dg_layer_tensor(m, l, "self_attn.k_norm.weight");
-    float *q = xmalloc((size_t)n * qn * 4), *k = xmalloc((size_t)n * kn * 4),
-          *v = xmalloc((size_t)n * kn * 4);
+    float *q = jb_arena_alloc(workspace, (size_t)n * qn, sizeof *q, 0),
+          *k = jb_arena_alloc(workspace, (size_t)n * kn, sizeof *k, 0),
+          *v = jb_arena_alloc(workspace, (size_t)n * kn, sizeof *v, 0);
     dg_mm(qw, x, q, n, qn, DG_H);
     dg_mm(kw, x, k, n, kn, DG_H);
     if (vw)
@@ -2030,7 +2373,8 @@ static void dg_attention_segments(DGModel *m, int l, float *x, int segments, int
         for (int s = 0; s < segments; s++)
             if (cache[s]->n > maxold)
                 maxold = cache[s]->n;
-    float *a = xcalloc((size_t)n * qn, 4), *score = xmalloc((size_t)n * (maxold + seq) * 4);
+    float *a = jb_arena_alloc(workspace, (size_t)n * qn, sizeof *a, 1),
+          *score = jb_arena_alloc(workspace, (size_t)n * (maxold + seq), sizeof *score, 0);
     JB_TO(attention_kv, kv_start);
     JB_TICK(core_start);
 #ifdef _OPENMP
@@ -2080,9 +2424,8 @@ static void dg_attention_segments(DGModel *m, int l, float *x, int segments, int
     if (out)
         for (int s = 0; s < segments; s++) {
             int old = cache ? cache[s]->n : 0, keep = lens[s];
-            out[s].n = old + keep;
-            out[s].k = xmalloc((size_t)(old + keep) * kn * 4);
-            out[s].v = xmalloc((size_t)(old + keep) * kn * 4);
+            if (out[s].n != old + keep || !out[s].k || !out[s].v)
+                die("K/V output does not match planned storage");
             if (old) {
                 memcpy(out[s].k, cache[s]->k, (size_t)old * kn * 4);
                 memcpy(out[s].v, cache[s]->v, (size_t)old * kn * 4);
@@ -2090,14 +2433,11 @@ static void dg_attention_segments(DGModel *m, int l, float *x, int segments, int
             memcpy(out[s].k + (size_t)old * kn, k + (size_t)s * seq * kn, (size_t)keep * kn * 4);
             memcpy(out[s].v + (size_t)old * kn, v + (size_t)s * seq * kn, (size_t)keep * kn * 4);
         }
-    free(q);
-    free(k);
-    free(v);
-    free(a);
-    free(score);
+    jb_arena_reset(workspace, mark);
 }
 
-static void dg_ff(DGModel *m, int l, float *x, int n) {
+static void dg_ff(DGModel *m, int l, float *x, int n, JBArena *workspace) {
+    size_t mark = jb_arena_mark(workspace);
     JB_TICK(ff_start);
     DGTensor *pre = dg_layer_tensor(m, l, "pre_feedforward_layernorm.weight");
     DGTensor *gw = dg_layer_tensor(m, l, "mlp.gate_proj.weight"),
@@ -2112,10 +2452,13 @@ static void dg_ff(DGModel *m, int l, float *x, int n) {
              *ed = m->nvfp4 ? NULL : dg_layer_tensor(m, l, "experts.down_proj");
     DGTensor *p2 = dg_layer_tensor(m, l, "post_feedforward_layernorm_2.weight"),
              *post = dg_layer_tensor(m, l, "post_feedforward_layernorm.weight");
-    float *z1 = xcalloc((size_t)n * DG_H, 4), *g = xmalloc((size_t)n * DG_DENSE * 4),
-          *u = xmalloc((size_t)n * DG_DENSE * 4), *d = xmalloc((size_t)n * DG_H * 4),
-          *z2 = xmalloc((size_t)n * DG_H * 4), *rin = xcalloc((size_t)n * DG_H, 4),
-          *route = xmalloc((size_t)n * DG_EXPERTS * sizeof *route);
+    float *z1 = jb_arena_alloc(workspace, (size_t)n * DG_H, sizeof *z1, 1),
+          *g = jb_arena_alloc(workspace, (size_t)n * DG_DENSE, sizeof *g, 0),
+          *u = jb_arena_alloc(workspace, (size_t)n * DG_DENSE, sizeof *u, 0),
+          *d = jb_arena_alloc(workspace, (size_t)n * DG_H, sizeof *d, 0),
+          *z2 = jb_arena_alloc(workspace, (size_t)n * DG_H, sizeof *z2, 0),
+          *rin = jb_arena_alloc(workspace, (size_t)n * DG_H, sizeof *rin, 1),
+          *route = jb_arena_alloc(workspace, (size_t)n * DG_EXPERTS, sizeof *route, 0);
 #ifdef _OPENMP
     JB_OMP();
 #pragma omp parallel for schedule(static)
@@ -2149,8 +2492,8 @@ static void dg_ff(DGModel *m, int l, float *x, int n) {
     for (size_t i = 0; i < (size_t)n * DG_EXPERTS; i++)
         if (!jb_finitef(route[i]))
             die("non-finite DiffusionGemma router logits");
-    int *top = xmalloc((size_t)n * DG_TOPK * sizeof *top);
-    float *tw = xmalloc((size_t)n * DG_TOPK * 4);
+    int *top = jb_arena_alloc(workspace, (size_t)n * DG_TOPK, sizeof *top, 0);
+    float *tw = jb_arena_alloc(workspace, (size_t)n * DG_TOPK, sizeof *tw, 0);
 #ifdef _OPENMP
     JB_OMP();
 #pragma omp parallel for schedule(static)
@@ -2192,12 +2535,14 @@ static void dg_ff(DGModel *m, int l, float *x, int n) {
     }
     JB_TO(router, router_start);
     JB_TICK(expert_start);
-    float *contrib = xcalloc((size_t)n * DG_TOPK * DG_H, 4),
-          *gather = xmalloc((size_t)n * DG_H * 4),
-          *gu = xmalloc((size_t)n * DG_EXPERT_PAIR * sizeof *gu),
-          *hid = xmalloc((size_t)n * DG_MOE * 4), *eo = xmalloc((size_t)n * DG_H * 4),
-          *qz2 = m->nvfp4 ? xmalloc((size_t)n * DG_H * 4) : NULL;
-    int *owner = xmalloc((size_t)n * 2 * sizeof *owner);
+    float *contrib = jb_arena_alloc(workspace, (size_t)n * DG_TOPK * DG_H, sizeof *contrib, 1),
+          *gather = jb_arena_alloc(workspace, (size_t)n * DG_H, sizeof *gather, 0),
+          *gu = jb_arena_alloc(workspace, (size_t)n * DG_EXPERT_PAIR, sizeof *gu, 0),
+          *hid = jb_arena_alloc(workspace, (size_t)n * DG_MOE, sizeof *hid, 0),
+          *eo = jb_arena_alloc(workspace, (size_t)n * DG_H, sizeof *eo, 0),
+          *qz2 = m->nvfp4 ? jb_arena_alloc(workspace, (size_t)n * DG_H, sizeof *qz2, 0) : NULL,
+          *qh = m->nvfp4 ? jb_arena_alloc(workspace, (size_t)n * DG_MOE, sizeof *qh, 0) : NULL;
+    int *owner = jb_arena_alloc(workspace, (size_t)n * 2, sizeof *owner, 0);
     if (qz2) {
         JB_TICK(input_qdq_start);
         dg_nvfp4_qdq(qz2, z2, n, DG_H, m->nv_a13[l]);
@@ -2218,7 +2563,6 @@ static void dg_ff(DGModel *m, int l, float *x, int n) {
             continue;
         if (m->nvfp4) {
             DGNvExpert *v = &m->nvexpert[l * DG_EXPERTS + e];
-            float *qh = xmalloc((size_t)ne * DG_MOE * 4);
             JB_TICK(gate_start);
             dg_nvfp4_mm(v->wg, v->sg, v->gg, gather, gu, ne, DG_MOE, DG_H);
             JB_TO(moe_gate, gate_start);
@@ -2239,7 +2583,6 @@ static void dg_ff(DGModel *m, int l, float *x, int n) {
             JB_TICK(down_start);
             dg_nvfp4_mm(v->wd, v->sd, v->gd, qh, eo, ne, DG_H, DG_MOE);
             JB_TO(moe_down, down_start);
-            free(qh);
         } else {
             const uint8_t *gp = eg->data + (uint64_t)e * DG_EXPERT_PAIR * DG_H * 2,
                           *dp = ed->data + (uint64_t)e * DG_H * DG_MOE * 2;
@@ -2260,7 +2603,8 @@ static void dg_ff(DGModel *m, int l, float *x, int n) {
     }
     JB_TO(experts, expert_start);
     JB_TICK(ff_tail_start);
-    float *mo = xmalloc(DG_H * 4), *sum = xmalloc(DG_H * 4);
+    float *mo = jb_arena_alloc(workspace, DG_H, sizeof *mo, 0),
+          *sum = jb_arena_alloc(workspace, DG_H, sizeof *sum, 0);
     for (int t = 0; t < n; t++) {
         float *r = x + (size_t)t * DG_H;
         memset(mo, 0, DG_H * 4);
@@ -2276,33 +2620,18 @@ static void dg_ff(DGModel *m, int l, float *x, int n) {
         for (int i = 0; i < DG_H; i++)
             r[i] += sum[i];
     }
-    free(z1);
-    free(g);
-    free(u);
-    free(d);
-    free(z2);
-    free(rin);
-    free(route);
-    free(top);
-    free(tw);
-    free(contrib);
-    free(gather);
-    free(gu);
-    free(hid);
-    free(eo);
-    free(qz2);
-    free(owner);
-    free(mo);
-    free(sum);
+    jb_arena_reset(workspace, mark);
     JB_TO(ff_other, ff_tail_start);
 }
 
 static void dg_layer(DGModel *m, int l, float *x, int n, int pos0, const DGKV *cache, DGKV *out,
-                     int mode, int batch) {
+                     int mode, int batch, JBArena *workspace) {
+    size_t mark = jb_arena_mark(workspace);
     JB_TICK(layer_start);
     DGTensor *in = dg_layer_tensor(m, l, "input_layernorm.weight"),
              *pa = dg_layer_tensor(m, l, "post_attention_layernorm.weight");
-    float *res = xmalloc((size_t)n * DG_H * 4), *z = xmalloc((size_t)n * DG_H * 4);
+    float *res = jb_arena_alloc(workspace, (size_t)n * DG_H, sizeof *res, 0),
+          *z = jb_arena_alloc(workspace, (size_t)n * DG_H, sizeof *z, 0);
     memcpy(res, x, (size_t)n * DG_H * 4);
 #ifdef _OPENMP
     JB_OMP();
@@ -2311,7 +2640,7 @@ static void dg_layer(DGModel *m, int l, float *x, int n, int pos0, const DGKV *c
     for (int t = 0; t < n; t++)
         dg_rms(z + (size_t)t * DG_H, x + (size_t)t * DG_H, in, DG_H);
     JB_TICK(attention_start);
-    dg_attention(m, l, z, n, pos0, cache, out, mode, batch);
+    dg_attention(m, l, z, n, pos0, cache, out, mode, batch, workspace);
     JB_TO(attention, attention_start);
 #ifdef _OPENMP
     JB_OMP();
@@ -2322,22 +2651,24 @@ static void dg_layer(DGModel *m, int l, float *x, int n, int pos0, const DGKV *c
         for (int i = 0; i < DG_H; i++)
             x[(size_t)t * DG_H + i] += res[(size_t)t * DG_H + i];
     }
-    dg_ff(m, l, x, n);
+    dg_ff(m, l, x, n, workspace);
     float sc = dg_at(dg_layer_tensor(m, l, "layer_scalar"), 0);
     for (size_t i = 0; i < (size_t)n * DG_H; i++)
         x[i] *= sc;
-    free(res);
-    free(z);
+    jb_arena_reset(workspace, mark);
     JB_TO(layers, layer_start);
 }
 
 static void dg_layer_multi(DGModel *m, int l, float *x, int segments, int seq,
-                           const DGKV *const *cache, const int *lens, DGKV *out, int mode) {
+                           const DGKV *const *cache, const int *lens, DGKV *out, int mode,
+                           JBArena *workspace) {
     int n = segments * seq;
+    size_t mark = jb_arena_mark(workspace);
     JB_TICK(layer_start);
     DGTensor *in = dg_layer_tensor(m, l, "input_layernorm.weight"),
              *pa = dg_layer_tensor(m, l, "post_attention_layernorm.weight");
-    float *res = xmalloc((size_t)n * DG_H * 4), *z = xmalloc((size_t)n * DG_H * 4);
+    float *res = jb_arena_alloc(workspace, (size_t)n * DG_H, sizeof *res, 0),
+          *z = jb_arena_alloc(workspace, (size_t)n * DG_H, sizeof *z, 0);
     memcpy(res, x, (size_t)n * DG_H * 4);
 #ifdef _OPENMP
     JB_OMP();
@@ -2346,7 +2677,7 @@ static void dg_layer_multi(DGModel *m, int l, float *x, int segments, int seq,
     for (int t = 0; t < n; t++)
         dg_rms(z + (size_t)t * DG_H, x + (size_t)t * DG_H, in, DG_H);
     JB_TICK(attention_start);
-    dg_attention_segments(m, l, z, segments, seq, 0, cache, lens, out, mode);
+    dg_attention_segments(m, l, z, segments, seq, 0, cache, lens, out, mode, workspace);
     JB_TO(attention, attention_start);
 #ifdef _OPENMP
     JB_OMP();
@@ -2357,18 +2688,16 @@ static void dg_layer_multi(DGModel *m, int l, float *x, int segments, int seq,
         for (int i = 0; i < DG_H; i++)
             x[(size_t)t * DG_H + i] += res[(size_t)t * DG_H + i];
     }
-    dg_ff(m, l, x, n);
+    dg_ff(m, l, x, n, workspace);
     float sc = dg_at(dg_layer_tensor(m, l, "layer_scalar"), 0);
     for (size_t i = 0; i < (size_t)n * DG_H; i++)
         x[i] *= sc;
-    free(res);
-    free(z);
+    jb_arena_reset(workspace, mark);
     JB_TO(layers, layer_start);
 }
 
-static float *dg_embed(DGModel *m, const int *ids, int n, int decoder) {
+static void dg_embed(DGModel *m, const int *ids, int n, int decoder, float *x) {
     DGTensor *w = dg_tensor(m, "model.decoder.embed_tokens.weight");
-    float *x = xmalloc((size_t)n * DG_H * 4);
     float scale = sqrtf(DG_H);
     for (int t = 0; t < n; t++) {
         for (int i = 0; i < DG_H; i++)
@@ -2376,7 +2705,6 @@ static float *dg_embed(DGModel *m, const int *ids, int n, int decoder) {
         if (decoder)
             dg_rms(x + (size_t)t * DG_H, x + (size_t)t * DG_H, NULL, DG_H);
     }
-    return x;
 }
 
 static void dg_final_norm(DGModel *m, float *x, int n) {
@@ -2385,31 +2713,43 @@ static void dg_final_norm(DGModel *m, float *x, int n) {
         dg_rms(x + (size_t)t * DG_H, x + (size_t)t * DG_H, w, DG_H);
 }
 
-static void dg_prefill(DGModel *m, const int *prompt, int np, DGKV kv[DG_L]) {
+static void dg_prefill(DGModel *m, const int *prompt, int np, DGKV kv[DG_L], DGWorkspace *owner) {
+    JBArena *workspace =
+        dg_workspace_begin(owner, dg_forward_workspace_bytes(m, np, 0, np, 1, 0, 0));
+    float *enc = jb_arena_alloc(workspace, (size_t)np * DG_H, sizeof *enc, 0);
     JB_TICK(embed_start);
-    float *enc = dg_embed(m, prompt, np, 0);
+    dg_embed(m, prompt, np, 0, enc);
     JB_TO(embedding, embed_start);
     for (int l = 0; l < DG_L; l++)
-        dg_layer(m, l, enc, np, 0, NULL, &kv[l], DG_CAUSAL, 1);
-    free(enc);
+        dg_layer(m, l, enc, np, 0, NULL, &kv[l], DG_CAUSAL, 1, workspace);
+    jb_arena_reset(workspace, 0);
+    dg_workspace_end(owner);
 }
 
 static void dg_prefill_suffix(DGModel *m, const int *token, int n, const DGKV prefix[DG_L],
-                              DGKV kv[DG_L]) {
+                              DGKV kv[DG_L], DGWorkspace *owner) {
+    JBArena *workspace =
+        dg_workspace_begin(owner, dg_forward_workspace_bytes(m, n, prefix[0].n, n, 1, 0, 0));
+    float *x = jb_arena_alloc(workspace, (size_t)n * DG_H, sizeof *x, 0);
     JB_TICK(embed_start);
-    float *x = dg_embed(m, token, n, 0);
+    dg_embed(m, token, n, 0, x);
     JB_TO(embedding, embed_start);
     for (int l = 0; l < DG_L; l++)
-        dg_layer(m, l, x, n, prefix[l].n, &prefix[l], &kv[l], DG_SUFFIX, 1);
-    free(x);
+        dg_layer(m, l, x, n, prefix[l].n, &prefix[l], &kv[l], DG_SUFFIX, 1, workspace);
+    jb_arena_reset(workspace, 0);
+    dg_workspace_end(owner);
 }
 
-static float *dg_decode(DGModel *m, DGKV kv[DG_L], int np, const int *canvas, int nc, int batch) {
+static float *dg_decode(DGModel *m, DGKV kv[DG_L], int np, const int *canvas, int nc, int batch,
+                        size_t tail, DGWorkspace *owner) {
+    JBArena *workspace = dg_workspace_begin(
+        owner, dg_forward_workspace_bytes(m, nc * batch, kv[0].n, nc, batch, batch > 1, tail));
+    float *dec = jb_arena_alloc(workspace, (size_t)nc * batch * DG_H, sizeof *dec, 0);
     JB_TICK(embed_start);
-    float *dec = dg_embed(m, canvas, nc * batch, 1);
+    dg_embed(m, canvas, nc * batch, 1, dec);
     JB_TO(embedding, embed_start);
     for (int l = 0; l < DG_L; l++)
-        dg_layer(m, l, dec, nc * batch, np, &kv[l], NULL, DG_CANVAS, batch);
+        dg_layer(m, l, dec, nc * batch, np, &kv[l], NULL, DG_CANVAS, batch, workspace);
     JB_TICK(norm_start);
     dg_final_norm(m, dec, nc * batch);
     JB_TO(final_norm, norm_start);
@@ -2417,62 +2757,64 @@ static float *dg_decode(DGModel *m, DGKV kv[DG_L], int np, const int *canvas, in
 }
 
 static void dg_prefill_suffix_multi(DGModel *m, const int *token, const int *lens, int batch,
-                                    int seq, const DGKV prefix[DG_L], DGKV *kv) {
+                                    int seq, const DGKV prefix[DG_L], DGKV *kv, const DGKV **cache,
+                                    DGKV *out, DGWorkspace *owner) {
+    JBArena *workspace = dg_workspace_begin(
+        owner, dg_forward_workspace_bytes(m, batch * seq, prefix[0].n, seq, batch, 0, 0));
+    float *x = jb_arena_alloc(workspace, (size_t)batch * seq * DG_H, sizeof *x, 0);
     JB_TICK(embed_start);
-    float *x = dg_embed(m, token, batch * seq, 0);
+    dg_embed(m, token, batch * seq, 0, x);
     JB_TO(embedding, embed_start);
-    const DGKV **cache = xmalloc((size_t)batch * sizeof *cache);
-    DGKV *out = xmalloc((size_t)batch * sizeof *out);
     for (int l = 0; l < DG_L; l++) {
-        for (int b = 0; b < batch; b++)
+        for (int b = 0; b < batch; b++) {
             cache[b] = &prefix[l];
-        dg_layer_multi(m, l, x, batch, seq, cache, lens, out, DG_SUFFIX);
-        for (int b = 0; b < batch; b++)
-            kv[(size_t)b * DG_L + l] = out[b];
+            out[b] = kv[(size_t)b * DG_L + l];
+        }
+        dg_layer_multi(m, l, x, batch, seq, cache, lens, out, DG_SUFFIX, workspace);
     }
-    free(out);
-    free(cache);
-    free(x);
+    jb_arena_reset(workspace, 0);
+    dg_workspace_end(owner);
 }
 
 static float *dg_decode_multi(DGModel *m, DGKV *kv, const int *doc, int segments, int seq,
-                              const int *canvas) {
+                              const int *canvas, const DGKV **cache, int *lens, size_t tail,
+                              DGWorkspace *owner) {
     int n = segments * seq;
-    JB_TICK(embed_start);
-    float *x = dg_embed(m, canvas, n, 1);
-    JB_TO(embedding, embed_start);
-    const DGKV **cache = xmalloc((size_t)segments * sizeof *cache);
-    int *lens = xmalloc((size_t)segments * sizeof *lens);
     for (int s = 0; s < segments; s++)
         lens[s] = seq;
+    int maxold = 0;
+    for (int s = 0; s < segments; s++)
+        for (int l = 0; l < DG_L; l++)
+            if (kv[(size_t)doc[s] * DG_L + l].n > maxold)
+                maxold = kv[(size_t)doc[s] * DG_L + l].n;
+    JBArena *workspace =
+        dg_workspace_begin(owner, dg_forward_workspace_bytes(m, n, maxold, seq, segments, 0, tail));
+    float *x = jb_arena_alloc(workspace, (size_t)n * DG_H, sizeof *x, 0);
+    JB_TICK(embed_start);
+    dg_embed(m, canvas, n, 1, x);
+    JB_TO(embedding, embed_start);
     for (int l = 0; l < DG_L; l++) {
         for (int s = 0; s < segments; s++)
             cache[s] = &kv[(size_t)doc[s] * DG_L + l];
-        dg_layer_multi(m, l, x, segments, seq, cache, lens, NULL, DG_CANVAS);
+        dg_layer_multi(m, l, x, segments, seq, cache, lens, NULL, DG_CANVAS, workspace);
     }
-    free(lens);
-    free(cache);
     JB_TICK(norm_start);
     dg_final_norm(m, x, n);
     JB_TO(final_norm, norm_start);
     return x;
 }
 
-static void dg_free_kv(DGKV kv[DG_L]) {
-    JB_TICK(kv_free_start);
-    for (int l = 0; l < DG_L; l++) {
-        free(kv[l].k);
-        free(kv[l].v);
-    }
-    JB_TO(kv_free, kv_free_start);
+static void dg_decode_end(DGWorkspace *workspace) {
+    jb_arena_reset(&workspace->arena, 0);
+    dg_workspace_end(workspace);
 }
 
 static void dg_prefix_free(DGPrefixCache *c) {
     if (!c)
         return;
-    dg_free_kv(c->kv);
-    free(c->schema);
-    free(c->ids);
+    dg_kv_free(&c->kv_storage, c->kv, 1);
+    if (c->metadata.allocation)
+        jb_arena_free(&c->metadata);
     memset(c, 0, sizeof *c);
 }
 
@@ -2803,45 +3145,7 @@ static void dg_sha256(const uint8_t *p, size_t n, uint8_t out[32]) {
             out[i * 4 + q] = (uint8_t)(h[i] >> (24 - 8 * q));
 }
 
-static void json_print_string(const char *s) {
-    putchar('\"');
-    for (; *s; s++) {
-        unsigned char c = (unsigned char)*s;
-        switch (c) {
-        case '\"':
-            fputs("\\\"", stdout);
-            break;
-        case '\\':
-            fputs("\\\\", stdout);
-            break;
-        case '\n':
-            fputs("\\n", stdout);
-            break;
-        case '\r':
-            fputs("\\r", stdout);
-            break;
-        case '\t':
-            fputs("\\t", stdout);
-            break;
-        default:
-            if (c < 32)
-                printf("\\u%04x", c);
-            else
-                putchar(c);
-        }
-    }
-    putchar('\"');
-}
-
-static void json_print_token(const char *j, const JTok *t) {
-    if (t->type == JT_STRING) {
-        char *s = jt_string(j, t);
-        json_print_string(s);
-        free(s);
-    } else
-        fwrite(j + t->start, 1, (size_t)(t->end - t->start), stdout);
-}
-
+#ifndef JB_NO_MAIN
 static char *read_all(const char *path, size_t *nn) {
     FILE *f = fopen(path, "rb");
     if (!f)
@@ -2861,6 +3165,7 @@ static char *read_all(const char *path, size_t *nn) {
     *nn = (size_t)z;
     return s;
 }
+#endif
 
 static void normalize_scores(const double *score, int n, double *prob) {
     if (n < 2)
@@ -3036,34 +3341,49 @@ static char *dg_answer_text_range(DecisionWork *w, int total, int start, int cou
     return b.p;
 }
 
+#ifndef JB_NO_MAIN
 static char *dg_answer_text(DecisionWork *w, int nq, const int *pick) {
     return dg_answer_text_range(w, nq, 0, nq, pick);
 }
+#endif
 
-static void dg_print_answers(const char *qj, JTok *qt, int qnt, DecisionWork *w, int nq,
-                             const char *id, uint32_t tokens, double ms, double prefill_ms,
-                             double cand_ms, int reads, int canvases, const char *cache_state,
-                             int cache_tokens, int processed_tokens, int microbatch) {
-    printf(
+static void db_json_token(DGBuf *b, const char *j, const JTok *t) {
+    if (t->type == JT_STRING) {
+        char *s = jt_string(j, t);
+        db_json_string(b, s, 0);
+        free(s);
+    } else
+        db_mem(b, j + t->start, (size_t)(t->end - t->start));
+}
+
+static char *dg_format_answers(const char *qj, JTok *qt, int qnt, DecisionWork *w, int nq,
+                               const char *id, uint32_t tokens, double ms, double prefill_ms,
+                               double cand_ms, int reads, int canvases, const char *cache_state,
+                               int cache_tokens, int processed_tokens, int microbatch,
+                               size_t *output_length) {
+    DGBuf out = {0};
+    db_fmt(
+        &out,
         "{\"model\":\"jev-bush-diffusion-%s\",\"math\":\"%s\",\"kernels\":\"%s\",\"threads\":%d,",
         JB_VERSION, JB_MATH_MODE, dg_kernels()->name, jb_threads());
     if (id) {
-        fputs("\"id\":", stdout);
-        json_print_string(id);
-        putchar(',');
+        db_mem(&out, "\"id\":", 5);
+        db_json_string(&out, id, 0);
+        db_ch(&out, ',');
     }
-    fputs("\"answers\":{", stdout);
+    db_mem(&out, "\"answers\":{", 11);
     for (int x = 0; x < nq; x++) {
         DecisionWork *d = &w[x];
         if (x)
-            putchar(',');
+            db_ch(&out, ',');
         char *k = jt_string(qj, &qt[d->key]);
-        json_print_string(k);
+        db_json_string(&out, k, 0);
         free(k);
-        fputs(":{\"type\":", stdout);
-        json_print_string(d->kind);
+        db_mem(&out, ":{\"type\":", 9);
+        db_json_string(&out, d->kind, 0);
         if (!strcmp(d->kind, "noul"))
-            printf(",\"noul\":%.17g,\"probabilities\":{\"true\":%.17g,\"false\":%.17g},"
+            db_fmt(&out,
+                   ",\"noul\":%.17g,\"probabilities\":{\"true\":%.17g,\"false\":%.17g},"
                    "\"confidence\":%.17g",
                    d->prob[0], d->prob[0], d->prob[1], confidence(d->prob, d->nc));
         else if (!strcmp(d->kind, "choice")) {
@@ -3071,40 +3391,44 @@ static void dg_print_answers(const char *qj, JTok *qt, int qnt, DecisionWork *w,
             for (int i = 1; i < d->nc; i++)
                 if (d->prob[i] > d->prob[top])
                     top = i;
-            fputs(",\"choice\":", stdout);
-            json_print_string(d->cand[top]);
-            fputs(",\"probabilities\":{", stdout);
+            db_mem(&out, ",\"choice\":", 10);
+            db_json_string(&out, d->cand[top], 0);
+            db_mem(&out, ",\"probabilities\":{", 18);
             for (int i = 0; i < d->nc; i++) {
                 if (i)
-                    putchar(',');
-                json_print_string(d->cand[i]);
-                printf(":%.17g", d->prob[i]);
+                    db_ch(&out, ',');
+                db_json_string(&out, d->cand[i], 0);
+                db_fmt(&out, ":%.17g", d->prob[i]);
             }
-            printf("},\"confidence\":%.17g", confidence(d->prob, d->nc));
+            db_fmt(&out, "},\"confidence\":%.17g", confidence(d->prob, d->nc));
         } else {
             double ev = 0;
             for (int i = 0; i < d->nc; i++)
                 ev += i * d->prob[i];
-            printf(",\"score\":%.17g,\"legend\":{", ev);
+            db_fmt(&out, ",\"score\":%.17g,\"legend\":{", ev);
             int zc = 0;
             for (int z = d->criteria + 1; z < qnt; z++)
                 if (qt[z].parent == d->criteria) {
-                    printf("%s\"%d\":", zc ? "," : "", zc);
+                    db_fmt(&out, "%s\"%d\":", zc ? "," : "", zc);
                     zc++;
-                    json_print_token(qj, &qt[z]);
+                    db_json_token(&out, qj, &qt[z]);
                 }
-            fputs("},\"probabilities\":{", stdout);
+            db_mem(&out, "},\"probabilities\":{", 19);
             for (int i = 0; i < d->nc; i++)
-                printf("%s\"%d\":%.17g", i ? "," : "", i, d->prob[i]);
-            printf("},\"confidence\":%.17g", confidence(d->prob, d->nc));
+                db_fmt(&out, "%s\"%d\":%.17g", i ? "," : "", i, d->prob[i]);
+            db_fmt(&out, "},\"confidence\":%.17g", confidence(d->prob, d->nc));
         }
-        putchar('}');
+        db_ch(&out, '}');
     }
-    printf("},\"usage\":{\"input_tokens\":%u,\"output_tokens\":0,\"prefill_tokens\":%d},\"timing_"
-           "ms\":{\"total\":%.3f,\"prefill\":%.3f,\"decode\":%.3f,\"candidates\":%.3f,\"reads\":%d,"
-           "\"canvases\":%d,\"microbatch\":%d,\"prefix_cache\":\"%s\",\"cache_tokens\":%d}}\n",
+    db_fmt(&out,
+           "},\"usage\":{\"input_tokens\":%u,\"output_tokens\":0,\"prefill_tokens\":%d},"
+           "\"timing_ms\":{\"total\":%.3f,\"prefill\":%.3f,\"decode\":%.3f,"
+           "\"candidates\":%.3f,\"reads\":%d,\"canvases\":%d,\"microbatch\":%d,"
+           "\"prefix_cache\":\"%s\",\"cache_tokens\":%d}}",
            tokens, processed_tokens, ms, prefill_ms, ms - prefill_ms - cand_ms, cand_ms, reads,
            canvases, microbatch, cache_state, cache_tokens);
+    *output_length = out.n;
+    return out.p;
 }
 
 typedef struct {
@@ -3245,6 +3569,7 @@ static void dg_questions_free(DecisionWork *w, int nq) {
     free(w);
 }
 
+#ifndef JB_NO_MAIN
 static char *dg_answer_template(DecisionWork *w, int nq, const int *pick) {
     char *a = dg_answer_text(w, nq, pick);
     DGBuf b = {0};
@@ -3252,6 +3577,7 @@ static char *dg_answer_template(DecisionWork *w, int nq, const int *pick) {
     free(a);
     return b.p;
 }
+#endif
 
 static char *dg_answer_template_range(DecisionWork *w, int total, int start, int count,
                                       const int *pick) {
@@ -3268,8 +3594,8 @@ typedef struct {
     int nq;
     uint32_t seed;
     char *sys, *pre, *prompt;
-    Tokens pt;
-    int group_cap, groups, width, *slot, **ids, *canvas;
+    Tokens pt, pre_tokens;
+    int group_cap, groups, width, *slot, **ids, *id_data, *canvas;
     DGCanvas *cv;
     int requested, reads, max_reads, active;
     uint64_t candidate_ns;
@@ -3291,6 +3617,7 @@ static void dg_job_prepare(DGJob *g, DGTokenizer *tok, const char *j, size_t len
     DGBuf pre = {0}, pb = {0};
     db_fmt(&pre, "<bos><|turn>system\n%s<turn|>\n<|turn>user\n", g->sys);
     g->pre = pre.p;
+    g->pre_tokens = dgt_tokenize(tok, g->pre);
     db_fmt(&pb, "%s%s<turn|>\n<|turn>model\n", g->pre, g->rq.state);
     g->prompt = pb.p;
     if (strlen(g->prompt) > (size_t)JB_MAX_CTX * tok->maxlen)
@@ -3304,6 +3631,15 @@ static void dg_job_prepare(DGJob *g, DGTokenizer *tok, const char *j, size_t len
     g->cv = xcalloc((size_t)g->groups, sizeof *g->cv);
     g->slot = xmalloc((size_t)g->nq * sizeof *g->slot);
     g->ids = xcalloc((size_t)g->nq, sizeof *g->ids);
+    size_t candidate_ids = 0;
+    for (int x = 0; x < g->nq; x++)
+        candidate_ids = jb_size_add(candidate_ids, (size_t)g->w[x].nc);
+    g->id_data = xmalloc(jb_size_mul(candidate_ids, sizeof *g->id_data));
+    size_t candidate_at = 0;
+    for (int x = 0; x < g->nq; x++) {
+        g->ids[x] = g->id_data + candidate_at;
+        candidate_at += (size_t)g->w[x].nc;
+    }
     for (int b = 0; b < g->groups; b++) {
         DGCanvas *c = &g->cv[b];
         c->start = b * g->group_cap;
@@ -3317,7 +3653,6 @@ static void dg_job_prepare(DGJob *g, DGTokenizer *tok, const char *j, size_t len
         if (cw > g->width)
             g->width = cw;
         for (int x = c->start; x < c->start + c->count; x++) {
-            g->ids[x] = xmalloc((size_t)g->w[x].nc * sizeof **g->ids);
             g->slot[x] = -1;
             for (int q = 1; q < g->w[x].nc; q++) {
                 int old = zero[x];
@@ -3359,15 +3694,15 @@ static void dg_job_prepare(DGJob *g, DGTokenizer *tok, const char *j, size_t len
 }
 
 static void dg_job_free(DGJob *g) {
-    for (int x = 0; x < g->nq; x++)
-        free(g->ids[x]);
     for (int b = 0; b < g->groups; b++)
         free(g->cv[b].base.v);
     free(g->cv);
     free(g->ids);
+    free(g->id_data);
     free(g->slot);
     free(g->canvas);
     free(g->pt.v);
+    free(g->pre_tokens.v);
     free(g->prompt);
     free(g->pre);
     free(g->sys);
@@ -3376,24 +3711,59 @@ static void dg_job_free(DGJob *g) {
     memset(g, 0, sizeof *g);
 }
 
-static void dg_job_score(DGTensor *emb, DGJob *g, const float *h, int segment0, int read) {
+static size_t dg_job_score_bytes(const DGJob *g, int read) {
+    size_t candidates = 0;
+    int max_candidates = 0;
+    for (int x = 0; x < g->nq; x++) {
+        candidates = jb_size_add(candidates, (size_t)g->w[x].nc);
+        if (g->w[x].nc > max_candidates)
+            max_candidates = g->w[x].nc;
+    }
+    size_t bytes = 0;
+    jb_workspace_plan(&bytes, (size_t)g->nq, sizeof(double *));
+    jb_workspace_plan(&bytes, candidates, sizeof(double));
+    if (!g->requested && read == 0) {
+        jb_workspace_plan(&bytes, (size_t)g->nq * DG_H, sizeof(float));
+        jb_workspace_plan(&bytes, (size_t)g->nq, sizeof(int));
+        jb_workspace_plan(&bytes, (size_t)g->nq * DG_VOCAB, sizeof(float));
+    }
+    jb_workspace_plan(&bytes, (size_t)max_candidates, sizeof(double));
+    return bytes;
+}
+
+static void dg_job_score(DGTensor *emb, DGJob *g, const float *h, int segment0, int read,
+                         DGWorkspace *owner) {
     uint64_t start = now_ns();
     double entropy = 0;
-    double **score = xmalloc((size_t)g->nq * sizeof *score);
-    for (int x = 0; x < g->nq; x++)
-        score[x] = xmalloc((size_t)g->w[x].nc * sizeof **score);
+    size_t candidates = 0;
+    int max_candidates = 0;
+    for (int x = 0; x < g->nq; x++) {
+        candidates = jb_size_add(candidates, (size_t)g->w[x].nc);
+        if (g->w[x].nc > max_candidates)
+            max_candidates = g->w[x].nc;
+    }
+    int score_only = !owner->active;
+    JBArena *workspace =
+        score_only ? dg_workspace_begin(owner, dg_job_score_bytes(g, read)) : &owner->arena;
+    size_t mark = jb_arena_mark(workspace);
+    double **score = jb_arena_alloc(workspace, (size_t)g->nq, sizeof *score, 0);
+    double *score_data = jb_arena_alloc(workspace, candidates, sizeof *score_data, 0);
+    size_t score_offset = 0;
+    for (int x = 0; x < g->nq; x++) {
+        score[x] = score_data + score_offset;
+        score_offset += (size_t)g->w[x].nc;
+    }
     if (!g->requested && read == 0) {
-        float *answer_h = xmalloc((size_t)g->nq * DG_H * sizeof *answer_h);
-        int *label_n = xmalloc((size_t)g->nq * sizeof *label_n);
+        float *answer_h = jb_arena_alloc(workspace, (size_t)g->nq * DG_H, sizeof *answer_h, 0);
+        int *label_n = jb_arena_alloc(workspace, (size_t)g->nq, sizeof *label_n, 0);
+        float *logits = jb_arena_alloc(workspace, (size_t)g->nq * DG_VOCAB, sizeof *logits, 0);
         for (int x = 0; x < g->nq; x++) {
             memcpy(answer_h + (size_t)x * DG_H,
                    h + ((size_t)(segment0 + x / g->group_cap) * g->width + g->slot[x]) * DG_H,
                    DG_H * sizeof *answer_h);
             label_n[x] = g->w[x].nc;
         }
-        entropy = dg_slot_logits_entropy(emb, answer_h, g->nq, g->ids, label_n, score);
-        free(label_n);
-        free(answer_h);
+        entropy = dg_slot_logits_entropy(emb, answer_h, g->nq, g->ids, label_n, score, logits);
     } else
         for (int x = 0; x < g->nq; x++)
             for (int c = 0; c < g->w[x].nc; c++) {
@@ -3404,15 +3774,17 @@ static void dg_job_score(DGTensor *emb, DGJob *g, const float *h, int segment0, 
                             &z, 1, DG_H);
                 score[x][c] = 30 * tanh(z / 30);
             }
+    double *prob = jb_arena_alloc(workspace, (size_t)max_candidates, sizeof *prob, 0);
     for (int x = 0; x < g->nq; x++) {
-        double *prob = xmalloc((size_t)g->w[x].nc * sizeof *prob);
         normalize_scores(score[x], g->w[x].nc, prob);
         for (int c = 0; c < g->w[x].nc; c++)
             g->w[x].prob[c] += prob[c];
-        free(prob);
-        free(score[x]);
     }
-    free(score);
+    jb_arena_reset(workspace, mark);
+    if (score_only) {
+        jb_arena_reset(workspace, 0);
+        dg_workspace_end(owner);
+    }
     g->candidate_ns += now_ns() - start;
     g->reads++;
     if (!g->requested && read == 0 && !(entropy > .1))
@@ -3426,9 +3798,11 @@ static void dg_job_normalize(DGJob *g) {
 }
 
 static int dg_systemone(DGModel *m, DGTokenizer *tok, const char *j, size_t len,
-                        const char *line_id, DGPrefixCache *prefix_cache) {
+                        DGPrefixCache *prefix_cache, DGWorkspace *workspace, char **output,
+                        size_t *output_length) {
 #ifdef JB_PROFILE
     memset(&jb_profile, 0, sizeof jb_profile);
+    jb_profile_hot = 0;
 #endif
     DGJob job;
     dg_job_prepare(&job, tok, j, len);
@@ -3442,14 +3816,18 @@ static int dg_systemone(DGModel *m, DGTokenizer *tok, const char *j, size_t len,
     free(system_part.v);
     free(state_part.v);
 #endif
+#ifdef JB_PROFILE
+    jb_profile_hot = 1;
+#endif
     uint64_t start = now_ns();
     DGKV kv[DG_L] = {0};
+    int kv_length = (int)job.pt.n;
+    dg_worker_kv_begin(workspace, kv, 1, &kv_length);
     const char *cache_state = "off";
     int cache_tokens = 0, processed_tokens = (int)job.pt.n;
     if (prefix_cache) {
-        Tokens prefix = dgt_tokenize(tok, job.pre);
-        uint32_t common = 0, lim = prefix.n < job.pt.n ? prefix.n : job.pt.n;
-        while (common < lim && prefix.v[common] == job.pt.v[common])
+        uint32_t common = 0, lim = job.pre_tokens.n < job.pt.n ? job.pre_tokens.n : job.pt.n;
+        while (common < lim && job.pre_tokens.v[common] == job.pt.v[common])
             common++;
         int hit = prefix_cache->schema && !strcmp(prefix_cache->schema, job.sys) &&
                   prefix_cache->n <= (int)job.pt.n &&
@@ -3458,18 +3836,22 @@ static int dg_systemone(DGModel *m, DGTokenizer *tok, const char *j, size_t len,
             if (!common || common >= job.pt.n)
                 die("cannot construct reusable schema prefix");
             dg_prefix_free(prefix_cache);
-            prefix_cache->schema = xstrdup(job.sys);
+            size_t schema_bytes = strlen(job.sys) + 1, metadata_bytes = 0;
+            jb_workspace_plan(&metadata_bytes, schema_bytes, sizeof(char));
+            jb_workspace_plan(&metadata_bytes, common, sizeof *prefix_cache->ids);
+            jb_arena_init(&prefix_cache->metadata, metadata_bytes);
+            prefix_cache->schema = jb_arena_alloc(&prefix_cache->metadata, schema_bytes,
+                                                  sizeof *prefix_cache->schema, 0);
+            prefix_cache->ids =
+                jb_arena_alloc(&prefix_cache->metadata, common, sizeof *prefix_cache->ids, 0);
+            memcpy(prefix_cache->schema, job.sys, schema_bytes);
             prefix_cache->n = (int)common;
-            prefix_cache->ids = xmalloc((size_t)common * sizeof *prefix_cache->ids);
             memcpy(prefix_cache->ids, job.pt.v, (size_t)common * sizeof *prefix_cache->ids);
-            dg_prefill(m, job.pt.v, (int)job.pt.n, kv);
+            dg_prefill(m, job.pt.v, (int)job.pt.n, kv, workspace);
+            int prefix_length = (int)common;
+            dg_kv_init(&prefix_cache->kv_storage, prefix_cache->kv, 1, &prefix_length);
             for (int l = 0; l < DG_L; l++) {
-                int full = l % DG_FULL_EVERY == DG_FULL_EVERY - 1;
-                int kn = (full ? DG_FULL_KV_HEADS : DG_LOCAL_KV_HEADS) *
-                         (full ? DG_FULL_HEAD_DIM : DG_LOCAL_HEAD_DIM);
-                prefix_cache->kv[l].n = (int)common;
-                prefix_cache->kv[l].k = xmalloc((size_t)common * kn * 4);
-                prefix_cache->kv[l].v = xmalloc((size_t)common * kn * 4);
+                int kn = dg_kv_width(l);
                 memcpy(prefix_cache->kv[l].k, kv[l].k, (size_t)common * kn * 4);
                 memcpy(prefix_cache->kv[l].v, kv[l].v, (size_t)common * kn * 4);
             }
@@ -3480,13 +3862,20 @@ static int dg_systemone(DGModel *m, DGTokenizer *tok, const char *j, size_t len,
             int suffix = (int)job.pt.n - prefix_cache->n;
             if (suffix <= 0)
                 die("schema prefix consumes complete prompt");
-            dg_prefill_suffix(m, job.pt.v + prefix_cache->n, suffix, prefix_cache->kv, kv);
+            dg_prefill_suffix(m, job.pt.v + prefix_cache->n, suffix, prefix_cache->kv, kv,
+                              workspace);
         }
         cache_tokens = prefix_cache->n;
-        free(prefix.v);
     } else
-        dg_prefill(m, job.pt.v, (int)job.pt.n, kv);
+        dg_prefill(m, job.pt.v, (int)job.pt.n, kv, workspace);
     uint64_t prefill_ns = now_ns() - start;
+#ifdef JB_CANVAS_SEQUENTIAL
+    size_t sequential_count = jb_size_mul((size_t)job.groups * job.width, DG_H);
+    JBArena *sequential_storage =
+        dg_control_begin(workspace, jb_size_mul(sequential_count, sizeof(float)));
+    float *sequential_hidden =
+        jb_arena_alloc(sequential_storage, sequential_count, sizeof *sequential_hidden, 0);
+#endif
     for (int r = 0; r < job.max_reads; r++) {
         memset(job.canvas, 0, (size_t)job.width * job.groups * sizeof *job.canvas);
         for (int b = 0; b < job.groups; b++) {
@@ -3500,28 +3889,41 @@ static int dg_systemone(DGModel *m, DGTokenizer *tok, const char *j, size_t len,
             job.canvas[(size_t)(x / job.group_cap) * job.width + job.slot[x]] =
                 (int)dg_mt_vocab(&rng);
 #ifdef JB_CANVAS_SEQUENTIAL
-        float *h = xmalloc((size_t)job.groups * job.width * DG_H * sizeof *h);
+        float *h = sequential_hidden;
         for (int b = 0; b < job.groups; b++) {
-            float *one =
-                dg_decode(m, kv, (int)job.pt.n, job.canvas + (size_t)b * job.width, job.width, 1);
+            float *one = dg_decode(m, kv, (int)job.pt.n, job.canvas + (size_t)b * job.width,
+                                   job.width, 1, 0, workspace);
             memcpy(h + (size_t)b * job.width * DG_H, one, (size_t)job.width * DG_H * sizeof *h);
-            free(one);
+            dg_decode_end(workspace);
         }
 #else
-        float *h = dg_decode(m, kv, (int)job.pt.n, job.canvas, job.width, job.groups);
+        size_t score_bytes = dg_job_score_bytes(&job, r);
+        float *h = dg_decode(m, kv, (int)job.pt.n, job.canvas, job.width, job.groups, score_bytes,
+                             workspace);
 #endif
-        dg_job_score(emb, &job, h, 0, r);
-        free(h);
+        dg_job_score(emb, &job, h, 0, r, workspace);
+#ifndef JB_CANVAS_SEQUENTIAL
+        dg_decode_end(workspace);
+#endif
         if (!job.active)
             break;
     }
-    dg_free_kv(kv);
+#ifdef JB_CANVAS_SEQUENTIAL
+    dg_control_end(workspace);
+#endif
+#ifdef JB_PROFILE
+    double kv_mb = workspace->kv_arena.size / 1048576.0;
+#endif
+    dg_worker_kv_end(workspace, kv, 1);
+#ifdef JB_PROFILE
+    jb_profile_hot = 0;
+#endif
     dg_job_normalize(&job);
     double cand_ms = job.candidate_ns / 1e6, ms = (now_ns() - start) / 1e6;
     uint32_t billed = job.pt.n * (job.requested ? job.reads : 1);
-    dg_print_answers(rq->qj, rq->qt, rq->qnt, job.w, job.nq, line_id ? line_id : rq->reqid, billed,
-                     ms, prefill_ns / 1e6, cand_ms, job.reads, job.groups, cache_state,
-                     cache_tokens, processed_tokens, 1);
+    *output = dg_format_answers(rq->qj, rq->qt, rq->qnt, job.w, job.nq, rq->reqid, billed, ms,
+                                prefill_ns / 1e6, cand_ms, job.reads, job.groups, cache_state,
+                                cache_tokens, processed_tokens, 1, output_length);
 #ifdef JB_PROFILE
     uint64_t detailed = jb_profile.moe_input_qdq + jb_profile.moe_gate + jb_profile.moe_up +
                         jb_profile.moe_activation + jb_profile.moe_hidden_qdq + jb_profile.moe_down;
@@ -3540,7 +3942,8 @@ static int dg_systemone(DGModel *m, DGTokenizer *tok, const char *j, size_t len,
     fprintf(
         stderr,
         "JB_PROFILE prompt_tokens=%llu system_tokens=%llu state_tokens=%llu omp_regions=%llu "
-        "alloc_calls=%llu alloc_ms=%.3f attention=%.3f attention_qkv=%.3f attention_prepare=%.3f "
+        "alloc_calls=%llu hot_alloc_calls=%llu alloc_ms=%.3f workspace_mb=%.3f kv_mb=%.3f "
+        "attention=%.3f attention_qkv=%.3f attention_prepare=%.3f "
         "attention_kv=%.3f attention_core=%.3f attention_output=%.3f attention_misc=%.3f "
         "dense=%.3f router=%.3f experts=%.3f moe_input_qdq=%.3f moe_gate=%.3f moe_up=%.3f "
         "moe_activation=%.3f moe_hidden_qdq=%.3f moe_down=%.3f moe_misc=%.3f ff_other=%.3f "
@@ -3548,7 +3951,8 @@ static int dg_systemone(DGModel *m, DGTokenizer *tok, const char *j, size_t len,
         "unaccounted=%.3f total=%.3f\n",
         (unsigned long long)jb_profile.prompt_tokens, (unsigned long long)jb_profile.system_tokens,
         (unsigned long long)jb_profile.state_tokens, (unsigned long long)jb_profile.omp_regions,
-        (unsigned long long)jb_profile.alloc_calls, jb_profile.alloc_ns / 1e6,
+        (unsigned long long)jb_profile.alloc_calls, (unsigned long long)jb_profile.hot_alloc_calls,
+        jb_profile.alloc_ns / 1e6, workspace->capacity / 1048576.0, kv_mb,
         jb_profile.attention / 1e6, jb_profile.attention_qkv / 1e6,
         jb_profile.attention_prepare / 1e6, jb_profile.attention_kv / 1e6,
         jb_profile.attention_core / 1e6, jb_profile.attention_output / 1e6, attention_misc,
@@ -3558,7 +3962,6 @@ static int dg_systemone(DGModel *m, DGTokenizer *tok, const char *j, size_t len,
         moe_misc, jb_profile.ff_other / 1e6, layer_other, jb_profile.embedding / 1e6,
         jb_profile.final_norm / 1e6, jb_profile.kv_free / 1e6, cand_ms, unaccounted, ms);
 #endif
-    flush_output();
     dg_job_free(&job);
     return 0;
 }
@@ -3566,7 +3969,8 @@ static int dg_systemone(DGModel *m, DGTokenizer *tok, const char *j, size_t len,
 /* Returns zero when the rows do not all hit the current exact schema entry;
  * the caller then executes them sequentially, allowing normal cache replace. */
 static int dg_system_batch(DGModel *m, DGTokenizer *tok, char **row, size_t *len, int batch,
-                           DGPrefixCache *prefix) {
+                           DGPrefixCache *prefix, DGWorkspace *workspace, char **output,
+                           size_t *output_length) {
     if (batch < 2 || !prefix || !prefix->schema)
         return 0;
     DGJob *g = xcalloc((size_t)batch, sizeof *g);
@@ -3587,30 +3991,57 @@ static int dg_system_batch(DGModel *m, DGTokenizer *tok, char **row, size_t *len
         free(g);
         return 0;
     }
-    int seq = 0, *sl = xmalloc((size_t)batch * sizeof *sl);
+    int seq = 0;
     for (int b = 0; b < batch; b++) {
-        sl[b] = (int)g[b].pt.n - prefix->n;
-        if (sl[b] < 1)
+        int suffix = (int)g[b].pt.n - prefix->n;
+        if (suffix < 1)
             die("schema prefix consumes complete prompt");
-        if (sl[b] > seq)
-            seq = sl[b];
+        if (suffix > seq)
+            seq = suffix;
     }
     if ((uint64_t)batch * seq > JB_MAX_CTX)
         die("microbatch suffix exceeds DiffusionGemma work limit");
-    int *st = xcalloc((size_t)batch * seq, sizeof *st);
-    for (int b = 0; b < batch; b++)
-        memcpy(st + (size_t)b * seq, g[b].pt.v + prefix->n, (size_t)sl[b] * sizeof *st);
-    DGKV *kv = xcalloc((size_t)batch * DG_L, sizeof *kv);
-    uint64_t start = now_ns();
-    dg_prefill_suffix_multi(m, st, sl, batch, seq, prefix->kv, kv);
-    uint64_t prefill_ns = now_ns() - start;
-    free(st);
-    free(sl);
-    DGTensor *emb = dg_tensor(m, "model.decoder.embed_tokens.weight");
-    int width = g[0].width, maxr = 0;
-    for (int b = 0; b < batch; b++)
+    int width = g[0].width, maxr = 0, max_segments = 0;
+    for (int b = 0; b < batch; b++) {
+        max_segments += g[b].groups;
         if (g[b].max_reads > maxr)
             maxr = g[b].max_reads;
+    }
+    size_t control_bytes = 0;
+    jb_workspace_plan(&control_bytes, (size_t)batch, sizeof(int));
+    jb_workspace_plan(&control_bytes, (size_t)batch * seq, sizeof(int));
+    jb_workspace_plan(&control_bytes, (size_t)batch * DG_L, sizeof(DGKV));
+    jb_workspace_plan(&control_bytes, (size_t)batch, sizeof(int));
+    jb_workspace_plan(&control_bytes, (size_t)max_segments * width, sizeof(int));
+    jb_workspace_plan(&control_bytes, (size_t)max_segments, sizeof(int));
+    jb_workspace_plan(&control_bytes, (size_t)batch, sizeof(int));
+    jb_workspace_plan(&control_bytes, (size_t)max_segments, sizeof(int));
+    jb_workspace_plan(&control_bytes, (size_t)max_segments, sizeof(DGKV *));
+    jb_workspace_plan(&control_bytes, (size_t)batch, sizeof(DGKV));
+    JBArena *control = dg_control_begin(workspace, control_bytes);
+    int *sl = jb_arena_alloc(control, (size_t)batch, sizeof *sl, 0);
+    int *st = jb_arena_alloc(control, (size_t)batch * seq, sizeof *st, 1);
+    DGKV *kv = jb_arena_alloc(control, (size_t)batch * DG_L, sizeof *kv, 1);
+    int *kv_lengths = jb_arena_alloc(control, (size_t)batch, sizeof *kv_lengths, 0);
+    int *canvas = jb_arena_alloc(control, (size_t)max_segments * width, sizeof *canvas, 0),
+        *doc = jb_arena_alloc(control, (size_t)max_segments, sizeof *doc, 0),
+        *base = jb_arena_alloc(control, (size_t)batch, sizeof *base, 0),
+        *attention_lens = jb_arena_alloc(control, (size_t)max_segments, sizeof *attention_lens, 0);
+    const DGKV **attention_cache =
+        jb_arena_alloc(control, (size_t)max_segments, sizeof *attention_cache, 0);
+    DGKV *layer_out = jb_arena_alloc(control, (size_t)batch, sizeof *layer_out, 0);
+    for (int b = 0; b < batch; b++) {
+        sl[b] = (int)g[b].pt.n - prefix->n;
+        kv_lengths[b] = (int)g[b].pt.n;
+    }
+    for (int b = 0; b < batch; b++)
+        memcpy(st + (size_t)b * seq, g[b].pt.v + prefix->n, (size_t)sl[b] * sizeof *st);
+    dg_worker_kv_begin(workspace, kv, batch, kv_lengths);
+    uint64_t start = now_ns();
+    dg_prefill_suffix_multi(m, st, sl, batch, seq, prefix->kv, kv, attention_cache, layer_out,
+                            workspace);
+    uint64_t prefill_ns = now_ns() - start;
+    DGTensor *emb = dg_tensor(m, "model.decoder.embed_tokens.weight");
     for (int r = 0; r < maxr; r++) {
         int segments = 0;
         for (int b = 0; b < batch; b++)
@@ -3618,9 +4049,6 @@ static int dg_system_batch(DGModel *m, DGTokenizer *tok, char **row, size_t *len
                 segments += g[b].groups;
         if (!segments)
             break;
-        int *canvas = xcalloc((size_t)segments * width, sizeof *canvas),
-            *doc = xmalloc((size_t)segments * sizeof *doc),
-            *base = xmalloc((size_t)batch * sizeof *base);
         int at = 0;
         for (int b = 0; b < batch; b++) {
             base[b] = -1;
@@ -3644,53 +4072,620 @@ static int dg_system_batch(DGModel *m, DGTokenizer *tok, char **row, size_t *len
                 doc[at++] = b;
             }
         }
-        float *h = dg_decode_multi(m, kv, doc, segments, width, canvas);
-        free(canvas);
-        free(doc);
+        size_t score_bytes = 0;
         for (int b = 0; b < batch; b++)
             if (base[b] >= 0) {
-                dg_job_score(emb, &g[b], h, base[b], r);
+                size_t one = dg_job_score_bytes(&g[b], r);
+                if (one > score_bytes)
+                    score_bytes = one;
             }
-        free(base);
-        free(h);
+        float *h = dg_decode_multi(m, kv, doc, segments, width, canvas, attention_cache,
+                                   attention_lens, score_bytes, workspace);
+        for (int b = 0; b < batch; b++)
+            if (base[b] >= 0) {
+                dg_job_score(emb, &g[b], h, base[b], r, workspace);
+            }
+        dg_decode_end(workspace);
     }
     uint64_t total_ns = now_ns() - start;
+    dg_worker_kv_end(workspace, kv, batch);
+    dg_control_end(workspace);
     for (int b = 0; b < batch; b++) {
-        dg_free_kv(kv + (size_t)b * DG_L);
         dg_job_normalize(&g[b]);
         uint32_t billed = g[b].pt.n * (g[b].requested ? g[b].reads : 1);
-        dg_print_answers(g[b].rq.qj, g[b].rq.qt, g[b].rq.qnt, g[b].w, g[b].nq, g[b].rq.reqid,
-                         billed, total_ns / 1e6, prefill_ns / 1e6, g[b].candidate_ns / 1e6,
-                         g[b].reads, g[b].groups, "hit", prefix->n, (int)g[b].pt.n - prefix->n,
-                         batch);
+        output[b] = dg_format_answers(
+            g[b].rq.qj, g[b].rq.qt, g[b].rq.qnt, g[b].w, g[b].nq, g[b].rq.reqid, billed,
+            total_ns / 1e6, prefill_ns / 1e6, g[b].candidate_ns / 1e6, g[b].reads, g[b].groups,
+            "hit", prefix->n, (int)g[b].pt.n - prefix->n, batch, &output_length[b]);
         dg_job_free(&g[b]);
     }
-    flush_output();
-    free(kv);
     free(g);
     return 1;
 }
 
+struct jb_model {
+    DGModel model;
+    DGTokenizer tokenizer;
+};
+
+struct jb_session {
+    jb_model *model;
+    DGPrefixCache prefix;
+    DGWorkspace workspace;
+    char *questions_json;
+    size_t questions_length;
+};
+
+const char *jb_version(void) {
+    return JB_VERSION;
+}
+
+const char *jb_status_string(jb_status status) {
+    static const char *const text[] = {"ok",
+                                       "invalid argument",
+                                       "I/O error",
+                                       "model error",
+                                       "request error",
+                                       "out of memory",
+                                       "internal error"};
+    return (unsigned)status < sizeof text / sizeof *text ? text[status] : "unknown error";
+}
+
+const char *jb_last_error(void) {
+    return jb_error_message;
+}
+
+static jb_status jb_invalid(const char *message) {
+    snprintf(jb_error_message, sizeof jb_error_message, "%s", message);
+    return JB_ERROR_INVALID_ARGUMENT;
+}
+
+jb_status jb_model_load(const char *model_directory, jb_model **out_model) {
+    if (!model_directory || !out_model)
+        return jb_invalid("model directory and output pointer are required");
+    *out_model = NULL;
+    jb_model *model = xcalloc(1, sizeof *model);
+    JBErrorFrame frame;
+    memset(&frame, 0, sizeof frame);
+    frame.previous = jb_error_frame;
+    frame.status = JB_ERROR_MODEL;
+    jb_error_frame = &frame;
+    if (setjmp(frame.jump)) {
+        jb_error_frame = frame.previous;
+        dgt_free(&model->tokenizer);
+        dg_free(&model->model);
+        free(model);
+        return frame.status;
+    }
+    dg_load(&model->model, model_directory);
+    dgt_load(&model->tokenizer, model_directory);
+    jb_error_frame = frame.previous;
+    *out_model = model;
+    jb_error_message[0] = 0;
+    return JB_OK;
+}
+
+void jb_model_free(jb_model *model) {
+    if (!model)
+        return;
+    dgt_free(&model->tokenizer);
+    dg_free(&model->model);
+    free(model);
+}
+
+static char *jb_schema_json(const jb_schema *schema, size_t *length) {
+    if (!schema || !schema->questions || !schema->question_count ||
+        schema->question_count > DG_MAX_QUESTIONS)
+        return NULL;
+    DGBuf out = {0};
+    db_ch(&out, '{');
+    for (size_t q = 0; q < schema->question_count; q++) {
+        const jb_question *question = &schema->questions[q];
+        if (!question->id.data || !question->id.length || !question->predicate.data ||
+            !question->predicate.length)
+            die("typed question needs id and predicate");
+        if (q)
+            db_ch(&out, ',');
+        char *id = xmalloc(question->id.length + 1);
+        memcpy(id, question->id.data, question->id.length);
+        id[question->id.length] = 0;
+        char *predicate = xmalloc(question->predicate.length + 1);
+        memcpy(predicate, question->predicate.data, question->predicate.length);
+        predicate[question->predicate.length] = 0;
+        db_json_string(&out, id, 0);
+        db_mem(&out, ":{\"type\":", 9);
+        const char *type = question->type == JB_DECISION_BOOLEAN  ? "noul"
+                           : question->type == JB_DECISION_CHOICE ? "choice"
+                                                                  : "score";
+        db_json_string(&out, type, 0);
+        db_mem(&out, ",\"instructions\":", 16);
+        db_json_string(&out, predicate, 0);
+        db_mem(&out, ",\"criteria\":", 12);
+        free(predicate);
+        free(id);
+        if (question->type == JB_DECISION_BOOLEAN) {
+            if (question->candidate_count != 2)
+                die("boolean question needs two candidates");
+            db_ch(&out, '{');
+        } else
+            db_ch(&out, question->type == JB_DECISION_CHOICE ? '{' : '[');
+        if (question->candidate_count < 2 || question->candidate_count > JB_MAX_CAND)
+            die("typed question candidate count out of range");
+        for (size_t c = 0; c < question->candidate_count; c++) {
+            const jb_candidate *candidate = &question->candidates[c];
+            if (c)
+                db_ch(&out, ',');
+            if (question->type != JB_DECISION_SCORE) {
+                const char *candidate_id = question->type == JB_DECISION_BOOLEAN
+                                               ? (c ? "false" : "true")
+                                               : candidate->id.data;
+                size_t candidate_length = question->type == JB_DECISION_BOOLEAN
+                                              ? strlen(candidate_id)
+                                              : candidate->id.length;
+                if (!candidate_id || !candidate_length)
+                    die("typed candidate needs id");
+                char *z = xmalloc(candidate_length + 1);
+                memcpy(z, candidate_id, candidate_length);
+                z[candidate_length] = 0;
+                db_json_string(&out, z, 0);
+                db_ch(&out, ':');
+                free(z);
+            }
+            char *description = xmalloc(candidate->description.length + 1);
+            if (candidate->description.length)
+                memcpy(description, candidate->description.data, candidate->description.length);
+            description[candidate->description.length] = 0;
+            db_json_string(&out, description, 0);
+            free(description);
+        }
+        db_ch(&out, question->type == JB_DECISION_SCORE ? ']' : '}');
+        db_ch(&out, '}');
+    }
+    db_ch(&out, '}');
+    *length = out.n;
+    return out.p;
+}
+
+jb_status jb_session_create_json(jb_model *model, const char *questions_json,
+                                 size_t questions_length, jb_session **out_session) {
+    if (!model || !out_session || (!questions_json && questions_length))
+        return jb_invalid("model, schema, and output pointer are required");
+    *out_session = NULL;
+    if (questions_length > JB_MAX_JSON)
+        return jb_invalid("schema JSON is too large");
+    jb_session *session = xcalloc(1, sizeof *session);
+    JBErrorFrame frame;
+    memset(&frame, 0, sizeof frame);
+    frame.previous = jb_error_frame;
+    frame.status = JB_ERROR_REQUEST;
+    jb_error_frame = &frame;
+    if (setjmp(frame.jump)) {
+        jb_error_frame = frame.previous;
+        free(session->questions_json);
+        free(session);
+        return frame.status;
+    }
+    session->model = model;
+    if (questions_json) {
+        int nt = 0;
+        JTok *tokens = json_tokens(questions_json, questions_length, &nt);
+        if (!nt || tokens[0].type != JT_OBJECT)
+            die("session schema must be a JSON object");
+        free(tokens);
+        session->questions_json = xmalloc(questions_length + 1);
+        memcpy(session->questions_json, questions_json, questions_length);
+        session->questions_json[questions_length] = 0;
+        session->questions_length = questions_length;
+    }
+    jb_error_frame = frame.previous;
+    *out_session = session;
+    jb_error_message[0] = 0;
+    return JB_OK;
+}
+
+jb_status jb_session_create(jb_model *model, const jb_schema *schema, jb_session **out_session) {
+    if (!model || !schema || !out_session)
+        return jb_invalid("model, typed schema, and output pointer are required");
+    JBErrorFrame frame;
+    memset(&frame, 0, sizeof frame);
+    frame.previous = jb_error_frame;
+    frame.status = JB_ERROR_REQUEST;
+    jb_error_frame = &frame;
+    if (setjmp(frame.jump)) {
+        jb_error_frame = frame.previous;
+        return frame.status;
+    }
+    size_t length = 0;
+    char *json = jb_schema_json(schema, &length);
+    if (!json) {
+        jb_error_frame = frame.previous;
+        return jb_invalid("typed schema is empty or invalid");
+    }
+    jb_status status = jb_session_create_json(model, json, length, out_session);
+    free(json);
+    jb_error_frame = frame.previous;
+    return status;
+}
+
+void jb_session_free(jb_session *session) {
+    if (!session)
+        return;
+    dg_workspace_destroy(&session->workspace);
+    dg_prefix_free(&session->prefix);
+    free(session->questions_json);
+    free(session);
+}
+
+static DGPrefixCache *jb_session_prefix(jb_session *session) {
+#ifdef __FAST_MATH__
+    (void)session;
+    return NULL;
+#else
+    return &session->prefix;
+#endif
+}
+
+jb_status jb_session_decide_json(jb_session *session, const char *request_json,
+                                 size_t request_length, char **out_json, size_t *out_length) {
+    if (!session || !request_json || !request_length || !out_json || !out_length)
+        return jb_invalid("session, request, and output pointers are required");
+    *out_json = NULL;
+    *out_length = 0;
+    JBErrorFrame frame;
+    memset(&frame, 0, sizeof frame);
+    frame.previous = jb_error_frame;
+    frame.status = JB_ERROR_REQUEST;
+    jb_error_frame = &frame;
+    if (setjmp(frame.jump)) {
+        jb_error_frame = frame.previous;
+#ifdef JB_PROFILE
+        jb_profile_hot = 0;
+#endif
+        session->workspace.active = 0;
+        session->workspace.kv_active = 0;
+        session->workspace.control_active = 0;
+        return frame.status;
+    }
+    dg_systemone(&session->model->model, &session->model->tokenizer, request_json, request_length,
+                 jb_session_prefix(session), &session->workspace, out_json, out_length);
+    jb_error_frame = frame.previous;
+    jb_error_message[0] = 0;
+    return JB_OK;
+}
+
+jb_status jb_session_decide_json_batch(jb_session *session, const char *const *request_json,
+                                       const size_t *request_lengths, size_t request_count,
+                                       char ***out_json, size_t **out_lengths) {
+    if (!session || !request_json || !request_lengths || !request_count || request_count > 16 ||
+        !out_json || !out_lengths)
+        return jb_invalid("batch arguments are invalid");
+    char **output = xcalloc(request_count, sizeof *output);
+    size_t *length = xcalloc(request_count, sizeof *length);
+    char **mutable_request = xmalloc(request_count * sizeof *mutable_request);
+    JBErrorFrame frame;
+    memset(&frame, 0, sizeof frame);
+    frame.previous = jb_error_frame;
+    frame.status = JB_ERROR_REQUEST;
+    jb_error_frame = &frame;
+    if (setjmp(frame.jump)) {
+        jb_error_frame = frame.previous;
+#ifdef JB_PROFILE
+        jb_profile_hot = 0;
+#endif
+        session->workspace.active = 0;
+        session->workspace.kv_active = 0;
+        session->workspace.control_active = 0;
+        for (size_t i = 0; i < request_count; i++)
+            free(output[i]);
+        free(mutable_request);
+        free(length);
+        free(output);
+        return frame.status;
+    }
+    for (size_t i = 0; i < request_count; i++) {
+        if (!request_json[i] || !request_lengths[i])
+            die("batch request is empty");
+        mutable_request[i] = (char *)request_json[i];
+    }
+    int batched = request_count > 1 &&
+                  dg_system_batch(&session->model->model, &session->model->tokenizer,
+                                  mutable_request, (size_t *)request_lengths, (int)request_count,
+                                  jb_session_prefix(session), &session->workspace, output, length);
+    if (!batched)
+        for (size_t i = 0; i < request_count; i++)
+            dg_systemone(&session->model->model, &session->model->tokenizer, request_json[i],
+                         request_lengths[i], jb_session_prefix(session), &session->workspace,
+                         &output[i], &length[i]);
+    free(mutable_request);
+    jb_error_frame = frame.previous;
+    *out_json = output;
+    *out_lengths = length;
+    jb_error_message[0] = 0;
+    return JB_OK;
+}
+
+void jb_free(void *allocation) {
+    free(allocation);
+}
+
+static double jb_token_double(const char *json, const JTok *token) {
+    char *end = NULL;
+    double value = strtod(json + token->start, &end);
+    if (end != json + token->end || !jb_finite(value))
+        die("invalid numeric result field");
+    return value;
+}
+
+static uint32_t jb_token_u32(const char *json, const JTok *token) {
+    double value = jb_token_double(json, token);
+    if (value < 0 || value > UINT32_MAX || value != floor(value))
+        die("invalid integer result field");
+    return (uint32_t)value;
+}
+
+static jb_string jb_result_string(const char *json, const JTok *token, char **cursor) {
+    char *decoded = jt_string(json, token);
+    size_t length = strlen(decoded);
+    memcpy(*cursor, decoded, length + 1);
+    jb_string result = {*cursor, length};
+    *cursor += length + 1;
+    free(decoded);
+    return result;
+}
+
+static jb_result *jb_result_parse(const char *json, size_t length) {
+    int nt = 0;
+    JTok *tokens = json_tokens(json, length, &nt);
+    int answers_at = jt_obj_get(json, tokens, nt, 0, "answers");
+    if (!nt || tokens[0].type != JT_OBJECT || answers_at < 0 ||
+        tokens[answers_at].type != JT_OBJECT)
+        die("invalid Jev Bush result");
+    int answer_keys[DG_MAX_QUESTIONS];
+    int answer_count = direct_keys(tokens, nt, answers_at, answer_keys, DG_MAX_QUESTIONS);
+    size_t probability_count = 0, string_bytes = 0;
+    for (int a = 0; a < answer_count; a++) {
+        int object = answer_keys[a] + 1;
+        int probabilities = jt_obj_get(json, tokens, nt, object, "probabilities");
+        if (probabilities < 0 || tokens[probabilities].type != JT_OBJECT)
+            die("result answer lacks probabilities");
+        string_bytes = jb_size_add(
+            string_bytes, (size_t)(tokens[answer_keys[a]].end - tokens[answer_keys[a]].start) + 1);
+        for (int i = probabilities + 1; i < nt && tokens[i].parent >= probabilities; i++)
+            if (tokens[i].parent == probabilities && tokens[i].type == JT_STRING) {
+                probability_count++;
+                string_bytes =
+                    jb_size_add(string_bytes, (size_t)(tokens[i].end - tokens[i].start) + 1);
+                i++;
+            }
+    }
+    size_t bytes = sizeof(jb_result);
+    bytes = jb_align_up(bytes, _Alignof(jb_answer));
+    size_t answers_offset = bytes;
+    bytes = jb_size_add(bytes, jb_size_mul((size_t)answer_count, sizeof(jb_answer)));
+    bytes = jb_align_up(bytes, _Alignof(jb_probability));
+    size_t probabilities_offset = bytes;
+    bytes = jb_size_add(bytes, jb_size_mul(probability_count, sizeof(jb_probability)));
+    size_t strings_offset = bytes;
+    bytes = jb_size_add(bytes, string_bytes);
+    jb_result *result = xcalloc(bytes, 1);
+    jb_answer *answers = (jb_answer *)((unsigned char *)result + answers_offset);
+    jb_probability *probability =
+        (jb_probability *)((unsigned char *)result + probabilities_offset);
+    char *strings = (char *)result + strings_offset;
+    result->answers = answers;
+    result->answer_count = (size_t)answer_count;
+    for (int a = 0; a < answer_count; a++) {
+        int object = answer_keys[a] + 1;
+        jb_answer *answer = &answers[a];
+        answer->id = jb_result_string(json, &tokens[answer_keys[a]], &strings);
+        int type = jt_obj_get(json, tokens, nt, object, "type");
+        char *type_name = type >= 0 ? jt_string(json, &tokens[type]) : NULL;
+        if (!type_name)
+            die("result answer lacks type");
+        answer->type = !strcmp(type_name, "noul")     ? JB_DECISION_BOOLEAN
+                       : !strcmp(type_name, "choice") ? JB_DECISION_CHOICE
+                                                      : JB_DECISION_SCORE;
+        free(type_name);
+        int probabilities = jt_obj_get(json, tokens, nt, object, "probabilities");
+        answer->probabilities = probability;
+        size_t count = 0, selected = 0;
+        double best = -1, expected = 0;
+        for (int i = probabilities + 1; i < nt && tokens[i].parent >= probabilities; i++)
+            if (tokens[i].parent == probabilities && tokens[i].type == JT_STRING) {
+                probability[count].candidate = jb_result_string(json, &tokens[i], &strings);
+                probability[count].probability = jb_token_double(json, &tokens[i + 1]);
+                expected += count * probability[count].probability;
+                if (probability[count].probability > best) {
+                    best = probability[count].probability;
+                    selected = count;
+                }
+                count++;
+                i++;
+            }
+        answer->probability_count = count;
+        answer->selected_candidate = selected;
+        answer->expected_score = expected;
+        int confidence_at = jt_obj_get(json, tokens, nt, object, "confidence");
+        if (confidence_at >= 0)
+            answer->confidence = jb_token_double(json, &tokens[confidence_at]);
+        probability += count;
+    }
+    int usage = jt_obj_get(json, tokens, nt, 0, "usage");
+    int timing = jt_obj_get(json, tokens, nt, 0, "timing_ms");
+    if (usage >= 0) {
+        int input = jt_obj_get(json, tokens, nt, usage, "input_tokens");
+        int prefill = jt_obj_get(json, tokens, nt, usage, "prefill_tokens");
+        if (input >= 0)
+            result->input_tokens = jb_token_u32(json, &tokens[input]);
+        if (prefill >= 0)
+            result->prefill_tokens = jb_token_u32(json, &tokens[prefill]);
+    }
+    if (timing >= 0) {
+        int total = jt_obj_get(json, tokens, nt, timing, "total");
+        int prefill = jt_obj_get(json, tokens, nt, timing, "prefill");
+        int candidates = jt_obj_get(json, tokens, nt, timing, "candidates");
+        if (total >= 0)
+            result->total_ms = jb_token_double(json, &tokens[total]);
+        if (prefill >= 0)
+            result->prefill_ms = jb_token_double(json, &tokens[prefill]);
+        if (candidates >= 0)
+            result->candidate_ms = jb_token_double(json, &tokens[candidates]);
+    }
+    free(tokens);
+    return result;
+}
+
+static char *jb_typed_request(const jb_session *session, const jb_input *input, size_t *length) {
+    if (!session->questions_json)
+        die("typed inference requires a typed or JSON session schema");
+    if (!input || !input->state_json.data || !input->state_json.length)
+        die("typed input needs state_json");
+    int nt = 0;
+    JTok *state = json_tokens(input->state_json.data, input->state_json.length, &nt);
+    if (!nt || state[0].parent != -1)
+        die("state_json must contain exactly one JSON value");
+    free(state);
+    DGBuf request = {0};
+    db_ch(&request, '{');
+    if (input->id.data && input->id.length) {
+        char *id = xmalloc(input->id.length + 1);
+        memcpy(id, input->id.data, input->id.length);
+        id[input->id.length] = 0;
+        db_mem(&request, "\"id\":", 5);
+        db_json_string(&request, id, 0);
+        db_ch(&request, ',');
+        free(id);
+    }
+    db_mem(&request, "\"state\":", 8);
+    db_mem(&request, input->state_json.data, input->state_json.length);
+    db_mem(&request, ",\"questions\":", 13);
+    db_mem(&request, session->questions_json, session->questions_length);
+    if (input->samples)
+        db_fmt(&request, ",\"samples\":%u", input->samples);
+    db_ch(&request, '}');
+    *length = request.n;
+    return request.p;
+}
+
+jb_status jb_session_decide(jb_session *session, const jb_input *input, jb_result **out_result) {
+    if (!session || !input || !out_result)
+        return jb_invalid("session, input, and output pointer are required");
+    *out_result = NULL;
+    JBErrorFrame frame;
+    memset(&frame, 0, sizeof frame);
+    frame.previous = jb_error_frame;
+    frame.status = JB_ERROR_REQUEST;
+    jb_error_frame = &frame;
+    if (setjmp(frame.jump)) {
+        jb_error_frame = frame.previous;
+        return frame.status;
+    }
+    size_t request_length = 0, output_length = 0;
+    char *request = jb_typed_request(session, input, &request_length), *output = NULL;
+    jb_status status =
+        jb_session_decide_json(session, request, request_length, &output, &output_length);
+    free(request);
+    if (status != JB_OK) {
+        jb_error_frame = frame.previous;
+        return status;
+    }
+    *out_result = jb_result_parse(output, output_length);
+    free(output);
+    jb_error_frame = frame.previous;
+    return JB_OK;
+}
+
+jb_status jb_session_decide_batch(jb_session *session, const jb_input *inputs, size_t input_count,
+                                  jb_result ***out_results) {
+    if (!session || !inputs || !input_count || input_count > 16 || !out_results)
+        return jb_invalid("typed batch arguments are invalid");
+    *out_results = NULL;
+    JBErrorFrame frame;
+    memset(&frame, 0, sizeof frame);
+    frame.previous = jb_error_frame;
+    frame.status = JB_ERROR_REQUEST;
+    jb_error_frame = &frame;
+    if (setjmp(frame.jump)) {
+        jb_error_frame = frame.previous;
+        return frame.status;
+    }
+    char **request = xcalloc(input_count, sizeof *request);
+    size_t *request_length = xcalloc(input_count, sizeof *request_length);
+    for (size_t i = 0; i < input_count; i++)
+        request[i] = jb_typed_request(session, &inputs[i], &request_length[i]);
+    char **output = NULL;
+    size_t *output_length = NULL;
+    jb_status status =
+        jb_session_decide_json_batch(session, (const char *const *)request, request_length,
+                                     input_count, &output, &output_length);
+    for (size_t i = 0; i < input_count; i++)
+        free(request[i]);
+    free(request_length);
+    free(request);
+    if (status != JB_OK) {
+        jb_error_frame = frame.previous;
+        return status;
+    }
+    jb_result **result = xcalloc(input_count, sizeof *result);
+    for (size_t i = 0; i < input_count; i++) {
+        result[i] = jb_result_parse(output[i], output_length[i]);
+        free(output[i]);
+    }
+    free(output_length);
+    free(output);
+    *out_results = result;
+    jb_error_frame = frame.previous;
+    return JB_OK;
+}
+
+void jb_result_free(jb_result *result) {
+    free(result);
+}
+
+void jb_results_free(jb_result **results, size_t count) {
+    if (!results)
+        return;
+    for (size_t i = 0; i < count; i++)
+        jb_result_free(results[i]);
+    free(results);
+}
+
+#ifndef JB_NO_MAIN
 static int dg_decide_file(const char *dir, const char *path) {
     size_t n;
     char *j = read_all(path, &n);
-    DGModel m;
-    DGTokenizer t;
-    dg_load(&m, dir);
-    dgt_load(&t, dir);
-    int rc = dg_systemone(&m, &t, j, n, NULL, NULL);
-    dgt_free(&t);
-    dg_free(&m);
+    jb_model *model = NULL;
+    jb_session *session = NULL;
+    char *output = NULL;
+    size_t output_length = 0;
+    if (jb_model_load(dir, &model) != JB_OK ||
+        jb_session_create_json(model, NULL, 0, &session) != JB_OK ||
+        jb_session_decide_json(session, j, n, &output, &output_length) != JB_OK)
+        die(jb_last_error());
+    if (fwrite(output, 1, output_length, stdout) != output_length || putchar('\n') == EOF)
+        die("cannot write output");
+    jb_free(output);
+    jb_session_free(session);
+    jb_model_free(model);
     free(j);
-    return rc;
+    return 0;
 }
 
-static void dg_eval_group(DGModel *m, DGTokenizer *t, char **row, size_t *len, int n,
-                          DGPrefixCache *cache) {
-    if (n > 1 && dg_system_batch(m, t, row, len, n, cache))
-        return;
-    for (int i = 0; i < n; i++)
-        dg_systemone(m, t, row[i], len[i], NULL, cache);
+static void dg_eval_group(jb_session *session, char **row, size_t *len, int n) {
+    char **output = NULL;
+    size_t *output_length = NULL;
+    if (jb_session_decide_json_batch(session, (const char *const *)row, len, (size_t)n, &output,
+                                     &output_length) != JB_OK)
+        die(jb_last_error());
+    for (int i = 0; i < n; i++) {
+        if (fwrite(output[i], 1, output_length[i], stdout) != output_length[i] ||
+            putchar('\n') == EOF)
+            die("cannot write output");
+        jb_free(output[i]);
+    }
+    jb_free(output_length);
+    jb_free(output);
+    flush_output();
 }
 
 static int dg_eval_file(const char *dir, const char *path) {
@@ -3701,9 +4696,8 @@ static int dg_eval_file(const char *dir, const char *path) {
     if (f == stdin && _setmode(_fileno(stdin), _O_BINARY) < 0)
         die("cannot set binary stdin");
 #endif
-    DGModel m;
-    DGTokenizer t;
-    DGPrefixCache cache = {0};
+    jb_model *model = NULL;
+    jb_session *session = NULL;
     int mb = 1;
     const char *me = getenv("JB_MICROBATCH");
     if (me) {
@@ -3713,13 +4707,9 @@ static int dg_eval_file(const char *dir, const char *path) {
             die("JB_MICROBATCH must be 1..16");
         mb = (int)v;
     }
-#ifdef __FAST_MATH__
-    DGPrefixCache *cachep = NULL;
-#else
-    DGPrefixCache *cachep = &cache;
-#endif
-    dg_load(&m, dir);
-    dgt_load(&t, dir);
+    if (jb_model_load(dir, &model) != JB_OK ||
+        jb_session_create_json(model, NULL, 0, &session) != JB_OK)
+        die(jb_last_error());
     char *line = NULL, **rows = xcalloc((size_t)mb, sizeof *rows);
     size_t cap = 0, n = 0, *lens = xcalloc((size_t)mb, sizeof *lens);
     int nr = 0, ch;
@@ -3732,7 +4722,7 @@ static int dg_eval_file(const char *dir, const char *path) {
                 memcpy(rows[nr], line, n);
                 lens[nr++] = n;
                 if (nr == mb) {
-                    dg_eval_group(&m, &t, rows, lens, nr, cachep);
+                    dg_eval_group(session, rows, lens, nr);
                     for (int i = 0; i < nr; i++)
                         free(rows[i]);
                     nr = 0;
@@ -3759,7 +4749,7 @@ static int dg_eval_file(const char *dir, const char *path) {
         lens[nr++] = n;
     }
     if (nr) {
-        dg_eval_group(&m, &t, rows, lens, nr, cachep);
+        dg_eval_group(session, rows, lens, nr);
         for (int i = 0; i < nr; i++)
             free(rows[i]);
     }
@@ -3768,9 +4758,8 @@ static int dg_eval_file(const char *dir, const char *path) {
     free(line);
     if (f != stdin)
         fclose(f);
-    dg_prefix_free(&cache);
-    dgt_free(&t);
-    dg_free(&m);
+    jb_session_free(session);
+    jb_model_free(model);
     return 0;
 }
 
@@ -4125,6 +5114,67 @@ static int bench_kernels(void) {
 }
 
 static int selftest(void) {
+    size_t arena_bytes = 0;
+    jb_workspace_plan(&arena_bytes, 7, sizeof(char));
+    jb_workspace_plan(&arena_bytes, 3, sizeof(uint32_t));
+    JBArena arena;
+    jb_arena_init(&arena, arena_bytes);
+    unsigned char *arena_bytes_out = jb_arena_alloc(&arena, 7, sizeof *arena_bytes_out, 0);
+    uint32_t *arena_words = jb_arena_alloc(&arena, 3, sizeof *arena_words, 1);
+    if ((uintptr_t)arena_bytes_out % 64 || (uintptr_t)arena_words % 64 || arena_words[0] ||
+        arena_words[1] || arena_words[2] || arena.peak != arena.size)
+        die("arena self-test failed");
+    jb_arena_reset(&arena, 0);
+    jb_arena_free(&arena);
+
+    DGWorkspace reuse = {0};
+    JBArena *first = dg_workspace_begin(&reuse, 128);
+    (void)jb_arena_alloc(first, 128, 1, 0);
+    jb_arena_reset(first, 0);
+    dg_workspace_end(&reuse);
+    void *first_allocation = reuse.arena.allocation;
+    JBArena *second = dg_workspace_begin(&reuse, 64);
+    (void)jb_arena_alloc(second, 64, 1, 0);
+    jb_arena_reset(second, 0);
+    dg_workspace_end(&reuse);
+    if (reuse.arena.allocation != first_allocation || reuse.capacity != 128)
+        die("workspace reuse self-test failed");
+    JBArena *grown = dg_workspace_begin(&reuse, 256);
+    (void)jb_arena_alloc(grown, 256, 1, 0);
+    jb_arena_reset(grown, 0);
+    dg_workspace_end(&reuse);
+    if (reuse.capacity != 256)
+        die("workspace growth self-test failed");
+
+    JBArena *control = dg_control_begin(&reuse, 128);
+    (void)jb_arena_alloc(control, 128, 1, 0);
+    dg_control_end(&reuse);
+    void *control_allocation = reuse.control_arena.allocation;
+    control = dg_control_begin(&reuse, 64);
+    (void)jb_arena_alloc(control, 64, 1, 0);
+    dg_control_end(&reuse);
+    if (reuse.control_arena.allocation != control_allocation || reuse.control_capacity != 128)
+        die("control workspace reuse self-test failed");
+
+    DGKV kv_test[DG_L * 2] = {0};
+    int kv_lengths[2] = {2, 3};
+    dg_worker_kv_begin(&reuse, kv_test, 2, kv_lengths);
+    void *kv_allocation = reuse.kv_arena.allocation;
+    for (int d = 0; d < 2; d++)
+        for (int l = 0; l < DG_L; l++) {
+            DGKV *one = &kv_test[d * DG_L + l];
+            size_t last = (size_t)one->n * dg_kv_width(l) - 1;
+            one->k[0] = (float)(d + l);
+            one->v[last] = (float)(d - l);
+        }
+    dg_worker_kv_end(&reuse, kv_test, 2);
+    int shorter = 1;
+    dg_worker_kv_begin(&reuse, kv_test, 1, &shorter);
+    if (reuse.kv_arena.allocation != kv_allocation)
+        die("K/V workspace reuse self-test failed");
+    dg_worker_kv_end(&reuse, kv_test, 1);
+    dg_workspace_destroy(&reuse);
+
     uint8_t sh[32], sha_abc[32] = {0xba, 0x78, 0x16, 0xbf, 0x8f, 0x01, 0xcf, 0xea, 0x41, 0x41, 0x40,
                                    0xde, 0x5d, 0xae, 0x22, 0x23, 0xb0, 0x03, 0x61, 0xa3, 0x96, 0x17,
                                    0x7a, 0x9c, 0xb4, 0x10, 0xff, 0x61, 0xf2, 0x00, 0x15, 0xad};
@@ -4207,6 +5257,31 @@ static int selftest(void) {
         tokens[candidates].type != JT_ARRAY || tokens[candidates].size != 2)
         die("JSON self-test failed");
     free(tokens);
+    static const char result_json[] =
+        "{\"answers\":{\"ok\":{\"type\":\"noul\",\"probabilities\":{\"true\":0.75,"
+        "\"false\":0.25},\"confidence\":0.5}},\"usage\":{\"input_tokens\":7,"
+        "\"prefill_tokens\":3},\"timing_ms\":{\"total\":2.5,\"prefill\":1.5,"
+        "\"candidates\":0.25}}";
+    jb_result *public_result = jb_result_parse(result_json, sizeof result_json - 1);
+    if (public_result->answer_count != 1 || public_result->answers[0].probability_count != 2 ||
+        public_result->answers[0].probabilities[0].probability != 0.75 ||
+        public_result->answers[0].selected_candidate != 0 || public_result->input_tokens != 7 ||
+        public_result->prefill_tokens != 3 || public_result->total_ms != 2.5)
+        die("public result self-test failed");
+    jb_result_free(public_result);
+    jb_model dummy_model = {0};
+    jb_session *public_session = NULL;
+    if (jb_session_create_json(&dummy_model, "[]", 2, &public_session) != JB_ERROR_REQUEST ||
+        public_session)
+        die("public schema error self-test failed");
+    if (jb_session_create_json(&dummy_model, "{}", 2, &public_session) != JB_OK)
+        die("public session self-test failed");
+    const jb_input invalid_input = {{NULL, 0}, {"{", 1}, 0};
+    jb_result *invalid_result = NULL;
+    if (jb_session_decide(public_session, &invalid_input, &invalid_result) != JB_ERROR_REQUEST ||
+        invalid_result)
+        die("public request error self-test failed");
+    jb_session_free(public_session);
     dg_kernel_selftest();
     puts("{\"selftest\":\"ok\"}");
     return 0;
@@ -4247,3 +5322,4 @@ int main(int ac, char **av) {
     usage();
     return 2;
 }
+#endif

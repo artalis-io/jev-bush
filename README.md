@@ -99,11 +99,59 @@ The AVX2 tier covers NVFP4 expert projections, BF16 matrices, RMS normalization,
 and attention dot products. The scalar reference and AVX-512 implementations
 remain separately compiled and checked by the same self-test.
 
+### C library API
+
+[`jb.h`](jb.h) exposes opaque model and session handles, typed
+decisions, typed batches, and JSON compatibility calls. Build the engine without
+its CLI entry point and link it into an application:
+
+```sh
+cc -O3 -march=native -std=c11 -Wall -Wextra -pedantic -fopenmp \
+  -DJB_NO_MAIN -c jb.c -o jb.o
+ar rcs libjb.a jb.o
+cc -O3 -march=native -std=c11 -Wall -Wextra -pedantic -fopenmp \
+  examples/library.c libjb.a -lm -o jb-library-example
+```
+
+The normal `jb.c` build still contains the CLI, but the CLI is itself a client
+of `jb_model_load()`, `jb_session_create_json()`, and the session JSON decision
+calls. There is no separate privileged inference route.
+
+A `jb_model` is immutable after loading and may be shared by multiple sessions.
+A `jb_session` owns one worker's schema-prefix cache, inference workspace, K/V
+storage, and microbatch controls. A session is deliberately single-threaded;
+create one session per concurrent worker. Inputs are borrowed for the duration
+of a call. Typed results use one contiguous library allocation and are released
+with `jb_result_free()`. JSON buffers and JSON batch arrays are released with
+`jb_free()`.
+
+Typed sessions copy their decision schema at creation. `jb_session_decide()`
+accepts a JSON state value plus an optional stable identifier. The equivalent
+`jb_session_decide_json()` accepts the complete OpenJev request shape and
+returns its deterministic machine-readable result. Batch variants preserve
+input order and use the existing cross-document microbatch path when the exact
+schema prefix permits it. See [`examples/library.c`](examples/library.c)
+for a complete typed example.
+
 Internally, model execution uses one small `DGKernelOps` table for BF16 GEMM,
 NVFP4 quantization/GEMM, RMS normalization, and attention dots. Scalar, AVX2,
 and AVX-512 differ only behind that boundary; inference, validation, benchmarks,
 and JSON output contain no ISA dispatch branches. Selection remains compile-time
 so the portable build does not require runtime CPU detection.
+
+Weights stay memory-mapped. Each evaluation worker owns one checked,
+64-byte-aligned, grow-only inference workspace. Prefill, cached suffixes,
+repeated canvas reads, candidate scoring, and document microbatches reset and
+reuse it; only a later request with a larger high-water requirement reallocates
+it. A second grow-only worker slab holds all per-request K/V layers and
+documents contiguously. A third, much smaller slab reuses the microbatch token,
+descriptor, and attention-control arrays. Every operation is constrained to an
+exact plan derived from its token and batch shape. The immutable schema-prefix
+cache owns separate exact metadata and K/V slabs because it outlives worker
+resets. This makes the ownership boundary explicit without copying model
+weights or hiding persistent state in a general-purpose allocator. `JB_PROFILE`
+reports `hot_alloc_calls`; after initial worker growth, an exact-prefix cache
+hit should report zero.
 
 For Linux release builds, use the hardened command below. These flags are part
 of the release contract rather than an optional deployment tweak; they do not
@@ -172,8 +220,8 @@ For operation-level profiling, add `-DJB_PROFILE`. Each request then emits one
 timing line to standard error for attention, dense FFN, routing, MoE experts,
 expert input/hidden QDQ, gate/up/down projections, expert activation and
 miscellaneous expert work, remaining FFN work, prompt composition, OpenMP
-region count, and allocation time. Normal JSONL on standard output is
-unchanged.
+region count, total and hot-path allocation counts, allocation time, workspace
+capacity, and active K/V size. Normal JSONL on standard output is unchanged.
 
 Generate one-state/many-predicate scaling requests from any OpenJev row with:
 
