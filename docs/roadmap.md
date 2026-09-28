@@ -439,3 +439,31 @@ which optimizations matter, and where the remaining hardware boundary lies.
 
 The project remains one model, one hypothesis, one C inference engine, and a
 reproducible evaluation path.
+
+## 9. CPU-native quantization gate
+
+The first CPU-native quantization experiment is implemented in
+`--bench-kernels` rather than wired into inference. It converts the existing
+NVFP4 expert weights to symmetric linear INT4 in 32-value blocks, quantizes
+activations to blockwise INT8, and executes an AVX2 INT16/INT32 dot-product
+kernel. At model expert shapes it reaches 33.7 GFLOP/s at one token and 53.2
+GFLOP/s at 64 tokens, versus 10.2 and 29.1 for the strict NVFP4 kernel.
+
+That speed does not pass the numerical gate. Requantizing weights that are
+already E2M1 produces 14.46% relative matrix-output RMSE and a 14.18 maximum
+absolute error on the deterministic fixture. Building a roughly model-sized
+`.jbc` cache or running OpenJev with this representation is therefore rejected:
+the primitive mismatch is already substantially beyond an acceptable inference
+perturbation.
+
+A second kernel preserves the original packed E2M1 weight codes and activation
+codes exactly, using integer dot products with the original block scales. It
+matches strict NVFP4 to 7.16e-7 relative RMSE, with differences attributable to
+accumulation order, but reaches only 29.9 GFLOP/s at 64 tokens and is slower at
+one token. The current register-decoded NVFP4 kernel is already near the useful
+AVX2 ceiling for this representation.
+
+The result keeps NVFP4 plus BF16 as canonical CPU execution formats for this
+model. A persistent transformed cache is deferred until a representation shows
+both meaningful kernel speedup and acceptable primitive accuracy; storage
+compactness alone is not sufficient.

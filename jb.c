@@ -60,6 +60,7 @@ typedef struct {
     uint64_t prompt_tokens, system_tokens, state_tokens;
     uint64_t omp_regions, alloc_calls, alloc_ns;
 } JBProfile;
+
 static JBProfile jb_profile;
 #define JB_TICK(name) uint64_t name = now_ns()
 #define JB_TO(field, name) (jb_profile.field += now_ns() - (name))
@@ -75,9 +76,11 @@ typedef struct {
     char *s;
     uint32_t n;
 } Vocab;
+
 typedef struct {
     uint32_t a, b, rank;
 } Merge;
+
 typedef struct {
     uint8_t *map;
     uint64_t size;
@@ -86,19 +89,24 @@ typedef struct {
     HANDLE hf, hm;
 #endif
 } FileMap;
+
 typedef struct {
     int *v;
     uint32_t n, cap;
 } Tokens;
+
 static uint64_t now_ns(void);
+
 static void die(const char *s) {
     fprintf(stderr, "jb: %s\n", s);
     exit(2);
 }
+
 static void die2(const char *a, const char *b) {
     fprintf(stderr, "jb: %s: %s\n", a, b);
     exit(2);
 }
+
 static void *xmalloc(size_t n) {
 #ifdef JB_PROFILE
     uint64_t start = now_ns();
@@ -112,6 +120,7 @@ static void *xmalloc(size_t n) {
         die("out of memory");
     return p;
 }
+
 static void *xcalloc(size_t n, size_t z) {
 #ifdef JB_PROFILE
     uint64_t start = now_ns();
@@ -125,12 +134,14 @@ static void *xcalloc(size_t n, size_t z) {
         die("out of memory");
     return p;
 }
+
 static char *xstrdup(const char *s) {
     size_t n = strlen(s) + 1;
     char *z = xmalloc(n);
     memcpy(z, s, n);
     return z;
 }
+
 static void *xrealloc(void *p, size_t n) {
 #ifdef JB_PROFILE
     uint64_t start = now_ns();
@@ -144,6 +155,7 @@ static void *xrealloc(void *p, size_t n) {
         die("out of memory");
     return p;
 }
+
 /* Bit-level finiteness tests: -ffast-math lets the compiler assume NaN and
  * infinity never occur, which can fold isfinite() and NaN comparisons away. */
 static int jb_finitef(float x) {
@@ -151,11 +163,13 @@ static int jb_finitef(float x) {
     memcpy(&u, &x, sizeof u);
     return (u & 0x7f800000u) != 0x7f800000u;
 }
+
 static int jb_finite(double x) {
     uint64_t u;
     memcpy(&u, &x, sizeof u);
     return (u & 0x7ff0000000000000ull) != 0x7ff0000000000000ull;
 }
+
 /* Threads OpenMP will use for parallel regions; 1 without OpenMP. */
 static int jb_threads(void) {
 #ifdef _OPENMP
@@ -164,6 +178,7 @@ static int jb_threads(void) {
     return 1;
 #endif
 }
+
 static void jb_path(char *out, size_t cap, const char *fmt, ...) {
     va_list a;
     va_start(a, fmt);
@@ -172,11 +187,13 @@ static void jb_path(char *out, size_t cap, const char *fmt, ...) {
     if (n < 0 || (size_t)n >= cap)
         die("model path too long");
 }
+
 static uint64_t now_ns(void) {
     struct timespec t;
     timespec_get(&t, TIME_UTC);
     return (uint64_t)t.tv_sec * 1000000000ull + t.tv_nsec;
 }
+
 static void map_file(FileMap *m, const char *path) {
 #if defined(_WIN32)
     LARGE_INTEGER z;
@@ -218,6 +235,7 @@ static void map_file(FileMap *m, const char *path) {
         fclose(f);
     }
 }
+
 static void unmap_file(FileMap *m) {
 #if defined(_WIN32)
     if (m->mapped)
@@ -242,6 +260,7 @@ static int cmp_vocab(const void *a, const void *b) {
     int c = memcmp(x->s, y->s, n);
     return c ? c : (x->n > y->n) - (x->n < y->n);
 }
+
 static int cmp_merge(const void *a, const void *b) {
     const Merge *x = a, *y = b;
     return x->a != y->a ? (x->a > y->a) - (x->a < y->a) : (x->b > y->b) - (x->b < y->b);
@@ -254,6 +273,7 @@ static void push(Tokens *t, int x) {
     }
     t->v[t->n++] = x;
 }
+
 static int put_utf8(uint32_t c, char *z) {
     if (c <= 0x7f) {
         z[0] = (char)c;
@@ -276,6 +296,7 @@ static int put_utf8(uint32_t c, char *z) {
     z[3] = (char)(0x80 | (c & 63));
     return 4;
 }
+
 static uint32_t next_cp(const unsigned char *s, size_t n, size_t *i) {
     size_t p = (*i)++;
     uint32_t c = s[p];
@@ -296,17 +317,22 @@ static uint32_t next_cp(const unsigned char *s, size_t n, size_t *i) {
         die("invalid UTF-8");
     return v;
 }
+
 enum { JT_UNDEF, JT_OBJECT, JT_ARRAY, JT_STRING, JT_PRIMITIVE };
+
 typedef struct {
     int type, start, end, parent, size;
 } JTok;
+
 typedef struct {
     const char *s;
     size_t n, pos;
     JTok *t;
     int nt, cap, depth;
 } JParser;
+
 static char *jt_string(const char *j, const JTok *t);
+
 static int jt_new(JParser *p, int type, int start, int parent) {
     if (p->nt == p->cap) {
         p->cap = p->cap ? p->cap * 2 : 256;
@@ -318,7 +344,9 @@ static int jt_new(JParser *p, int type, int start, int parent) {
         p->t[parent].size++;
     return i;
 }
+
 static int json_parse_value(JParser *p, int parent);
+
 static int json_primitive_valid(const char *s, size_t n) {
     if ((n == 4 && (!memcmp(s, "true", 4) || !memcmp(s, "null", 4))) ||
         (n == 5 && !memcmp(s, "false", 5)))
@@ -356,6 +384,7 @@ static int json_primitive_valid(const char *s, size_t n) {
     }
     return i == n;
 }
+
 static int json_parse_string_tok(JParser *p, int parent) {
     int i = jt_new(p, JT_STRING, (int)++p->pos, parent);
     while (p->pos < p->n) {
@@ -380,6 +409,7 @@ static int json_parse_string_tok(JParser *p, int parent) {
     die("unterminated JSON string");
     return -1;
 }
+
 static int json_parse_value(JParser *p, int parent) {
     while (p->pos < p->n && isspace((unsigned char)p->s[p->pos]))
         p->pos++;
@@ -431,9 +461,11 @@ static int json_parse_value(JParser *p, int parent) {
         die("bad JSON primitive");
     return i;
 }
+
 static int cmp_str(const void *a, const void *b) {
     return strcmp(*(char *const *)a, *(char *const *)b);
 }
+
 /* Duplicate keys are rejected: lookups would take the first value where
  * Python's json keeps the last, and canonical seeds would diverge. */
 static void json_check_keys(const char *s, const JTok *t, int nt) {
@@ -462,6 +494,7 @@ static void json_check_keys(const char *s, const JTok *t, int nt) {
     }
     free(keys);
 }
+
 static JTok *json_tokens(const char *s, size_t n, int *nt) {
     JParser p = {s, n, 0, 0, 0, 0, 0};
     json_parse_value(&p, -1);
@@ -473,6 +506,7 @@ static JTok *json_tokens(const char *s, size_t n, int *nt) {
     *nt = p.nt;
     return p.t;
 }
+
 static int jt_eq(const char *j, const JTok *t, const char *z) {
     if (t->type != JT_STRING)
         return 0;
@@ -484,10 +518,12 @@ static int jt_eq(const char *j, const JTok *t, const char *z) {
     free(s);
     return eq;
 }
+
 static int jt_literal(const char *j, const JTok *t, const char *z) {
     return t->type == JT_PRIMITIVE && t->end - t->start == (int)strlen(z) &&
            !memcmp(j + t->start, z, strlen(z));
 }
+
 static int jt_obj_get(const char *j, JTok *t, int nt, int obj, const char *key) {
     if (obj < 0 || obj >= nt || t[obj].type != JT_OBJECT)
         return -1;
@@ -502,6 +538,7 @@ static int jt_obj_get(const char *j, JTok *t, int nt, int obj, const char *key) 
     }
     return -1;
 }
+
 static int jt_nonnegative_int(const char *j, const JTok *t, const char *name) {
     if (t->type != JT_PRIMITIVE || t->end <= t->start || t->end - t->start > 9)
         die2("expected non-negative integer", name);
@@ -518,12 +555,14 @@ typedef struct {
     FileMap file;
     char path[768];
 } DGShard;
+
 typedef struct {
     char *name;
     const uint8_t *data;
     uint64_t shape[4], bytes;
     int nd, dtype;
 } DGTensor;
+
 typedef struct {
     const char *name;
     void (*nvfp4_qdq)(float *, const float *, int, int, float);
@@ -534,10 +573,13 @@ typedef struct {
     void (*rms)(float *, const float *, const DGTensor *, int);
     double (*dot)(const float *, const float *, int);
 } DGKernelOps;
+
 static const DGKernelOps *dg_kernels(void);
+
 typedef struct {
     DGTensor *wg, *sg, *gg, *ag, *wu, *su, *gu, *wd, *sd, *gd, *ad;
 } DGNvExpert;
+
 typedef struct {
     DGShard shard[11];
     DGTensor *tensor;
@@ -548,6 +590,7 @@ typedef struct {
 } DGModel;
 
 enum { DG_UNKNOWN = -1, DG_BF16, DG_U8, DG_F8E4M3, DG_F32 };
+
 static uint64_t dg_item(int dtype) {
     return dtype == DG_BF16 ? 2 : dtype == DG_F32 ? 4 : 1;
 }
@@ -572,6 +615,7 @@ static uint64_t jt_u64(const char *j, const JTok *t, const char *name) {
     }
     return v;
 }
+
 static void dg_push_tensor(DGModel *m, DGTensor t) {
     if (m->nt == m->cap) {
         m->cap = m->cap ? m->cap * 2 : 1024;
@@ -579,14 +623,17 @@ static void dg_push_tensor(DGModel *m, DGTensor t) {
     }
     m->tensor[m->nt++] = t;
 }
+
 static int dg_tensor_cmp(const void *a, const void *b) {
     const DGTensor *x = a, *y = b;
     return strcmp(x->name, y->name);
 }
+
 static int dg_is_text(const char *name) {
     return !strncmp(name, "model.decoder.", 14) ||
            (!strncmp(name, "model.encoder.language_model.", 29) && strstr(name, ".layer_scalar"));
 }
+
 static void dg_parse_shard(DGModel *m, int si, const char *dir) {
     DGShard *s = &m->shard[si];
     jb_path(s->path, sizeof s->path, "%s/model-%05d-of-%05d.safetensors", dir, si + 1, m->nshard);
@@ -674,6 +721,7 @@ static void dg_parse_shard(DGModel *m, int si, const char *dir) {
     }
     free(tok);
 }
+
 static DGTensor *dg_tensor(DGModel *m, const char *name) {
     DGTensor key = {0};
     key.name = (char *)name;
@@ -683,11 +731,13 @@ static DGTensor *dg_tensor(DGModel *m, const char *name) {
     die2("missing DiffusionGemma tensor", name);
     return NULL;
 }
+
 static DGTensor *dg_expert_tensor(DGModel *m, int l, int e, const char *tail) {
     char n[192];
     snprintf(n, sizeof n, "model.decoder.layers.%d.experts.%d.%s", l, e, tail);
     return dg_tensor(m, n);
 }
+
 static void dg_expect(DGModel *m, const char *name, int dtype, int nd, uint64_t a, uint64_t b,
                       uint64_t c) {
     DGTensor *t = dg_tensor(m, name);
@@ -703,23 +753,27 @@ static void dg_expect(DGModel *m, const char *name, int dtype, int nd, uint64_t 
     if (t->bytes != n * dg_item(dtype))
         die2("unexpected DiffusionGemma tensor byte size", name);
 }
+
 /* Vectors are read as exactly `count` elements; their rank is not relied on. */
 static void dg_expect_count(DGModel *m, const char *name, int dtype, uint64_t count) {
     DGTensor *t = dg_tensor(m, name);
     if (t->dtype != dtype || t->bytes != count * dg_item(dtype))
         die2("unexpected DiffusionGemma tensor size", name);
 }
+
 static void dg_expect_layer(DGModel *m, int l, const char *tail, int nd, uint64_t a, uint64_t b,
                             uint64_t c) {
     char n[192];
     jb_path(n, sizeof n, "model.decoder.layers.%d.%s", l, tail);
     dg_expect(m, n, DG_BF16, nd, a, b, c);
 }
+
 static void dg_expect_layer_count(DGModel *m, int l, const char *tail, uint64_t count) {
     char n[192];
     jb_path(n, sizeof n, "model.decoder.layers.%d.%s", l, tail);
     dg_expect_count(m, n, DG_BF16, count);
 }
+
 static void dg_load(DGModel *m, const char *dir) {
     memset(m, 0, sizeof *m);
     char probe[768];
@@ -804,6 +858,7 @@ static void dg_load(DGModel *m, const char *dir) {
             }
     }
 }
+
 static void dg_free(DGModel *m) {
     for (size_t i = 0; i < m->nt; i++)
         free(m->tensor[i].name);
@@ -817,10 +872,12 @@ static Vocab *dgt_vfind(DGTokenizer *d, const char *s, size_t n) {
     Vocab k = {0, (char *)s, (uint32_t)n};
     return bsearch(&k, d->vocab, d->nv, sizeof *d->vocab, cmp_vocab);
 }
+
 static Merge *dgt_mfind(DGTokenizer *d, uint32_t a, uint32_t b) {
     Merge k = {a, b, 0};
     return bsearch(&k, d->merge, d->nm, sizeof *d->merge, cmp_merge);
 }
+
 static char *read_whole(const char *path, size_t *n) {
     FILE *f = fopen(path, "rb");
     if (!f)
@@ -833,6 +890,7 @@ static char *read_whole(const char *path, size_t *n) {
     p[*n] = 0;
     return p;
 }
+
 static void dgt_load(DGTokenizer *d, const char *dir) {
     memset(d, 0, sizeof *d);
     char path[768];
@@ -936,6 +994,7 @@ static void dgt_load(DGTokenizer *d, const char *dir) {
     free(t);
     free(j);
 }
+
 static void dgt_free(DGTokenizer *d) {
     for (uint32_t i = 0; i < d->nv; i++)
         free(d->vocab[i].s);
@@ -944,12 +1003,15 @@ static void dgt_free(DGTokenizer *d) {
     free(d->merge);
     free(d->special);
 }
+
 typedef struct {
     uint32_t rank, pos, a, b;
 } DGBpeCand;
+
 static int dgt_bpe_less(const DGBpeCand *x, const DGBpeCand *y) {
     return x->rank != y->rank ? x->rank < y->rank : x->pos < y->pos;
 }
+
 static void dgt_bpe_push(DGTokenizer *d, DGBpeCand *heap, size_t *nh, const uint32_t *ids,
                          uint32_t i, uint32_t j) {
     Merge *m = dgt_mfind(d, ids[i], ids[j]);
@@ -964,6 +1026,7 @@ static void dgt_bpe_push(DGTokenizer *d, DGBpeCand *heap, size_t *nh, const uint
         at = (at - 1) / 2;
     }
 }
+
 static void dgt_piece(DGTokenizer *d, const char *s, size_t n, Tokens *out) {
     uint32_t *ids = xmalloc((n ? n : 1) * sizeof *ids);
     uint32_t k = 0;
@@ -1043,6 +1106,7 @@ static void dgt_piece(DGTokenizer *d, const char *s, size_t n, Tokens *out) {
     free(next);
     free(ids);
 }
+
 static Tokens dgt_tokenize(DGTokenizer *d, const char *s) {
     Tokens out = {0};
     size_t n = strlen(s), plain = 0, i = 0;
@@ -1091,6 +1155,7 @@ static Tokens dgt_tokenize(DGTokenizer *d, const char *s) {
     }
     return out;
 }
+
 #define DG_H 2816
 #define DG_L 30
 #define DG_HEADS 16
@@ -1098,19 +1163,23 @@ static Tokens dgt_tokenize(DGTokenizer *d, const char *s) {
 #define DG_DENSE 2112
 #define DG_MOE 704
 #define DG_TOPK 8
+
 typedef struct {
     float *k, *v;
     int n;
 } DGKV;
+
 typedef struct {
     char *schema;
     int *ids, n;
     DGKV kv[DG_L];
 } DGPrefixCache;
+
 typedef struct {
     uint32_t mt[624];
     int at;
 } DGMT;
+
 static void dg_mt_seed(DGMT *r, uint32_t seed) {
     r->mt[0] = 19650218u;
     for (int i = 1; i < 624; i++)
@@ -1138,6 +1207,7 @@ static void dg_mt_seed(DGMT *r, uint32_t seed) {
     r->mt[0] = 0x80000000u;
     r->at = 624;
 }
+
 static uint32_t dg_mt_u32(DGMT *r) {
     if (r->at >= 624) {
         for (int i = 0; i < 624; i++) {
@@ -1153,6 +1223,7 @@ static uint32_t dg_mt_u32(DGMT *r) {
     y ^= y >> 18;
     return y;
 }
+
 static uint32_t dg_mt_vocab(DGMT *r) {
     uint32_t x;
     do {
@@ -1167,14 +1238,17 @@ static float dg_bf(const uint8_t *p) {
     memcpy(&f, &u, 4);
     return f;
 }
+
 static float dg_at(const DGTensor *t, uint64_t i) {
     return dg_bf(t->data + i * 2);
 }
+
 static float dg_f8e4m3(uint8_t u) {
     int sign = u >> 7, e = (u >> 3) & 15, m = u & 7;
     float x = e ? ldexpf(1.0f + m / 8.0f, e - 7) : ldexpf((float)m, -9);
     return sign ? -x : x;
 }
+
 static float dg_f8e4m3_round(float x) {
     if (!(x > 0))
         return 0;
@@ -1191,6 +1265,7 @@ static float dg_f8e4m3_round(float x) {
     float a = dg_f8e4m3((uint8_t)lo), b = dg_f8e4m3((uint8_t)hi), da = x - a, db = b - x;
     return da < db || (da == db && !(lo & 1)) ? a : b;
 }
+
 static float dg_e2m1_round(float x) {
     static const float q[8] = {0, .5f, 1, 1.5f, 2, 3, 4, 6};
     float a = fabsf(x);
@@ -1202,6 +1277,7 @@ static float dg_e2m1_round(float x) {
     }
     return signbit(x) ? -q[best] : q[best];
 }
+
 /* Kernels come in pairs: a portable *_ref version that is always compiled and
  * serves as the correctness reference, and an ISA-specific version selected
  * at compile time. The selftest checks both against a double-precision
@@ -1228,10 +1304,12 @@ static void dg_nvfp4_qdq_ref(float *out, const float *in, int tokens, int cols, 
                 y[k] = dg_e2m1_round(x[k] / s) * s;
         }
 }
+
 /* Produces the activation layout the selected dg_nvfp4_mm kernel expects. */
 static void dg_nvfp4_qdq(float *out, const float *in, int tokens, int cols, float base) {
     dg_kernels()->nvfp4_qdq(out, in, tokens, cols, base);
 }
+
 /* x in the dg_nvfp4_qdq_ref layout. */
 static void dg_nvfp4_mm_ref(const uint8_t *wd, const uint8_t *sd, float global, const float *x,
                             float *y, int tokens, int rows, int cols) {
@@ -1262,6 +1340,7 @@ static void dg_nvfp4_mm_ref(const uint8_t *wd, const uint8_t *sd, float global, 
             y[(size_t)t * rows + r] = sum;
         }
 }
+
 /* x comes from dg_nvfp4_qdq, in the layout the selected kernel expects. */
 static void dg_nvfp4_mm(const DGTensor *w, const DGTensor *s, const DGTensor *g, const float *x,
                         float *y, int tokens, int rows, int cols) {
@@ -1274,6 +1353,7 @@ static void dg_nvfp4_mm(const DGTensor *w, const DGTensor *s, const DGTensor *g,
     memcpy(&global, g->data, 4);
     dg_kernels()->nvfp4_mm(w->data, s->data, global, x, y, tokens, rows, cols);
 }
+
 static void dg_mm_data_ref(const uint8_t *data, const float *x, float *y, int tokens, int rows,
                            int cols) {
 #ifdef _OPENMP
@@ -1293,17 +1373,20 @@ static void dg_mm_data_ref(const uint8_t *data, const float *x, float *y, int to
             y[(size_t)t * rows + r] = sum[t];
     }
 }
+
 static void dg_mm_data(const uint8_t *data, const float *x, float *y, int tokens, int rows,
                        int cols) {
     if (tokens < 1 || tokens > JB_MAX_CTX)
         die("DiffusionGemma sequence exceeds context limit");
     dg_kernels()->bf16_mm(data, x, y, tokens, rows, cols);
 }
+
 static void dg_mm(const DGTensor *w, const float *x, float *y, int tokens, int rows, int cols) {
     if (w->nd != 2 || w->shape[0] != (uint64_t)rows || w->shape[1] != (uint64_t)cols)
         die2("bad matrix shape", w->name);
     dg_mm_data(w->data, x, y, tokens, rows, cols);
 }
+
 static void dg_mv_slice(const DGTensor *w, uint64_t base, const float *x, float *y, int rows,
                         int cols) {
 #ifdef _OPENMP
@@ -1318,6 +1401,7 @@ static void dg_mv_slice(const DGTensor *w, uint64_t base, const float *x, float 
         y[r] = s;
     }
 }
+
 /* Project all answer slots together so the tied LM head is streamed once.
  * OpenJev's automatic reread test is entropy over the union of the
  * full-vocabulary top 20 and the explicitly requested label ids. */
@@ -1403,6 +1487,7 @@ static double dg_slot_logits_entropy(const DGTensor *w, const float *hidden, int
     free(logits);
     return max_entropy;
 }
+
 static void dg_rms_ref(float *y, const float *x, const DGTensor *scale, int n) {
     double ss = 0.0;
     for (int i = 0; i < n; i++)
@@ -1411,33 +1496,40 @@ static void dg_rms_ref(float *y, const float *x, const DGTensor *scale, int n) {
     for (int i = 0; i < n; i++)
         y[i] = x[i] * q * (scale ? dg_at(scale, i) : 1.0f);
 }
+
 static void dg_rms(float *y, const float *x, const DGTensor *scale, int n) {
     dg_kernels()->rms(y, x, scale, n);
 }
+
 static float dg_gelu(float x) {
     return .5f * x * (1.0f + tanhf(.7978845608028654f * (x + .044715f * x * x * x)));
 }
+
 static double dg_dot_ref(const float *a, const float *b, int n) {
     double s = 0;
     for (int i = 0; i < n; i++)
         s += (double)a[i] * b[i];
     return s;
 }
+
 static double dg_dot(const float *a, const float *b, int n) {
     return dg_kernels()->dot(a, b, n);
 }
+
 /* AVX2 backend. */
 #if defined(JB_AVX2)
 static __m256 dg_bf16x8(const uint8_t *p) {
     __m128i h = _mm_loadu_si128((const __m128i *)p);
     return _mm256_castsi256_ps(_mm256_slli_epi32(_mm256_cvtepu16_epi32(h), 16));
 }
+
 static float dg_hsum8(__m256 x) {
     __m128 h = _mm_add_ps(_mm256_castps256_ps128(x), _mm256_extractf128_ps(x, 1));
     h = _mm_hadd_ps(h, h);
     h = _mm_hadd_ps(h, h);
     return _mm_cvtss_f32(h);
 }
+
 static void dg_mm_data_avx2(const uint8_t *data, const float *x, float *y, int tokens, int rows,
                             int cols) {
     if (rows % 2)
@@ -1475,6 +1567,7 @@ static void dg_mm_data_avx2(const uint8_t *data, const float *x, float *y, int t
         }
     }
 }
+
 static void dg_nvfp4_qdq_avx2(float *out, const float *in, int tokens, int cols, float base) {
     if (!jb_finitef(base) || !(base > 0) || cols % 32)
         die("invalid NVFP4 activation scale");
@@ -1502,7 +1595,9 @@ static void dg_nvfp4_qdq_avx2(float *out, const float *in, int tokens, int cols,
             y[k] = dg_e2m1_round(x[k] / s) * s;
     }
 }
+
 static float dg_hsum8(__m256 x);
+
 static void dg_nvfp4_weights16_avx2(const uint8_t *q, float scale, __m256 *w0, __m256 *w1) {
     const __m128i lut = _mm_setr_epi8(0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12);
     const __m128i mask = _mm_set1_epi8(15), raw = _mm_loadl_epi64((const __m128i *)q);
@@ -1515,6 +1610,7 @@ static void dg_nvfp4_weights16_avx2(const uint8_t *q, float scale, __m256 *w0, _
     *w0 = _mm256_mul_ps(_mm256_permute2f128_ps(a, b, 0x20), s);
     *w1 = _mm256_mul_ps(_mm256_permute2f128_ps(a, b, 0x31), s);
 }
+
 /* Decode each packed 16-weight block entirely in registers, retaining the
  * reference interleaved lane order and reusing it across four tokens. */
 static void dg_nvfp4_mm_avx2(const uint8_t *wd, const uint8_t *sd, float global, const float *x,
@@ -1544,11 +1640,13 @@ static void dg_nvfp4_mm_avx2(const uint8_t *wd, const uint8_t *sd, float global,
         }
     }
 }
+
 static double dg_hsum4d(__m256d x) {
     __m128d h = _mm_add_pd(_mm256_castpd256_pd128(x), _mm256_extractf128_pd(x, 1));
     h = _mm_hadd_pd(h, h);
     return _mm_cvtsd_f64(h);
 }
+
 static void dg_rms_avx2(float *y, const float *x, const DGTensor *scale, int n) {
     __m256d a = _mm256_setzero_pd(), b = a;
     int i = 0;
@@ -1575,6 +1673,7 @@ static void dg_rms_avx2(float *y, const float *x, const DGTensor *scale, int n) 
     for (; i < n; i++)
         y[i] = x[i] * q * (scale ? dg_at(scale, i) : 1.0f);
 }
+
 static double dg_dot_avx2(const float *a, const float *b, int n) {
     __m256d s0 = _mm256_setzero_pd(), s1 = s0;
     int i = 0;
@@ -1598,6 +1697,7 @@ static __m512 dg_bf16x16(const uint8_t *p) {
     __m256i h = _mm256_loadu_si256((const __m256i *)p);
     return _mm512_castsi512_ps(_mm512_slli_epi32(_mm512_cvtepu16_epi32(h), 16));
 }
+
 static void dg_mm_data_avx512(const uint8_t *data, const float *x, float *y, int tokens, int rows,
                               int cols) {
     if (rows % 2)
@@ -1652,6 +1752,7 @@ static void dg_mm_data_avx512(const uint8_t *data, const float *x, float *y, int
         }
     }
 }
+
 /* Match each packed weight byte: low-nibble activations, then high. This
  * one-time swizzle removes two activation permutes per expert row/tile. */
 static void dg_nvfp4_swizzle(float *out, int tokens, int cols) {
@@ -1665,10 +1766,12 @@ static void dg_nvfp4_swizzle(float *out, int tokens, int cols) {
             }
         }
 }
+
 static void dg_nvfp4_qdq_avx512(float *out, const float *in, int tokens, int cols, float base) {
     dg_nvfp4_qdq_ref(out, in, tokens, cols, base);
     dg_nvfp4_swizzle(out, tokens, cols);
 }
+
 /* x in the dg_nvfp4_swizzle layout; rows must be even. */
 static void dg_nvfp4_mm_avx512(const uint8_t *wd, const uint8_t *sd, float global, const float *x,
                                float *y, int tokens, int rows, int cols) {
@@ -1722,6 +1825,7 @@ static void dg_nvfp4_mm_avx512(const uint8_t *wd, const uint8_t *sd, float globa
         }
     }
 }
+
 static void dg_rms_avx512(float *y, const float *x, const DGTensor *scale, int n) {
     __m512d a = _mm512_setzero_pd(), b = a, c = a, d = a;
     int i = 0;
@@ -1752,6 +1856,7 @@ static void dg_rms_avx512(float *y, const float *x, const DGTensor *scale, int n
     for (; i < n; i++)
         y[i] = x[i] * q * (scale ? dg_at(scale, i) : 1.0f);
 }
+
 static double dg_dot_avx512(const float *a, const float *b, int n) {
     __m512d s0 = _mm512_setzero_pd(), s1 = s0;
     int i = 0;
@@ -1786,11 +1891,13 @@ static const DGKernelOps *dg_kernels(void) {
     return &scalar;
 #endif
 }
+
 static DGTensor *dg_layer_tensor(DGModel *m, int l, const char *tail) {
     char n[192];
     snprintf(n, sizeof n, "model.decoder.layers.%d.%s", l, tail);
     return dg_tensor(m, n);
 }
+
 static void dg_rope(float *x, int heads, int hd, const float *cv, const float *sv) {
     int half = hd / 2;
     for (int h = 0; h < heads; h++) {
@@ -1802,11 +1909,14 @@ static void dg_rope(float *x, int heads, int hd, const float *cv, const float *s
         }
     }
 }
+
 static void dg_norm_heads(float *x, int heads, int hd, DGTensor *scale) {
     for (int h = 0; h < heads; h++)
         dg_rms(x + (size_t)h * hd, x + (size_t)h * hd, scale, hd);
 }
+
 enum { DG_CAUSAL, DG_CANVAS, DG_SUFFIX };
+
 static void dg_attention(DGModel *m, int l, float *x, int n, int pos0, const DGKV *cache, DGKV *out,
                          int mode, int batch) {
     JB_TICK(qkv_start);
@@ -1923,6 +2033,7 @@ static void dg_attention(DGModel *m, int l, float *x, int n, int pos0, const DGK
     free(a);
     free(score);
 }
+
 /* Execute independent equal-stride sequences through one set of projections.
  * Attention never crosses a segment boundary.  Suffix segments may have
  * different useful lengths; padding is computed but never copied into K/V. */
@@ -2037,6 +2148,7 @@ static void dg_attention_multi(DGModel *m, int l, float *x, int segments, int se
     free(a);
     free(score);
 }
+
 static void dg_ff(DGModel *m, int l, float *x, int n) {
     JB_TICK(ff_start);
     DGTensor *pre = dg_layer_tensor(m, l, "pre_feedforward_layernorm.weight");
@@ -2235,6 +2347,7 @@ static void dg_ff(DGModel *m, int l, float *x, int n) {
     free(sum);
     JB_TO(ff_other, ff_tail_start);
 }
+
 static void dg_layer(DGModel *m, int l, float *x, int n, int pos0, const DGKV *cache, DGKV *out,
                      int mode, int batch) {
     JB_TICK(layer_start);
@@ -2268,6 +2381,7 @@ static void dg_layer(DGModel *m, int l, float *x, int n, int pos0, const DGKV *c
     free(z);
     JB_TO(layers, layer_start);
 }
+
 static void dg_layer_multi(DGModel *m, int l, float *x, int segments, int seq,
                            const DGKV *const *cache, const int *lens, DGKV *out, int mode) {
     int n = segments * seq;
@@ -2302,6 +2416,7 @@ static void dg_layer_multi(DGModel *m, int l, float *x, int segments, int seq,
     free(z);
     JB_TO(layers, layer_start);
 }
+
 static float *dg_embed(DGModel *m, const int *ids, int n, int decoder) {
     DGTensor *w = dg_tensor(m, "model.decoder.embed_tokens.weight");
     float *x = xmalloc((size_t)n * DG_H * 4);
@@ -2314,11 +2429,13 @@ static float *dg_embed(DGModel *m, const int *ids, int n, int decoder) {
     }
     return x;
 }
+
 static void dg_final_norm(DGModel *m, float *x, int n) {
     DGTensor *w = dg_tensor(m, "model.decoder.norm.weight");
     for (int t = 0; t < n; t++)
         dg_rms(x + (size_t)t * DG_H, x + (size_t)t * DG_H, w, DG_H);
 }
+
 static void dg_prefill(DGModel *m, const int *prompt, int np, DGKV kv[DG_L]) {
     JB_TICK(embed_start);
     float *enc = dg_embed(m, prompt, np, 0);
@@ -2327,6 +2444,7 @@ static void dg_prefill(DGModel *m, const int *prompt, int np, DGKV kv[DG_L]) {
         dg_layer(m, l, enc, np, 0, NULL, &kv[l], DG_CAUSAL, 1);
     free(enc);
 }
+
 static void dg_prefill_suffix(DGModel *m, const int *token, int n, const DGKV prefix[DG_L],
                               DGKV kv[DG_L]) {
     JB_TICK(embed_start);
@@ -2336,6 +2454,7 @@ static void dg_prefill_suffix(DGModel *m, const int *token, int n, const DGKV pr
         dg_layer(m, l, x, n, prefix[l].n, &prefix[l], &kv[l], DG_SUFFIX, 1);
     free(x);
 }
+
 static float *dg_decode(DGModel *m, DGKV kv[DG_L], int np, const int *canvas, int nc, int batch) {
     JB_TICK(embed_start);
     float *dec = dg_embed(m, canvas, nc * batch, 1);
@@ -2347,6 +2466,7 @@ static float *dg_decode(DGModel *m, DGKV kv[DG_L], int np, const int *canvas, in
     JB_TO(final_norm, norm_start);
     return dec;
 }
+
 static void dg_prefill_suffix_multi(DGModel *m, const int *token, const int *lens, int batch,
                                     int seq, const DGKV prefix[DG_L], DGKV *kv) {
     JB_TICK(embed_start);
@@ -2365,6 +2485,7 @@ static void dg_prefill_suffix_multi(DGModel *m, const int *token, const int *len
     free(cache);
     free(x);
 }
+
 static float *dg_decode_multi(DGModel *m, DGKV *kv, const int *doc, int segments, int seq,
                               const int *canvas) {
     int n = segments * seq;
@@ -2387,6 +2508,7 @@ static float *dg_decode_multi(DGModel *m, DGKV *kv, const int *doc, int segments
     JB_TO(final_norm, norm_start);
     return x;
 }
+
 static void dg_free_kv(DGKV kv[DG_L]) {
     JB_TICK(kv_free_start);
     for (int l = 0; l < DG_L; l++) {
@@ -2395,6 +2517,7 @@ static void dg_free_kv(DGKV kv[DG_L]) {
     }
     JB_TO(kv_free, kv_free_start);
 }
+
 static void dg_prefix_free(DGPrefixCache *c) {
     if (!c)
         return;
@@ -2403,6 +2526,7 @@ static void dg_prefix_free(DGPrefixCache *c) {
     free(c->ids);
     memset(c, 0, sizeof *c);
 }
+
 static char *jt_raw(const char *j, const JTok *t) {
     size_t n = (size_t)(t->end - t->start);
     char *z = xmalloc(n + 1);
@@ -2410,6 +2534,7 @@ static char *jt_raw(const char *j, const JTok *t) {
     z[n] = 0;
     return z;
 }
+
 static unsigned hex4(const char *s) {
     unsigned v = 0;
     for (int i = 0; i < 4; i++) {
@@ -2418,6 +2543,7 @@ static unsigned hex4(const char *s) {
     }
     return v;
 }
+
 static char *jt_string(const char *j, const JTok *t) {
     if (t->type != JT_STRING)
         return jt_raw(j, t);
@@ -2473,10 +2599,12 @@ static char *jt_string(const char *j, const JTok *t) {
         (void)next_cp((const unsigned char *)z, zn, &at);
     return z;
 }
+
 typedef struct {
     char *p;
     size_t n, cap;
 } DGBuf;
+
 static void db_need(DGBuf *b, size_t add) {
     if (add > SIZE_MAX - b->n - 1)
         die("string size overflow");
@@ -2492,17 +2620,20 @@ static void db_need(DGBuf *b, size_t add) {
         b->cap = c;
     }
 }
+
 static void db_mem(DGBuf *b, const char *p, size_t n) {
     db_need(b, n);
     memcpy(b->p + b->n, p, n);
     b->n += n;
     b->p[b->n] = 0;
 }
+
 static void db_ch(DGBuf *b, char c) {
     db_need(b, 1);
     b->p[b->n++] = c;
     b->p[b->n] = 0;
 }
+
 static void db_fmt(DGBuf *b, const char *fmt, ...) {
     va_list a, z;
     va_start(a, fmt);
@@ -2516,6 +2647,7 @@ static void db_fmt(DGBuf *b, const char *fmt, ...) {
     va_end(a);
     b->n += (size_t)n;
 }
+
 static void db_json_string(DGBuf *b, const char *s, int ascii) {
     db_ch(b, '"');
     size_t n = strlen(s), i = 0;
@@ -2549,13 +2681,16 @@ static void db_json_string(DGBuf *b, const char *s, int ascii) {
     }
     db_ch(b, '"');
 }
+
 typedef struct {
     int tok;
     char *key;
 } DGKey;
+
 static int dg_key_cmp(const void *a, const void *b) {
     return strcmp(((const DGKey *)a)->key, ((const DGKey *)b)->key);
 }
+
 static void dg_json_value(DGBuf *b, const char *j, JTok *t, int nt, int at, int sort_keys,
                           int ascii) {
     if (t[at].type == JT_STRING) {
@@ -2613,6 +2748,7 @@ static void dg_json_value(DGBuf *b, const char *j, JTok *t, int nt, int at, int 
     db_ch(b, '}');
     free(k);
 }
+
 static char *dg_json_canonical(const char *j, JTok *t, int nt, int at, int sort_keys, int ascii) {
     DGBuf b = {0};
     dg_json_value(&b, j, t, nt, at, sort_keys, ascii);
@@ -2620,11 +2756,13 @@ static char *dg_json_canonical(const char *j, JTok *t, int nt, int at, int sort_
         return xstrdup("");
     return b.p;
 }
+
 static int dg_py_space(uint32_t c) {
     return (c >= 9 && c <= 13) || (c >= 0x1c && c <= 0x20) || c == 0x85 || c == 0xa0 ||
            c == 0x1680 || (c >= 0x2000 && c <= 0x200a) || c == 0x2028 || c == 0x2029 ||
            c == 0x202f || c == 0x205f || c == 0x3000;
 }
+
 static char *dg_text_of(const char *j, JTok *t, int nt, int at) {
     if (t[at].type != JT_STRING) {
         if (jt_literal(j, &t[at], "null"))
@@ -2654,6 +2792,7 @@ static char *dg_text_of(const char *j, JTok *t, int nt, int at) {
 static uint32_t dg_rotr(uint32_t x, int n) {
     return (x >> n) | (x << (32 - n));
 }
+
 static void dg_sha256(const uint8_t *p, size_t n, uint8_t out[32]) {
     static const uint32_t k[64] = {
         0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4,
@@ -2714,6 +2853,7 @@ static void dg_sha256(const uint8_t *p, size_t n, uint8_t out[32]) {
         for (int q = 0; q < 4; q++)
             out[i * 4 + q] = (uint8_t)(h[i] >> (24 - 8 * q));
 }
+
 static void json_print_string(const char *s) {
     putchar('\"');
     for (; *s; s++) {
@@ -2743,6 +2883,7 @@ static void json_print_string(const char *s) {
     }
     putchar('\"');
 }
+
 static void json_print_token(const char *j, const JTok *t) {
     if (t->type == JT_STRING) {
         char *s = jt_string(j, t);
@@ -2771,6 +2912,7 @@ static char *read_all(const char *path, size_t *nn) {
     *nn = (size_t)z;
     return s;
 }
+
 static void normalize_scores(const double *score, int n, double *prob) {
     if (n < 2)
         die("at least two candidate scores required");
@@ -2791,6 +2933,7 @@ static void normalize_scores(const double *score, int n, double *prob) {
     for (int i = 0; i < n; i++)
         prob[i] = exp(score[i] - mx) / den;
 }
+
 static double confidence(const double *p, int n) {
     double h = 0;
     for (int i = 0; i < n; i++)
@@ -2801,6 +2944,7 @@ static double confidence(const double *p, int n) {
         c = 0;
     return c < 0 ? 0 : c > 1 ? 1 : c;
 }
+
 static int direct_keys(const JTok *t, int nt, int obj, int *keys, int max) {
     int n = 0;
     for (int i = obj + 1; i < nt; i++) {
@@ -2815,12 +2959,14 @@ static int direct_keys(const JTok *t, int nt, int obj, int *keys, int max) {
     }
     return n;
 }
+
 typedef struct {
     int key, criteria, nc;
     char *kind;
     char **cand, **label;
     double *prob;
 } DecisionWork;
+
 typedef struct {
     Tokens base;
     int start, count;
@@ -2839,6 +2985,7 @@ static void dg_choice_candidate(int ci, char label[3]) {
         label[1] = (char)('A' + j % 26);
     }
 }
+
 static int dg_choice_inventory(DGTokenizer *tok, char *out[128]) {
     Tokens base = dgt_tokenize(tok, "q1: A");
     int seen[128], n = 0;
@@ -2863,6 +3010,7 @@ static int dg_choice_inventory(DGTokenizer *tok, char *out[128]) {
     free(base.v);
     return n;
 }
+
 static char *dg_decision_label(const char *kind, int i, char **choice) {
     char z[16];
     if (!strcmp(kind, "noul"))
@@ -2873,10 +3021,12 @@ static char *dg_decision_label(const char *kind, int i, char **choice) {
     }
     return xstrdup(choice[i]);
 }
+
 static char *dg_instruction(const char *j, JTok *t, int nt, int qo) {
     int i = jt_obj_get(j, t, nt, qo, "instructions");
     return i < 0 ? xstrdup("Answer about the state.") : dg_text_of(j, t, nt, i);
 }
+
 static char *dg_system_prompt(const char *qj, JTok *qt, int qnt, DecisionWork *w, int nq) {
     static const char intro[] =
         "Answer a fixed set of questions about the state the user provides. Each question lists "
@@ -2923,6 +3073,7 @@ static char *dg_system_prompt(const char *qj, JTok *qt, int qnt, DecisionWork *w
                       "label, separated by single spaces.");
     return b.p;
 }
+
 static char *dg_answer_text_range(DecisionWork *w, int total, int start, int count,
                                   const int *pick) {
     DGBuf b = {0};
@@ -2935,9 +3086,11 @@ static char *dg_answer_text_range(DecisionWork *w, int total, int start, int cou
     }
     return b.p;
 }
+
 static char *dg_answer_text(DecisionWork *w, int nq, const int *pick) {
     return dg_answer_text_range(w, nq, 0, nq, pick);
 }
+
 static void dg_print_answers(const char *qj, JTok *qt, int qnt, DecisionWork *w, int nq,
                              const char *id, uint32_t tokens, double ms, double prefill_ms,
                              double cand_ms, int reads, int canvases, const char *cache_state,
@@ -3011,6 +3164,7 @@ typedef struct {
     int nt, qnt, si, qroot, requested;
     char *state, *reqid, *qowned;
 } DGRequest;
+
 static void dg_request_parse(DGRequest *r, const char *j, size_t len) {
     memset(r, 0, sizeof *r);
     r->j = j;
@@ -3051,6 +3205,7 @@ static void dg_request_parse(DGRequest *r, const char *j, size_t len) {
             die("questions string is not a JSON object");
     }
 }
+
 static void dg_request_free(DGRequest *r) {
     free(r->state);
     free(r->reqid);
@@ -3060,6 +3215,7 @@ static void dg_request_free(DGRequest *r) {
     }
     free(r->t);
 }
+
 static uint32_t dg_request_seed(const DGRequest *r) {
     DGBuf seed_json = {0};
     db_ch(&seed_json, '[');
@@ -3073,6 +3229,7 @@ static uint32_t dg_request_seed(const DGRequest *r) {
     return (uint32_t)digest[0] << 24 | (uint32_t)digest[1] << 16 | (uint32_t)digest[2] << 8 |
            digest[3];
 }
+
 static DecisionWork *dg_questions(const DGRequest *r, char **choice_label, int *nq_out) {
     const char *qj = r->qj;
     JTok *qt = r->qt;
@@ -3123,6 +3280,7 @@ static DecisionWork *dg_questions(const DGRequest *r, char **choice_label, int *
     *nq_out = nq;
     return w;
 }
+
 static void dg_questions_free(DecisionWork *w, int nq) {
     for (int x = 0; x < nq; x++) {
         for (int i = 0; i < w[x].nc; i++) {
@@ -3136,6 +3294,7 @@ static void dg_questions_free(DecisionWork *w, int nq) {
     }
     free(w);
 }
+
 static char *dg_answer_template(DecisionWork *w, int nq, const int *pick) {
     char *a = dg_answer_text(w, nq, pick);
     DGBuf b = {0};
@@ -3143,6 +3302,7 @@ static char *dg_answer_template(DecisionWork *w, int nq, const int *pick) {
     free(a);
     return b.p;
 }
+
 static char *dg_answer_template_range(DecisionWork *w, int total, int start, int count,
                                       const int *pick) {
     char *a = dg_answer_text_range(w, total, start, count, pick);
@@ -3164,6 +3324,7 @@ typedef struct {
     int requested, reads, max_reads, active;
     uint64_t candidate_ns;
 } DGJob;
+
 static void dg_job_prepare(DGJob *g, DGTokenizer *tok, const char *j, size_t len) {
     memset(g, 0, sizeof *g);
     dg_request_parse(&g->rq, j, len);
@@ -3246,6 +3407,7 @@ static void dg_job_prepare(DGJob *g, DGTokenizer *tok, const char *j, size_t len
     g->active = 1;
     free(zero);
 }
+
 static void dg_job_free(DGJob *g) {
     for (int x = 0; x < g->nq; x++)
         free(g->ids[x]);
@@ -3533,6 +3695,7 @@ static int dg_systemone(DGModel *m, DGTokenizer *tok, const char *j, size_t len,
     dg_request_free(&rq);
     return 0;
 }
+
 /* Returns zero when the rows do not all hit the current exact schema entry;
  * the caller then executes them sequentially, allowing normal cache replace. */
 static int dg_system_batch(DGModel *m, DGTokenizer *tok, char **row, size_t *len, int batch,
@@ -3683,6 +3846,7 @@ static int dg_system_batch(DGModel *m, DGTokenizer *tok, char **row, size_t *len
     free(g);
     return 1;
 }
+
 static int dg_decide_file(const char *dir, const char *path) {
     size_t n;
     char *j = read_all(path, &n);
@@ -3696,6 +3860,7 @@ static int dg_decide_file(const char *dir, const char *path) {
     free(j);
     return rc;
 }
+
 static void dg_eval_group(DGModel *m, DGTokenizer *t, char **row, size_t *len, int n,
                           DGPrefixCache *cache) {
     if (n > 1 && dg_system_batch(m, t, row, len, n, cache))
@@ -3703,6 +3868,7 @@ static void dg_eval_group(DGModel *m, DGTokenizer *t, char **row, size_t *len, i
     for (int i = 0; i < n; i++)
         dg_systemone(m, t, row[i], len[i], NULL, cache);
 }
+
 static int dg_eval_file(const char *dir, const char *path) {
     FILE *f = !strcmp(path, "-") ? stdin : fopen(path, "rb");
     if (!f)
@@ -3830,15 +3996,18 @@ static uint32_t jb_rng(uint64_t *s) {
     *s ^= *s << 17;
     return (uint32_t)(*s >> 32);
 }
+
 static float jb_rng_unit(uint64_t *s) {
     return (float)(jb_rng(s) >> 8) / 8388608.0f * 2.0f - 1.0f;
 }
+
 static void jb_put_bf16(uint8_t *p, float v) {
     uint32_t u;
     memcpy(&u, &v, 4);
     p[0] = (uint8_t)(u >> 16);
     p[1] = (uint8_t)(u >> 24);
 }
+
 static void jb_check_close(const char *what, double got, double want, double bound) {
     if (!jb_finite(got) || fabs(got - want) > bound) {
         char z[160];
@@ -3846,6 +4015,7 @@ static void jb_check_close(const char *what, double got, double want, double bou
         die2("kernel self-test failed", z);
     }
 }
+
 static void dg_test_mm(uint64_t *rs) {
     static const int shape[][3] = {{2, 16, 1}, {2, 7, 1},  {2, 15, 8},
                                    {4, 40, 3}, {6, 33, 9}, {8, 2816, 17}};
@@ -3887,6 +4057,7 @@ static void dg_test_mm(uint64_t *rs) {
         free(mag);
     }
 }
+
 static void dg_test_nvfp4(uint64_t *rs) {
     static const int shape[][3] = {{2, 32, 1}, {4, 64, 9}, {8, 704, 17}, {2, 2816, 3}};
     static const float mag4[8] = {0, .5f, 1, 1.5f, 2, 3, 4, 6};
@@ -3958,6 +4129,7 @@ static void dg_test_nvfp4(uint64_t *rs) {
         free(mag);
     }
 }
+
 static void dg_test_rms_dot(uint64_t *rs) {
     static const int len[] = {1, 15, 16, 17, 31, 32, 33, 256, 2816};
     for (size_t k = 0; k < sizeof len / sizeof *len; k++) {
@@ -4003,6 +4175,7 @@ static void dg_test_rms_dot(uint64_t *rs) {
         free(sw);
     }
 }
+
 static void dg_kernel_selftest(void) {
     uint64_t rs = 0x9e3779b97f4a7c15ull;
     dg_test_mm(&rs);
@@ -4019,6 +4192,7 @@ static double jb_best_ms(uint64_t *ns, int reps) {
             best = ns[i];
     return (double)best / 1e6;
 }
+
 static int bench_kernels(void) {
     printf("{\"bench\":\"info\",\"kernels\":\"%s\",\"math\":\"%s\",\"threads\":%d}\n",
            dg_kernels()->name, JB_MATH_MODE, jb_threads());
@@ -4224,6 +4398,7 @@ static void usage(void) {
             "  jb --bench-kernels\n",
             JB_VERSION);
 }
+
 int main(int ac, char **av) {
     if (ac == 2 && !strcmp(av[1], "--selftest"))
         return selftest();

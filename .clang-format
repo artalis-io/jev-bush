@@ -18,4 +18,5 @@ BinPackParameters: true
 SortIncludes: Never
 IncludeBlocks: Preserve
 ReflowComments: true
+SeparateDefinitionBlocks: Always
 ...
