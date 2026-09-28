@@ -462,16 +462,23 @@ static void jb_arena_reserve(JBArena *a, size_t *capacity, size_t required) {
 static void jb_workspace_plan(size_t *used, size_t count, size_t element_size);
 
 /* Bit-level finiteness tests: -ffast-math lets the compiler assume NaN and
- * infinity never occur, which can fold isfinite() and NaN comparisons away. */
+ * infinity never occur, which can fold isfinite() and NaN comparisons away.
+ * Clang goes further and marks floating-point arguments as never NaN or
+ * infinite, which folds even a bit test on the argument. A volatile round
+ * trip hides the value, so the bits tested are the bits actually passed. */
 static int jb_finitef(float x) {
+    volatile float hidden = x;
+    float value = hidden;
     uint32_t u;
-    memcpy(&u, &x, sizeof u);
+    memcpy(&u, &value, sizeof u);
     return (u & 0x7f800000u) != 0x7f800000u;
 }
 
 static int jb_finite(double x) {
+    volatile double hidden = x;
+    double value = hidden;
     uint64_t u;
-    memcpy(&u, &x, sizeof u);
+    memcpy(&u, &value, sizeof u);
     return (u & 0x7ff0000000000000ull) != 0x7ff0000000000000ull;
 }
 
@@ -5514,12 +5521,18 @@ static int selftest(void) {
     jb_release(ov);
     jb_release(nv);
     jb_release(tt);
+    /* Build NaN and infinity from bits: under -ffinite-math-only the compiler
+     * may assume no arithmetic or conversion produces them. */
     uint32_t nan_bits = 0x7fc00000u, inf_bits = 0x7f800000u;
+    uint64_t dnan_bits = 0x7ff8000000000000ull, dinf_bits = 0x7ff0000000000000ull;
     float fnan, finf;
+    double dnan, dinf;
     memcpy(&fnan, &nan_bits, 4);
     memcpy(&finf, &inf_bits, 4);
-    if (jb_finitef(fnan) || jb_finitef(finf) || !jb_finitef(FLT_MAX) || jb_finite((double)finf) ||
-        !jb_finite(0.0))
+    memcpy(&dnan, &dnan_bits, 8);
+    memcpy(&dinf, &dinf_bits, 8);
+    if (jb_finitef(fnan) || jb_finitef(finf) || !jb_finitef(FLT_MAX) || jb_finite(dnan) ||
+        jb_finite(dinf) || !jb_finite(DBL_MAX) || !jb_finite(0.0))
         die("finiteness self-test failed");
     const char *ek = "{\"st\\u0061te\":1}";
     int ekn;
