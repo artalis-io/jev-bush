@@ -3862,26 +3862,31 @@ static int dg_systemone(DGModel *m, DGTokenizer *tok, const char *j, size_t len,
         if (!hit) {
             if (!common || common >= job.pt.n)
                 die("cannot construct reusable schema prefix");
+            /* Build the replacement privately and install it only once it is
+             * complete. If anything below fails, the entry stays empty, so
+             * the next request misses and rebuilds instead of "hitting" a
+             * schema whose K/V was never filled. */
             dg_prefix_free(prefix_cache);
+            DGPrefixCache fresh;
+            memset(&fresh, 0, sizeof fresh);
             size_t schema_bytes = strlen(job.sys) + 1, metadata_bytes = 0;
             jb_workspace_plan(&metadata_bytes, schema_bytes, sizeof(char));
-            jb_workspace_plan(&metadata_bytes, common, sizeof *prefix_cache->ids);
-            jb_arena_init(&prefix_cache->metadata, metadata_bytes);
-            prefix_cache->schema = jb_arena_alloc(&prefix_cache->metadata, schema_bytes,
-                                                  sizeof *prefix_cache->schema, 0);
-            prefix_cache->ids =
-                jb_arena_alloc(&prefix_cache->metadata, common, sizeof *prefix_cache->ids, 0);
-            memcpy(prefix_cache->schema, job.sys, schema_bytes);
-            prefix_cache->n = (int)common;
-            memcpy(prefix_cache->ids, job.pt.v, (size_t)common * sizeof *prefix_cache->ids);
+            jb_workspace_plan(&metadata_bytes, common, sizeof *fresh.ids);
+            jb_arena_init(&fresh.metadata, metadata_bytes);
+            fresh.schema = jb_arena_alloc(&fresh.metadata, schema_bytes, sizeof *fresh.schema, 0);
+            fresh.ids = jb_arena_alloc(&fresh.metadata, common, sizeof *fresh.ids, 0);
+            memcpy(fresh.schema, job.sys, schema_bytes);
+            fresh.n = (int)common;
+            memcpy(fresh.ids, job.pt.v, (size_t)common * sizeof *fresh.ids);
             dg_prefill(m, job.pt.v, (int)job.pt.n, kv, workspace);
             int prefix_length = (int)common;
-            dg_kv_init(&prefix_cache->kv_storage, prefix_cache->kv, 1, &prefix_length);
+            dg_kv_init(&fresh.kv_storage, fresh.kv, 1, &prefix_length);
             for (int l = 0; l < DG_L; l++) {
                 int kn = dg_kv_width(l);
-                memcpy(prefix_cache->kv[l].k, kv[l].k, (size_t)common * kn * 4);
-                memcpy(prefix_cache->kv[l].v, kv[l].v, (size_t)common * kn * 4);
+                memcpy(fresh.kv[l].k, kv[l].k, (size_t)common * kn * 4);
+                memcpy(fresh.kv[l].v, kv[l].v, (size_t)common * kn * 4);
             }
+            *prefix_cache = fresh;
             cache_state = "miss";
         } else {
             cache_state = "hit";
