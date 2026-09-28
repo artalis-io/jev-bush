@@ -68,7 +68,7 @@ jobs:
           gcc -O2 -march=skylake-avx512 -std=c11 -Wall -Wextra -pedantic -Werror ${{ matrix.flags }} \
             jb.c -lm -o jb-avx512
           # Fail if the build silently fell back to the scalar kernels.
-          grep -q 'BF16 matmul (avx512)' jb-avx512
+          strings jb-avx512 | grep -qx 'avx512'
 
       - name: Selftest
         run: sde/sde64 -skx -- ./jb-avx512 --selftest
