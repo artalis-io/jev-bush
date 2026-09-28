@@ -52,6 +52,11 @@
 #define JB_MAX_CAND 255
 #define JB_MAX_JSON (64u * 1024u * 1024u)
 #define JB_MAX_DEPTH 256
+/* Each microbatch document holds its own copy of the shared prefix K/V.
+ * Groups whose K/V would exceed this many bytes run sequentially. */
+#ifndef JB_MICROBATCH_KV_LIMIT
+#define JB_MICROBATCH_KV_LIMIT (4ull << 30)
+#endif
 
 #define DG_H 2816
 #define DG_L 30
@@ -4227,6 +4232,13 @@ static int dg_system_batch(DGModel *m, DGTokenizer *tok, char **row, size_t *len
             seq = suffix;
     }
     if ((uint64_t)batch * seq > JB_MAX_CTX)
+        ok = 0;
+    uint64_t kv_token_bytes = 0, kv_batch_bytes = 0;
+    for (int l = 0; l < DG_L; l++)
+        kv_token_bytes += 2 * (uint64_t)dg_kv_width(l) * sizeof(float);
+    for (int b = 0; ok && b < batch; b++)
+        kv_batch_bytes += (uint64_t)g[b].pt.n * kv_token_bytes;
+    if (kv_batch_bytes > JB_MICROBATCH_KV_LIMIT)
         ok = 0;
     if (!ok) {
         for (int b = 0; b < batch; b++)

@@ -247,7 +247,9 @@ OMP_NUM_THREADS=32 JB_MICROBATCH=4 ./jb MODEL_DIR eval requests.jsonl
 ```
 
 `JB_MICROBATCH` accepts `1..16` and defaults to `1`. Incompatible rows fall
-back to sequential execution. Attention remains isolated per document and per
+back to sequential execution, as do groups whose K/V would exceed 4 GiB: each
+document holds its own copy of the shared prefix K/V, about 440 KiB per token.
+Build with `-DJB_MICROBATCH_KV_LIMIT=BYTES` to change that bound. Attention remains isolated per document and per
 answer canvas, while dense projections, routing, and expert buckets span the
 batch. Output records the actual `microbatch` size. Prefix caching and
 microbatching remain disabled by the fast-math correctness boundary.
