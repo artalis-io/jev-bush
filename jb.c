@@ -104,8 +104,9 @@ typedef struct {
     uint64_t omp_regions, alloc_calls, hot_alloc_calls, alloc_ns;
 } JBProfile;
 
-static JBProfile jb_profile;
-static int jb_profile_hot;
+/* Per calling thread: concurrent sessions would otherwise mix their counts. */
+static _Thread_local JBProfile jb_profile;
+static _Thread_local int jb_profile_hot;
 #define JB_TICK(name) uint64_t name = now_ns()
 #define JB_TO(field, name) (jb_profile.field += now_ns() - (name))
 #define JB_OMP() (jb_profile.omp_regions++)
