@@ -13,6 +13,7 @@
 #endif
 #include <ctype.h>
 #include <float.h>
+#include <locale.h>
 #include <math.h>
 #include <setjmp.h>
 #include <stdarg.h>
@@ -3116,6 +3117,35 @@ static void db_fmt(DGBuf *b, const char *fmt, ...) {
     b->n += (size_t)n;
 }
 
+/* JSON numbers always use '.', but the printf family writes the current
+ * locale's decimal point, and a host application may have set one (for
+ * example "," for de-DE). Format each number alone and restore '.'. */
+static void db_decimal(DGBuf *b, const char *z, int n) {
+    if (n < 0 || n >= 64)
+        die("number formatting failed");
+    const char *point = localeconv()->decimal_point;
+    size_t point_length = point ? strlen(point) : 0, o = 0;
+    char out[64];
+    for (const char *c = z; *c;) {
+        if (point_length && !strncmp(c, point, point_length)) {
+            out[o++] = '.';
+            c += point_length;
+        } else
+            out[o++] = *c++;
+    }
+    db_mem(b, out, o);
+}
+
+static void db_number(DGBuf *b, double value) {
+    char z[64];
+    db_decimal(b, z, snprintf(z, sizeof z, "%.17g", value));
+}
+
+static void db_millis(DGBuf *b, double ms) {
+    char z[64];
+    db_decimal(b, z, snprintf(z, sizeof z, "%.3f", ms));
+}
+
 static void db_json_string(DGBuf *b, const char *s, int ascii) {
     db_ch(b, '"');
     size_t n = strlen(s), i = 0;
@@ -3558,12 +3588,16 @@ static char *dg_format_answers(const char *qj, JTok *qt, int qnt, DecisionWork *
         jb_release(k);
         db_mem(&out, ":{\"type\":", 9);
         db_json_string(&out, d->kind, 0);
-        if (!strcmp(d->kind, "noul"))
-            db_fmt(&out,
-                   ",\"noul\":%.17g,\"probabilities\":{\"true\":%.17g,\"false\":%.17g},"
-                   "\"confidence\":%.17g",
-                   d->prob[0], d->prob[0], d->prob[1], confidence(d->prob, d->nc));
-        else if (!strcmp(d->kind, "choice")) {
+        if (!strcmp(d->kind, "noul")) {
+            db_fmt(&out, ",\"noul\":");
+            db_number(&out, d->prob[0]);
+            db_fmt(&out, ",\"probabilities\":{\"true\":");
+            db_number(&out, d->prob[0]);
+            db_fmt(&out, ",\"false\":");
+            db_number(&out, d->prob[1]);
+            db_fmt(&out, "},\"confidence\":");
+            db_number(&out, confidence(d->prob, d->nc));
+        } else if (!strcmp(d->kind, "choice")) {
             int top = 0;
             for (int i = 1; i < d->nc; i++)
                 if (d->prob[i] > d->prob[top])
@@ -3575,14 +3609,18 @@ static char *dg_format_answers(const char *qj, JTok *qt, int qnt, DecisionWork *
                 if (i)
                     db_ch(&out, ',');
                 db_json_string(&out, d->cand[i], 0);
-                db_fmt(&out, ":%.17g", d->prob[i]);
+                db_ch(&out, ':');
+                db_number(&out, d->prob[i]);
             }
-            db_fmt(&out, "},\"confidence\":%.17g", confidence(d->prob, d->nc));
+            db_fmt(&out, "},\"confidence\":");
+            db_number(&out, confidence(d->prob, d->nc));
         } else {
             double ev = 0;
             for (int i = 0; i < d->nc; i++)
                 ev += i * d->prob[i];
-            db_fmt(&out, ",\"score\":%.17g,\"legend\":{", ev);
+            db_fmt(&out, ",\"score\":");
+            db_number(&out, ev);
+            db_fmt(&out, ",\"legend\":{");
             int zc = 0;
             for (int z = d->criteria + 1; z < qnt; z++)
                 if (qt[z].parent == d->criteria) {
@@ -3591,19 +3629,30 @@ static char *dg_format_answers(const char *qj, JTok *qt, int qnt, DecisionWork *
                     db_json_token(&out, qj, &qt[z]);
                 }
             db_mem(&out, "},\"probabilities\":{", 19);
-            for (int i = 0; i < d->nc; i++)
-                db_fmt(&out, "%s\"%d\":%.17g", i ? "," : "", i, d->prob[i]);
-            db_fmt(&out, "},\"confidence\":%.17g", confidence(d->prob, d->nc));
+            for (int i = 0; i < d->nc; i++) {
+                db_fmt(&out, "%s\"%d\":", i ? "," : "", i);
+                db_number(&out, d->prob[i]);
+            }
+            db_fmt(&out, "},\"confidence\":");
+            db_number(&out, confidence(d->prob, d->nc));
         }
         db_ch(&out, '}');
     }
     db_fmt(&out,
            "},\"usage\":{\"input_tokens\":%u,\"output_tokens\":0,\"prefill_tokens\":%d},"
-           "\"timing_ms\":{\"total\":%.3f,\"prefill\":%.3f,\"decode\":%.3f,"
-           "\"candidates\":%.3f,\"reads\":%d,\"canvases\":%d,\"microbatch\":%d,"
-           "\"prefix_cache\":\"%s\",\"cache_tokens\":%d}}",
-           tokens, processed_tokens, ms, prefill_ms, ms - prefill_ms - cand_ms, cand_ms, reads,
-           canvases, microbatch, cache_state, cache_tokens);
+           "\"timing_ms\":{\"total\":",
+           tokens, processed_tokens);
+    db_millis(&out, ms);
+    db_fmt(&out, ",\"prefill\":");
+    db_millis(&out, prefill_ms);
+    db_fmt(&out, ",\"decode\":");
+    db_millis(&out, ms - prefill_ms - cand_ms);
+    db_fmt(&out, ",\"candidates\":");
+    db_millis(&out, cand_ms);
+    db_fmt(&out,
+           ",\"reads\":%d,\"canvases\":%d,\"microbatch\":%d,\"prefix_cache\":\"%s\","
+           "\"cache_tokens\":%d}}",
+           reads, canvases, microbatch, cache_state, cache_tokens);
     *output_length = out.n;
     return out.p;
 }
@@ -4575,10 +4624,26 @@ void jb_free(void *allocation) {
     jb_release(allocation);
 }
 
+/* strtod follows the locale's decimal point; results always use '.'. */
 static double jb_token_double(const char *json, const JTok *token) {
+    const char *point = localeconv()->decimal_point;
+    size_t point_length = point ? strlen(point) : 0, o = 0;
+    char z[128];
+    if (token->type != JT_PRIMITIVE || !point_length || token->end - token->start > 32)
+        die("invalid numeric result field");
+    for (int i = token->start; i < token->end; i++) {
+        if (o + point_length >= sizeof z)
+            die("invalid numeric result field");
+        if (json[i] == '.') {
+            memcpy(z + o, point, point_length);
+            o += point_length;
+        } else
+            z[o++] = json[i];
+    }
+    z[o] = 0;
     char *end = NULL;
-    double value = strtod(json + token->start, &end);
-    if (end != json + token->end || !jb_finite(value))
+    double value = strtod(z, &end);
+    if (end != z + o || !jb_finite(value))
         die("invalid numeric result field");
     return value;
 }
@@ -5296,6 +5361,34 @@ static int bench_kernels(void) {
     return 0;
 }
 
+/* Numbers in results must use '.' even after a host sets a comma-decimal
+ * locale. Skipped where no such locale is installed. */
+static void dg_test_locale_numbers(void) {
+    static const char *const names[] = {"de_DE.UTF-8", "de_DE.utf8", "de_DE", "de-DE",
+                                        "fr_FR.UTF-8", "fr-FR"};
+    const char *current = setlocale(LC_NUMERIC, NULL);
+    char restore[128];
+    snprintf(restore, sizeof restore, "%s", current ? current : "C");
+    for (size_t i = 0; i < sizeof names / sizeof *names; i++) {
+        if (!setlocale(LC_NUMERIC, names[i]))
+            continue;
+        if (localeconv()->decimal_point[0] == '.')
+            continue;
+        DGBuf b = {0};
+        db_number(&b, 0.25);
+        db_ch(&b, ' ');
+        db_millis(&b, 1.5);
+        JTok t = {JT_PRIMITIVE, 0, 4, -1, 0};
+        int ok = !strcmp(b.p, "0.25 1.500") && jb_token_double("0.25", &t) == 0.25;
+        jb_release(b.p);
+        setlocale(LC_NUMERIC, restore);
+        if (!ok)
+            die2("locale number self-test failed", names[i]);
+        return;
+    }
+    setlocale(LC_NUMERIC, restore);
+}
+
 static int selftest(void) {
     size_t arena_bytes = 0;
     jb_workspace_plan(&arena_bytes, 7, sizeof(char));
@@ -5466,6 +5559,7 @@ static int selftest(void) {
         die("public request error self-test failed");
     jb_session_free(public_session);
     dg_kernel_selftest();
+    dg_test_locale_numbers();
     puts("{\"selftest\":\"ok\"}");
     return 0;
 }
