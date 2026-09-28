@@ -1747,6 +1747,10 @@ static void dg_mm_data(const uint8_t *data, const float *x, float *y, int tokens
                        int cols) {
     if (tokens < 1 || tokens > JB_MAX_CTX)
         die("DiffusionGemma sequence exceeds context limit");
+    /* The SIMD kernels tile row pairs; every model matrix has an even row
+     * count, and requiring it here keeps all kernels to one contract. */
+    if (rows < 2 || rows % 2)
+        die("matrix row count must be even");
     dg_kernels()->bf16_mm(data, x, y, tokens, rows, cols);
 }
 
@@ -1971,8 +1975,6 @@ static void dg_nvfp4_qdq_avx2(float *out, const float *in, int tokens, int cols,
     if (nonfinite)
         die("non-finite NVFP4 activation");
 }
-
-static float dg_hsum8(__m256 x);
 
 static void dg_nvfp4_weights16_avx2(const uint8_t *q, float scale, __m256 *w0, __m256 *w1) {
     const __m128i lut = _mm_setr_epi8(0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12);
