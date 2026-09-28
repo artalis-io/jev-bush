@@ -28,3 +28,5 @@
 "\"samples\""
 "\"steps\""
 "\"id\""
+# Typed-API field separator (inputs starting with byte 0x01)
+"\x1f"

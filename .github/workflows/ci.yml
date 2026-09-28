@@ -173,6 +173,23 @@ jobs:
           ASAN_OPTIONS: detect_leaks=0
         run: sh tools/check_requests.sh ./jb-asan
 
+      # The library releases a failed call's allocations; check that
+      # LeakSanitizer agrees on the example's error path.
+      - name: Library error path (leak-checked)
+        env:
+          ASAN_OPTIONS: detect_leaks=1
+        run: |
+          clang -O1 -g -std=c11 -Wall -Wextra -pedantic -Werror ${{ matrix.flags }} \
+            -fsanitize=address,undefined -fno-sanitize-recover=all \
+            -fno-omit-frame-pointer -DJB_NO_MAIN -I. examples/library.c jb.c -lm \
+            -o library-asan
+          rc=0
+          ./library-asan missing-model 2>err.txt || rc=$?
+          cat err.txt
+          test "$rc" -eq 1
+          grep -q '^jev-bush: model error: open: ' err.txt
+          ! grep -q Sanitizer err.txt
+
   hardening:
     name: Hardened Linux build
     runs-on: ubuntu-latest
