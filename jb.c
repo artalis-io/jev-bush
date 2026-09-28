@@ -291,6 +291,24 @@ static void jb_arena_free(JBArena *a) {
     memset(a, 0, sizeof *a);
 }
 
+/* Reuse a grow-only arena for a new plan. Growth allocates the replacement
+ * before releasing the old block, so a failed allocation leaves the arena
+ * and its recorded capacity intact for later requests. */
+static void jb_arena_reserve(JBArena *a, size_t *capacity, size_t required) {
+    if (required > *capacity) {
+        JBArena grown;
+        jb_arena_init(&grown, required);
+        if (a->allocation)
+            jb_arena_free(a);
+        *a = grown;
+        *capacity = required;
+    } else {
+        a->size = required;
+        a->used = 0;
+        a->peak = 0;
+    }
+}
+
 static void jb_workspace_plan(size_t *used, size_t count, size_t element_size);
 
 /* Bit-level finiteness tests: -ffast-math lets the compiler assume NaN and
@@ -2181,16 +2199,7 @@ typedef struct {
 static JBArena *dg_workspace_begin(DGWorkspace *workspace, size_t required) {
     if (workspace->active)
         die("inference workspace is already active");
-    if (required > workspace->capacity) {
-        if (workspace->arena.allocation)
-            jb_arena_free(&workspace->arena);
-        jb_arena_init(&workspace->arena, required);
-        workspace->capacity = required;
-    } else {
-        workspace->arena.size = required;
-        workspace->arena.used = 0;
-        workspace->arena.peak = 0;
-    }
+    jb_arena_reserve(&workspace->arena, &workspace->capacity, required);
     workspace->active = 1;
     return &workspace->arena;
 }
@@ -2217,16 +2226,7 @@ static void dg_workspace_destroy(DGWorkspace *workspace) {
 static JBArena *dg_control_begin(DGWorkspace *workspace, size_t required) {
     if (workspace->control_active)
         die("worker control storage is already active");
-    if (required > workspace->control_capacity) {
-        if (workspace->control_arena.allocation)
-            jb_arena_free(&workspace->control_arena);
-        jb_arena_init(&workspace->control_arena, required);
-        workspace->control_capacity = required;
-    } else {
-        workspace->control_arena.size = required;
-        workspace->control_arena.used = 0;
-        workspace->control_arena.peak = 0;
-    }
+    jb_arena_reserve(&workspace->control_arena, &workspace->control_capacity, required);
     workspace->control_active = 1;
     return &workspace->control_arena;
 }
@@ -2293,16 +2293,7 @@ static void dg_worker_kv_begin(DGWorkspace *workspace, DGKV *kv, int documents,
     if (workspace->kv_active)
         die("worker K/V storage is already active");
     size_t required = dg_kv_bytes(documents, lengths);
-    if (required > workspace->kv_capacity) {
-        if (workspace->kv_arena.allocation)
-            jb_arena_free(&workspace->kv_arena);
-        jb_arena_init(&workspace->kv_arena, required);
-        workspace->kv_capacity = required;
-    } else {
-        workspace->kv_arena.size = required;
-        workspace->kv_arena.used = 0;
-        workspace->kv_arena.peak = 0;
-    }
+    jb_arena_reserve(&workspace->kv_arena, &workspace->kv_capacity, required);
     workspace->kv_active = 1;
     dg_kv_bind(&workspace->kv_arena, kv, documents, lengths);
 }
