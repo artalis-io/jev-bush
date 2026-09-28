@@ -4140,22 +4140,25 @@ static int dg_system_batch(DGModel *m, DGTokenizer *tok, char **row, size_t *len
     }
     if ((uint64_t)batch * g[0].groups * g[0].width > JB_MAX_CTX)
         ok = 0;
+    /* Suffixes are padded to the longest one. Rows that each fit on their
+     * own but not together as one microbatch run sequentially instead. */
+    int seq = 0;
+    for (int b = 0; ok && b < batch; b++) {
+        int suffix = (int)g[b].pt.n - prefix->n;
+        if (suffix > seq)
+            seq = suffix;
+    }
+    if ((uint64_t)batch * seq > JB_MAX_CTX)
+        ok = 0;
     if (!ok) {
         for (int b = 0; b < batch; b++)
             dg_job_free(&g[b]);
         jb_release(g);
         return 0;
     }
-    int seq = 0;
-    for (int b = 0; b < batch; b++) {
-        int suffix = (int)g[b].pt.n - prefix->n;
-        if (suffix < 1)
+    for (int b = 0; b < batch; b++)
+        if ((int)g[b].pt.n - prefix->n < 1)
             die("schema prefix consumes complete prompt");
-        if (suffix > seq)
-            seq = suffix;
-    }
-    if ((uint64_t)batch * seq > JB_MAX_CTX)
-        die("microbatch suffix exceeds DiffusionGemma work limit");
     int width = g[0].width, maxr = 0, max_segments = 0;
     for (int b = 0; b < batch; b++) {
         max_segments += g[b].groups;
