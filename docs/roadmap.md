@@ -237,6 +237,24 @@ sequential strict reference. B=4 is the measured sweet spot, but the 10.1%
 gain decisively rejects the hoped-for multi-x improvement and does not cross
 the 10 predicates/s research target.
 
+A final Linux PMU sweep closes this optimization hypothesis more directly.
+The counters below are steady-state interval means from the strict AVX-512
+build on the 64-core Threadripper 9980X, using the same 486-token cached-prefix
+workload. Values reported by `perf` are scaled for counter multiplexing. The
+DRAM figure is an estimate of 64 bytes per
+`ls_any_fills_from_sys.dram_io_all` event, not a memory-controller byte count:
+
+| batch | IPC | retired FP | retired MAC FP | cache miss ratio | estimated DRAM fills |
+|---:|---:|---:|---:|---:|---:|
+| 1 | 1.607 | 738 GFLOP/s | 681 GFLOP/s | 3.37% | 8.70 GB/s |
+| 4 | 1.391 | 787 GFLOP/s | 735 GFLOP/s | 5.29% | 5.31 GB/s |
+
+B=4 increases retired floating-point work per second while estimated DRAM
+fills fall and IPC declines. That is strong evidence that execution/compute,
+not sustained DRAM bandwidth, is the remaining limit. Package-energy counters
+were unavailable on this machine, so this is deliberately not presented as a
+power-efficiency result.
+
 The reason is visible in the timings. B=4 suffix prefill took 3.72 seconds
 versus about 4 x 0.91 seconds sequential, while decode took 4.24 seconds versus
 about 4 x 1.25 seconds. Existing kernels already process token matrices and
@@ -278,9 +296,9 @@ primitives against them and against the existing PyTorch checks.
 
 ### Machines without AVX-512
 
-Only the AVX-512 build has vectorized kernels; everything else, including
-Apple Silicon, Graviton, and AVX2-only x86, runs the portable reference
-kernels. `jb --bench-kernels` on a Ryzen 9 5950X (Zen 3, AVX2, 32 threads,
+AVX2-only x86 now has dedicated BF16, NVFP4, RMS-normalization, and attention-
+dot kernels. Apple Silicon and Graviton still use the portable reference
+kernels. The earlier portable baseline on a Ryzen 9 5950X (Zen 3, 32 threads,
 `-O3 -march=native -ffast-math -fopenmp`, 35 GB/s measured streaming read):
 
 | Kernel | Tokens | GFLOP/s | Weight GB/s |
@@ -299,10 +317,9 @@ partly fits the 64 MB L3, so that figure may be cache-assisted. Every multi-toke
 compute-bound far below the CPU's roughly 1.9 TFLOP/s FP32 FMA peak, and the
 NVFP4 expert path, the largest share of model time in the profiles above,
 streams weights at under a tenth of the available bandwidth even for one token.
-AVX2 and NEON versions of the BF16 and NVFP4 kernels are the main opportunity.
-To keep strict builds byte-identical across ISAs, each should reproduce the
-AVX-512 kernels' 16-lane accumulation and reduction order rather than choose
-its own.
+NEON remains the main missing vector tier. Strict output is deterministic for
+each selected backend; different vector widths have different FP32 reduction
+orders and therefore are not promised to be byte-identical across ISAs.
 
 Already completed: packed activation swizzling, two-output-row NVFP4 expert
 tiles, and routed-token grouping by expert. BF16 dot-product instructions were
@@ -330,6 +347,41 @@ Report at least four CPU modes:
 2. warm repeated schema;
 3. lowest single-request latency;
 4. best sustained throughput under a fixed memory budget.
+
+## 8. Concluded Bonsai experiment
+
+The separate Ternary Bonsai 2 27B backend experiment was removed from the
+production tree. It established tokenizer compatibility and close numerical
+agreement with Prism, and native AVX-512 VNNI plus OpenMP reduced a one-token
+forward from 15.25 s scalar to 0.37 s on the 9980X. That did not make the model
+a good Jev Bush backend: causal execution required independent predicate
+continuations, a representative five-decision OpenJev row took 206.35 s, and
+its smoke result was only 3/5 argmax agreement with poor calibration. Further
+cross-token tiling was compute-bound and did not materially improve throughput.
+
+The result is retained as negative evidence, not supported code. Jev Bush
+therefore returns to one implementation file and one model family:
+DiffusionGemma. Future CPU work targets portable AVX2 kernels while preserving
+the scalar reference and existing AVX-512 behavior.
+
+That AVX2 tier is now established. A forced `-mavx2 -mfma -mno-avx512f`
+build selects independent kernels for NVFP4, BF16 matrices, RMS normalization,
+and attention dots; forced scalar and native AVX-512 builds still compile and
+pass the same oracle-backed self-test. Token tiling reuses each BF16 vector or
+decoded NVFP4 block across several activation rows. On one 9980X thread, BF16
+now reaches 17.7 GFLOP/s at one token and 53.6 GFLOP/s at 256 tokens; NVFP4
+reaches 6.93 GFLOP/s at one token and 19.72 GFLOP/s at 64 tokens. The original
+untiled multi-token results were 24.5 and 7.15 GFLOP/s respectively.
+
+On the repeated-schema OpenJev row, warm strict AVX2 latency scales from 18.51
+seconds at 8 threads to 4.51 seconds at 64 before token tiling. Tiling reduces
+the 64-thread result to 2.94--3.00 seconds while preserving byte-identical AVX2
+answers, a further 34% reduction. The unchanged AVX-512 path reaches 2.18
+seconds at 48 threads, so AVX2 is now within 1.35x on this workload. A warm
+64-thread profile attributes 2.28 of 2.94 seconds to MoE experts; GELU and
+activation quantization total 0.91 seconds and are the clearest remaining AVX2
+targets. These figures are from the 9980X with physical-core placement.
+
 
 ## Expected outcome
 

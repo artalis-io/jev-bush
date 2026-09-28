@@ -83,9 +83,21 @@ probabilities. The strict build is byte-identical between cached and
 monolithic execution. This is a correctness boundary, not a tunable tolerance.
 
 Output also records `"kernels"`: `"avx512"` when the build targets AVX-512F
-and AVX-512DQ, otherwise `"scalar"`. The published throughput figures use the
-AVX-512 kernels; other CPUs run the portable scalar kernels, which are much
-slower. `"threads"` records the OpenMP thread count the process ran with.
+and AVX-512DQ, `"avx2"` when it targets AVX2 and FMA without AVX-512, and
+otherwise `"scalar"`. Dispatch is compile-time and ordered AVX-512, AVX2,
+scalar. `"threads"` records the OpenMP thread count the process ran with.
+
+To build specifically for an AVX2/FMA machine while keeping the binary free of
+AVX-512 instructions:
+
+```sh
+cc -O3 -mavx2 -mfma -mno-avx512f -std=c11 -Wall -Wextra -pedantic \
+  -fopenmp jb.c -lm -o jb
+```
+
+The AVX2 tier covers NVFP4 expert projections, BF16 matrices, RMS normalization,
+and attention dot products. The scalar reference and AVX-512 implementations
+remain separately compiled and checked by the same self-test.
 
 For deployments that accept requests from other processes or users, add the
 usual Linux hardening flags; they do not change results:

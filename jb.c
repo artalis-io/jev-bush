@@ -20,6 +20,10 @@
 #define JB_AVX512 1
 #define JB_KERNELS "avx512"
 #include <immintrin.h>
+#elif defined(__AVX2__) && defined(__FMA__)
+#define JB_AVX2 1
+#define JB_KERNELS "avx2"
+#include <immintrin.h>
 #else
 #define JB_KERNELS "scalar"
 #endif
@@ -1057,6 +1061,32 @@ static void dg_nvfp4_mm_avx512(const uint8_t*wd,const uint8_t*sd,float global,co
     }
 }
 #endif
+#if defined(JB_AVX2)
+static float dg_hsum8(__m256 x);
+/* AVX2 has no convenient cross-lane nibble expansion. Decode one 16-value
+ * NVFP4 block to a small stack tile, then reuse it across the token batch. */
+static void dg_nvfp4_mm_avx2(const uint8_t*wd,const uint8_t*sd,float global,const float*x,float*y,int tokens,int rows,int cols){
+    static const float lut[16]={0,.5f,1,1.5f,2,3,4,6,0,-.5f,-1,-1.5f,-2,-3,-4,-6};
+#ifdef _OPENMP
+    JB_OMP();
+#pragma omp parallel for schedule(static)
+#endif
+    for(int r=0;r<rows;r++){
+        const uint8_t*wp=wd+(uint64_t)r*cols/2,*sp=sd+(uint64_t)r*cols/16;
+        for(int tb=0;tb<tokens;tb+=4){
+            int nb=tokens-tb<4?tokens-tb:4;__m256 acc0[4],acc1[4];
+            for(int q=0;q<nb;q++)acc0[q]=acc1[q]=_mm256_setzero_ps();
+            for(int c=0;c<cols;c+=16){
+                float wv[16],scale=dg_f8e4m3(sp[c/16])*global;const uint8_t*z=wp+c/2;
+                for(int k=0;k<8;k++){uint8_t v=z[k];wv[2*k]=lut[v&15]*scale;wv[2*k+1]=lut[v>>4]*scale;}
+                __m256 w0=_mm256_loadu_ps(wv),w1=_mm256_loadu_ps(wv+8);
+                for(int q=0;q<nb;q++){const float*xp=x+(size_t)(tb+q)*cols+c;acc0[q]=_mm256_fmadd_ps(w0,_mm256_loadu_ps(xp),acc0[q]);acc1[q]=_mm256_fmadd_ps(w1,_mm256_loadu_ps(xp+8),acc1[q]);}
+            }
+            for(int q=0;q<nb;q++)y[(size_t)(tb+q)*rows+r]=dg_hsum8(_mm256_add_ps(acc0[q],acc1[q]));
+        }
+    }
+}
+#endif
 /* x comes from dg_nvfp4_qdq, in the layout the selected kernel expects. */
 static void dg_nvfp4_mm(const DGTensor*w,const DGTensor*s,const DGTensor*g,
                         const float*x,float*y,int tokens,int rows,int cols){
@@ -1066,6 +1096,8 @@ static void dg_nvfp4_mm(const DGTensor*w,const DGTensor*s,const DGTensor*g,
     float global;memcpy(&global,g->data,4);
 #if defined(JB_AVX512)
     dg_nvfp4_mm_avx512(w->data,s->data,global,x,y,tokens,rows,cols);
+#elif defined(JB_AVX2)
+    dg_nvfp4_mm_avx2(w->data,s->data,global,x,y,tokens,rows,cols);
 #else
     dg_nvfp4_mm_ref(w->data,s->data,global,x,y,tokens,rows,cols);
 #endif
@@ -1090,6 +1122,24 @@ static void dg_mm_data_avx512(const uint8_t*data,const float*x,float*y,int token
     }
 }
 #endif
+#if defined(JB_AVX2)
+static __m256 dg_bf16x8(const uint8_t*p){__m128i h=_mm_loadu_si128((const __m128i*)p);return _mm256_castsi256_ps(_mm256_slli_epi32(_mm256_cvtepu16_epi32(h),16));}
+static float dg_hsum8(__m256 x){__m128 h=_mm_add_ps(_mm256_castps256_ps128(x),_mm256_extractf128_ps(x,1));h=_mm_hadd_ps(h,h);h=_mm_hadd_ps(h,h);return _mm_cvtss_f32(h);}
+static void dg_mm_data_avx2(const uint8_t*data,const float*x,float*y,int tokens,int rows,int cols){
+#ifdef _OPENMP
+    JB_OMP();
+#pragma omp parallel for schedule(static)
+#endif
+    for(int r=0;r<rows;r++){
+        const uint8_t*p=data+(uint64_t)r*cols*2;
+        for(int tb=0;tb<tokens;tb+=8){
+            int nb=tokens-tb<8?tokens-tb:8;__m256 a[8];for(int q=0;q<nb;q++)a[q]=_mm256_setzero_ps();int c=0;
+            for(;c+7<cols;c+=8){__m256 w=dg_bf16x8(p+c*2);for(int q=0;q<nb;q++)a[q]=_mm256_fmadd_ps(w,_mm256_loadu_ps(x+(size_t)(tb+q)*cols+c),a[q]);}
+            for(int q=0;q<nb;q++){float z=dg_hsum8(a[q]);for(int k=c;k<cols;k++)z+=dg_bf(p+k*2)*x[(size_t)(tb+q)*cols+k];y[(size_t)(tb+q)*rows+r]=z;}
+        }
+    }
+}
+#endif
 static void dg_mm_data_ref(const uint8_t*data,const float*x,float*y,int tokens,int rows,int cols){
 #ifdef _OPENMP
 #pragma omp parallel for schedule(static)
@@ -1105,6 +1155,8 @@ static void dg_mm_data(const uint8_t*data,const float*x,float*y,int tokens,int r
     if(tokens<1||tokens>JB_MAX_CTX)die("DiffusionGemma sequence exceeds context limit");
 #if defined(JB_AVX512)
     dg_mm_data_avx512(data,x,y,tokens,rows,cols);
+#elif defined(JB_AVX2)
+    dg_mm_data_avx2(data,x,y,tokens,rows,cols);
 #else
     dg_mm_data_ref(data,x,y,tokens,rows,cols);
 #endif
@@ -1191,9 +1243,15 @@ static void dg_rms_avx512(float *y, const float *x, const DGTensor *scale, int n
     for(;i<n;i++)y[i]=x[i]*q*(scale?dg_at(scale,i):1.0f);
 }
 #endif
+#if defined(JB_AVX2)
+static double dg_hsum4d(__m256d x){__m128d h=_mm_add_pd(_mm256_castpd256_pd128(x),_mm256_extractf128_pd(x,1));h=_mm_hadd_pd(h,h);return _mm_cvtsd_f64(h);}
+static void dg_rms_avx2(float*y,const float*x,const DGTensor*scale,int n){__m256d a=_mm256_setzero_pd(),b=a;int i=0;for(;i+7<n;i+=8){__m256 v=_mm256_loadu_ps(x+i);__m256d lo=_mm256_cvtps_pd(_mm256_castps256_ps128(v)),hi=_mm256_cvtps_pd(_mm256_extractf128_ps(v,1));a=_mm256_fmadd_pd(lo,lo,a);b=_mm256_fmadd_pd(hi,hi,b);}double ss=dg_hsum4d(_mm256_add_pd(a,b));for(;i<n;i++)ss+=(double)x[i]*x[i];float q=1.0f/sqrtf((float)(ss/n)+1e-6f);i=0;if(scale)for(;i+7<n;i+=8)_mm256_storeu_ps(y+i,_mm256_mul_ps(_mm256_mul_ps(_mm256_loadu_ps(x+i),_mm256_set1_ps(q)),dg_bf16x8(scale->data+(size_t)i*2)));else for(;i+7<n;i+=8)_mm256_storeu_ps(y+i,_mm256_mul_ps(_mm256_loadu_ps(x+i),_mm256_set1_ps(q)));for(;i<n;i++)y[i]=x[i]*q*(scale?dg_at(scale,i):1.0f);}
+#endif
 static void dg_rms(float *y, const float *x, const DGTensor *scale, int n) {
 #if defined(JB_AVX512)
     dg_rms_avx512(y, x, scale, n);
+#elif defined(JB_AVX2)
+    dg_rms_avx2(y,x,scale,n);
 #else
     dg_rms_ref(y, x, scale, n);
 #endif
@@ -1209,9 +1267,14 @@ static double dg_dot_avx512(const float*a,const float*b,int n){
     __m512d s0=_mm512_setzero_pd(),s1=s0;int i=0;for(;i+15<n;i+=16){__m512 x=_mm512_loadu_ps(a+i),y=_mm512_loadu_ps(b+i);s0=_mm512_fmadd_pd(_mm512_cvtps_pd(_mm512_castps512_ps256(x)),_mm512_cvtps_pd(_mm512_castps512_ps256(y)),s0);s1=_mm512_fmadd_pd(_mm512_cvtps_pd(_mm512_extractf32x8_ps(x,1)),_mm512_cvtps_pd(_mm512_extractf32x8_ps(y,1)),s1);}double s=_mm512_reduce_add_pd(_mm512_add_pd(s0,s1));for(;i<n;i++)s+=(double)a[i]*b[i];return s;
 }
 #endif
+#if defined(JB_AVX2)
+static double dg_dot_avx2(const float*a,const float*b,int n){__m256d s0=_mm256_setzero_pd(),s1=s0;int i=0;for(;i+7<n;i+=8){__m256 x=_mm256_loadu_ps(a+i),y=_mm256_loadu_ps(b+i);s0=_mm256_fmadd_pd(_mm256_cvtps_pd(_mm256_castps256_ps128(x)),_mm256_cvtps_pd(_mm256_castps256_ps128(y)),s0);s1=_mm256_fmadd_pd(_mm256_cvtps_pd(_mm256_extractf128_ps(x,1)),_mm256_cvtps_pd(_mm256_extractf128_ps(y,1)),s1);}double s=dg_hsum4d(_mm256_add_pd(s0,s1));for(;i<n;i++)s+=(double)a[i]*b[i];return s;}
+#endif
 static double dg_dot(const float*a,const float*b,int n){
 #if defined(JB_AVX512)
     return dg_dot_avx512(a,b,n);
+#elif defined(JB_AVX2)
+    return dg_dot_avx2(a,b,n);
 #else
     return dg_dot_ref(a,b,n);
 #endif
@@ -1992,7 +2055,7 @@ static int bench_kernels(void) {
     for (size_t k = 0; k < sizeof mm_tokens / sizeof *mm_tokens; k++) {
         int tokens = mm_tokens[k];
         for (int kernel = 0; kernel < 2; kernel++) {
-#if !defined(JB_AVX512)
+#if !defined(JB_AVX512) && !defined(JB_AVX2)
             if (kernel) break;
 #endif
             dg_mm_data_ref(w, x, y, tokens, rows, cols);
@@ -2024,7 +2087,7 @@ static int bench_kernels(void) {
     for (size_t k = 0; k < sizeof nv_tokens / sizeof *nv_tokens; k++) {
         int tokens = nv_tokens[k];
         for (int kernel = 0; kernel < 2; kernel++) {
-#if !defined(JB_AVX512)
+#if !defined(JB_AVX512) && !defined(JB_AVX2)
             if (kernel) break;
 #endif
             for (int rep = 0; rep < 3; rep++) {
@@ -2032,6 +2095,9 @@ static int bench_kernels(void) {
                 for (int e = 0; e < experts; e++) {
 #if defined(JB_AVX512)
                     if (kernel) dg_nvfp4_mm_avx512(wd + wbytes * e, sd + sbytes * e, 0.01f, xs, yo, tokens, nr, nc);
+                    else
+#elif defined(JB_AVX2)
+                    if (kernel) dg_nvfp4_mm_avx2(wd + wbytes * e, sd + sbytes * e, 0.01f, xs, yo, tokens, nr, nc);
                     else
 #endif
                         dg_nvfp4_mm_ref(wd + wbytes * e, sd + sbytes * e, 0.01f, xq, yo, tokens, nr, nc);
