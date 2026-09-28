@@ -157,13 +157,23 @@ static uint64_t now_ns(void);
  * cache) is detached with jb_untrack() so a later failure cannot free it.
  * Tracked allocations are released only by the thread that made them; OpenMP
  * workers allocate untracked. Without a frame (the CLI), die() exits. */
+/* max_align_t is missing from MSVC's C mode; align the header for the
+ * strictest standard types instead so every allocation stays aligned. */
+typedef union {
+    long double ld;
+    long long ll;
+    double d;
+    void *p;
+    void (*f)(void);
+} JBMaxAlign;
+
 typedef union JBAllocation {
     struct {
         union JBAllocation *previous, *next;
         uint64_t sequence;
         int tracked;
     } link;
-    max_align_t align;
+    JBMaxAlign align;
 } JBAllocation;
 
 typedef struct JBErrorFrame {
