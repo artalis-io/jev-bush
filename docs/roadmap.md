@@ -336,7 +336,9 @@ Measured on an NVIDIA DGX Spark (GB10, 10 Cortex-X925 + 10 Cortex-A725 cores,
 checkpoint at revision `ec4ff3d`, over 40 dataset rows (every tenth row, 10 per
 workflow, 200 decisions, one read): all 200 answer objects are byte-identical
 between the NEON and `-DJB_SCALAR` builds. NEON took 660 s against 3,325 s for
-the reference (16.3 against 81.6 s per row after the first), 5.0x faster.
+the reference (16.3 against 81.6 s per row after the first), 5.0x faster. After
+the NVFP4 decoding work below, NEON takes 626 s against 3,322 s (15.4 against
+81.5 s per row after the first), 5.3x faster, still byte-identical on all 200.
 
 Fast-math is not a parity configuration on ARM either: against the strict
 reference, fast-math NEON agrees on 93.5% of argmaxes (mean total variation
@@ -344,10 +346,26 @@ reference, fast-math NEON agrees on 93.5% of argmaxes (mean total variation
 workload, because it disables prefix reuse. On ARM the strict NEON build is both
 exact and the fastest.
 
+A profiled row spends about half its time in NVFP4 expert matrices, 26% in
+attention (10% projections, 9% dots and softmax), 9% in the dense feed-forward
+layer, and 12% in GELU and activation quantization. NVFP4 decoding therefore
+reads each 16-weight block for four rows with one table lookup per lane group,
+from a table of signed E2M1 floats that keeps -0.0; decodes the four rows'
+E4M3 scales with vector integer operations; and loads each block's activations
+once, multiplying by lane. The per-row order of operations is unchanged. On one
+X925 core, single-token NVFP4 rose from 9.6 to 10.8 GFLOP/s; on 20 threads from
+56 to 68. End to end, the 40 rows went from 654 to 626 s at the same binding.
+Without fused multiply-adds, which bit-identity rules out, each weight pair
+costs five vector operations, so multi-token NVFP4 runs at about 70% of what
+exact arithmetic allows.
+
 Kernel throughput against the reference on the same machine (`--bench-kernels`,
-20 threads, 96 GB/s streaming read): BF16 3.6x at 1 and 64 tokens and 10.9x at
-256; NVFP4 1.3x at one token, 2.2x at 4, 2.8x at 16, and 3.8x at 64. Single-
-token NVFP4 remains limited by decoding four rows' packed weights per block.
+20 threads, `OMP_PROC_BIND=close`): BF16 2.3x at one token, 3.5x at 64, and
+11x at 256; NVFP4 1.9x at one token and 4.5x at 64. This microbenchmark is
+sensitive to thread placement on GB10, whose firmware reports a fast and a slow
+core as one "core": `OMP_PLACES=cores` made single-token NVFP4 about five times
+slower there. End-to-end rows are not: all 40 took within 1% under either
+placement, for both builds.
 
 Already completed: packed activation swizzling, two-output-row NVFP4 expert
 tiles, and routed-token grouping by expert. BF16 dot-product instructions were
