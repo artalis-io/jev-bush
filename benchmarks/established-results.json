@@ -156,6 +156,15 @@
         "previous_neon_seconds_same_binding": 626,
         "attention_scoring_seconds_eight_rows": {"before": 6.8, "after": 5.8}
       },
+      "after_fused_experts_and_dynamic_scheduling": {
+        "binding": "OMP_PROC_BIND=close",
+        "strict_identical_answer_objects": 200,
+        "strict_neon_seconds": 591,
+        "strict_neon_seconds_dynamic_scheduling": 275,
+        "strict_reference_seconds_dynamic_scheduling": 3353,
+        "reference_answers_unchanged": true,
+        "profiled_eight_rows_seconds": {"static": 74, "dynamic": 33}
+      },
       "rejected_fast_math_fused_multiply_add": {
         "fast_neon_seconds": {"before": 915, "after": 901},
         "note": "fast math disables prefix reuse, so both are slower than strict NEON"

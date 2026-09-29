@@ -341,7 +341,10 @@ the reference (16.3 against 81.6 s per row after the first), 5.0x faster. After
 the NVFP4 decoding work below, NEON takes 626 s against 3,322 s (15.4 against
 81.5 s per row after the first), 5.3x faster, still byte-identical on all 200.
 With the batched attention dots below, NEON takes 608 s, 5.5x faster than the
-reference, again byte-identical on all 200.
+reference, again byte-identical on all 200. With the fused expert kernel and
+dynamic scheduling below, NEON takes 275 s against 3,353 s for the reference,
+12.2x faster, byte-identical on all 200; the reference's own answers are also
+unchanged.
 
 Fast-math is not a parity configuration on ARM either: against the strict
 reference, fast-math NEON agrees on 93.5% of argmaxes (mean total variation
@@ -376,6 +379,25 @@ block before scaling it, were measured and rejected: the 40 rows went from 915
 to 901 s (1.5%), NVFP4 matrices improved about 4%, and GCC's fast-math code was
 already close. The strict/fast split was not worth that. CI still builds and
 self-tests fast-math NEON.
+
+Each expert's gate and up products and its GELU run as one `nvfp4_gated`
+kernel operation. The reference and x86 backends keep the three steps; NEON
+computes gate and up for the same four rows and applies GELU in the same
+parallel loop, so GELU no longer runs serially for experts with few tokens.
+Every value is the one the separate steps produce. The 40 rows went from 608 to
+591 s.
+
+Scheduling mattered far more. The kernels' row blocks, the attention and
+per-token loops, and the activation quantizer's blocks were split evenly
+across threads, so on GB10 every such region waited for the A725 cores, whose
+SIMD is much weaker than the X925's. Dynamic scheduling lets the fast cores take
+more of the work; iterations are independent, so results are unchanged. Over
+eight profiled rows the total fell from 74 to 33 s: expert products from 37 to
+14 s, activation quantization from 6.1 to 1.5 s, attention from 20 to 12 s, and
+the dense layer from 7.1 to 3.6 s. The 40 rows went from 591 to 275 s. Every
+loop dynamic with chunk 1 was slower (37 s over eight rows), because
+per-element loops pay for it; those stay static. The AVX2 and AVX-512 kernels
+keep static schedules until someone measures dynamic ones on x86.
 
 Kernel throughput against the reference on the same machine (`--bench-kernels`,
 20 threads, `OMP_PROC_BIND=close`): BF16 2.3x at one token, 3.5x at 64, and
