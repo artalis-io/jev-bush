@@ -99,6 +99,13 @@ The AVX2 tier covers NVFP4 expert projections, BF16 matrices, RMS normalization,
 and attention dot products. The scalar reference and AVX-512 implementations
 remain separately compiled and checked by the same self-test.
 
+On little-endian AArch64 (Apple Silicon, Graviton, NVIDIA Grace and GB10) the
+portable build selects the NEON tier automatically. It covers NVFP4 and BF16
+matrices and RMS normalization; each vector lane computes one output row in the
+reference's accumulation order, so strict NEON builds are bit-identical to the
+reference kernels, which the self-test checks. Attention dots keep the
+reference, whose sequential double sum has no reordering-free vector form.
+
 ### C library API
 
 [`jb.h`](jb.h) exposes opaque model and session handles, typed
@@ -141,7 +148,7 @@ for a complete typed example.
 
 Internally, model execution uses one small `DGKernelOps` table for BF16 GEMM,
 NVFP4 quantization/GEMM, RMS normalization, and attention dots. Scalar, AVX2,
-and AVX-512 differ only behind that boundary; inference, validation, benchmarks,
+AVX-512, and NEON differ only behind that boundary; inference, validation, benchmarks,
 and JSON output contain no ISA dispatch branches. Selection remains compile-time
 so the portable build does not require runtime CPU detection.
 

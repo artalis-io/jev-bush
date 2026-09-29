@@ -125,6 +125,28 @@
       "throughput_scaling": [1.0, 1.084591, 1.101119, 1.091266],
       "validation": "all repeated rows byte-identical to B=1; eight varying OpenJev rows at B=4 were 8/8 byte-identical to sequential strict output"
     },
+    "neon_parity": {
+      "hardware": "NVIDIA DGX Spark (GB10: 10 Cortex-X925 + 10 Cortex-A725)",
+      "threads": 20,
+      "compiler": "gcc 13.3.0",
+      "compiler_flags": "-O3 -march=native -std=c11 -fopenmp; the reference build adds -DJB_SCALAR",
+      "model": "nvidia/diffusiongemma-26B-A4B-it-NVFP4",
+      "model_revision": "ec4ff3df205028f4e81c954c2227f9312b3ec2ea",
+      "rows": "every tenth dataset row (10 per workflow), samples 1",
+      "rows_measured": 40,
+      "decisions": 200,
+      "strict_identical_answer_objects": 200,
+      "strict_argmax_agreement": 1.0,
+      "strict_max_abs_probability_difference": 0.0,
+      "strict_neon_seconds": 660,
+      "strict_reference_seconds": 3325,
+      "strict_mean_row_s_after_first": {"neon": 16.28, "reference": 81.63},
+      "fast_math_vs_strict_reference": {
+        "neon": {"argmax_agreement": 0.935, "mean_total_variation": 0.0749},
+        "reference": {"argmax_agreement": 0.92, "mean_total_variation": 0.0723}
+      },
+      "validation": "answer objects compared with tools/compare_answers.py"
+    },
     "openjev": {
       "hardware": "NVIDIA RTX PRO 6000 Blackwell",
       "read_policy": "one",
