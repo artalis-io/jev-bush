@@ -141,6 +141,14 @@
       "strict_neon_seconds": 660,
       "strict_reference_seconds": 3325,
       "strict_mean_row_s_after_first": {"neon": 16.28, "reference": 81.63},
+      "after_nvfp4_decoding": {
+        "binding": "OMP_PROC_BIND=close",
+        "strict_identical_answer_objects": 200,
+        "strict_neon_seconds": 626,
+        "strict_reference_seconds": 3322,
+        "strict_mean_row_s_after_first": {"neon": 15.44, "reference": 81.53},
+        "previous_neon_seconds_same_binding": 654
+      },
       "fast_math_vs_strict_reference": {
         "neon": {"argmax_agreement": 0.935, "mean_total_variation": 0.0749},
         "reference": {"argmax_agreement": 0.92, "mean_total_variation": 0.0723}
