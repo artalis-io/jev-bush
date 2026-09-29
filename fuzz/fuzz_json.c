@@ -59,26 +59,31 @@ static void *fuzz_malloc(size_t n) {
     fuzz_live += p != NULL;
     return p;
 }
+
 static void *fuzz_calloc(size_t n, size_t z) {
     void *p = calloc(n, z);
     fuzz_live += p != NULL;
     return p;
 }
+
 static void *fuzz_realloc(void *p, size_t n) {
     void *q = realloc(p, n);
     fuzz_live += q && !p;
     return q;
 }
+
 static void fuzz_free(void *p) {
     fuzz_live -= p != NULL;
     free(p);
 }
+
 /* jb.c only exits when die() runs without an error frame, and every input
  * here runs under one. */
 static void fuzz_exit(int code) {
     (void)code;
     abort();
 }
+
 static int fuzz_fprintf(FILE *f, const char *fmt, ...) {
     (void)f;
     (void)fmt;
