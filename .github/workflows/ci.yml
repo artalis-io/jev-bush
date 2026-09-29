@@ -27,7 +27,17 @@ jobs:
         if: runner.os != 'Windows'
         run: |
           cc -O2 -std=c11 -Wall -Wextra -pedantic jb.c -lm -o jb
-          ./jb --selftest
+          ./jb --selftest | tee selftest.json
+
+      # ARM runners select the NEON backend, whose strict selftest also checks
+      # bit-identity with the reference; -DJB_SCALAR builds that reference.
+      - name: NEON backend and reference build
+        if: runner.arch == 'ARM64'
+        run: |
+          grep -q '"kernels":"neon"' selftest.json
+          cc -O2 -std=c11 -Wall -Wextra -pedantic -Werror -DJB_SCALAR jb.c -lm -o jb-scalar
+          ./jb-scalar --selftest | tee scalar.json
+          grep -q '"kernels":"scalar"' scalar.json
 
       - name: Build and test
         if: runner.os == 'Windows'
