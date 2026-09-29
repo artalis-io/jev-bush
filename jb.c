@@ -1706,6 +1706,48 @@ static void dg_nvfp4_qdq_ref(float *out, const float *in, int tokens, int cols, 
         }
 }
 
+/* The reference quantizer's arithmetic, block for block, spread over the
+ * OpenMP team: the vector backends use it, and it matches the reference byte
+ * for byte. The scalar build keeps the serial reference as its oracle. */
+static void dg_nvfp4_qdq_parallel(float *out, const float *in, int tokens, int cols, float base) {
+    if (!jb_finitef(base) || !(base > 0) || cols % 32)
+        die("invalid NVFP4 activation scale");
+    int nb = cols / 16, blocks = tokens * nb, nonfinite = 0;
+    /* die() must not run inside the parallel region: OpenMP workers have no
+     * error frame, so it would exit the host process, and a longjmp out of
+     * the region is undefined. Record the failure and report it afterwards. */
+    {
+        int z;
+#ifdef _OPENMP
+        JB_OMP();
+#pragma omp parallel for schedule(static) if (blocks >= 256) reduction(| : nonfinite)
+#endif
+        for (z = 0; z < blocks; z++) {
+            int t = z / nb, b = z % nb, bad = 0;
+            const float *x = in + (size_t)t * cols + (size_t)b * 16;
+            float *y = out + (size_t)t * cols + (size_t)b * 16, amax = 0;
+            for (int k = 0; k < 16; k++) {
+                bad |= !jb_finitef(x[k]);
+                if (fabsf(x[k]) > amax)
+                    amax = fabsf(x[k]);
+            }
+            if (bad) {
+                nonfinite = 1;
+                continue;
+            }
+            float s = dg_f8e4m3_round((amax / 6) / base) * base;
+            if (s == 0) {
+                memset(y, 0, 16 * sizeof *y);
+                continue;
+            }
+            for (int k = 0; k < 16; k++)
+                y[k] = dg_e2m1_round(x[k] / s) * s;
+        }
+    }
+    if (nonfinite)
+        die("non-finite NVFP4 activation");
+}
+
 /* Produces the activation layout the selected dg_nvfp4_mm kernel expects. */
 static void dg_nvfp4_qdq(float *out, const float *in, int tokens, int cols, float base) {
     dg_kernels()->nvfp4_qdq(out, in, tokens, cols, base);
@@ -1982,45 +2024,6 @@ static void dg_mm_data_avx2(const uint8_t *data, const float *x, float *y, int t
             }
         }
     }
-}
-
-static void dg_nvfp4_qdq_avx2(float *out, const float *in, int tokens, int cols, float base) {
-    if (!jb_finitef(base) || !(base > 0) || cols % 32)
-        die("invalid NVFP4 activation scale");
-    int nb = cols / 16, blocks = tokens * nb, nonfinite = 0;
-    /* die() must not run inside the parallel region: OpenMP workers have no
-     * error frame, so it would exit the host process, and a longjmp out of
-     * the region is undefined. Record the failure and report it afterwards. */
-    {
-        int z;
-#ifdef _OPENMP
-        JB_OMP();
-#pragma omp parallel for schedule(static) if (blocks >= 256) reduction(| : nonfinite)
-#endif
-        for (z = 0; z < blocks; z++) {
-            int t = z / nb, b = z % nb, bad = 0;
-            const float *x = in + (size_t)t * cols + (size_t)b * 16;
-            float *y = out + (size_t)t * cols + (size_t)b * 16, amax = 0;
-            for (int k = 0; k < 16; k++) {
-                bad |= !jb_finitef(x[k]);
-                if (fabsf(x[k]) > amax)
-                    amax = fabsf(x[k]);
-            }
-            if (bad) {
-                nonfinite = 1;
-                continue;
-            }
-            float s = dg_f8e4m3_round((amax / 6) / base) * base;
-            if (s == 0) {
-                memset(y, 0, 16 * sizeof *y);
-                continue;
-            }
-            for (int k = 0; k < 16; k++)
-                y[k] = dg_e2m1_round(x[k] / s) * s;
-        }
-    }
-    if (nonfinite)
-        die("non-finite NVFP4 activation");
 }
 
 static void dg_nvfp4_weights16_avx2(const uint8_t *q, float scale, __m256 *w0, __m256 *w1) {
@@ -2312,6 +2315,7 @@ static double dg_dot_avx512(const float *a, const float *b, int n) {
 
 static const DGKernelOps *dg_kernels(void) {
 #if defined(JB_AVX512)
+    (void)dg_nvfp4_qdq_parallel;
     (void)dg_nvfp4_qdq_ref;
     (void)dg_nvfp4_mm_ref;
     (void)dg_mm_data_ref;
@@ -2327,11 +2331,12 @@ static const DGKernelOps *dg_kernels(void) {
     (void)dg_mm_data_ref;
     (void)dg_rms_ref;
     (void)dg_dot_ref;
-    static const DGKernelOps selected = {"avx2",           dg_nvfp4_qdq_avx2, NULL,
-                                         dg_nvfp4_mm_avx2, dg_mm_data_avx2,   dg_rms_avx2,
+    static const DGKernelOps selected = {"avx2",           dg_nvfp4_qdq_parallel, NULL,
+                                         dg_nvfp4_mm_avx2, dg_mm_data_avx2,       dg_rms_avx2,
                                          dg_dot_avx2};
     return &selected;
 #else
+    (void)dg_nvfp4_qdq_parallel;
     static const DGKernelOps scalar = {"scalar",       dg_nvfp4_qdq_ref, NULL,      dg_nvfp4_mm_ref,
                                        dg_mm_data_ref, dg_rms_ref,       dg_dot_ref};
     return &scalar;
