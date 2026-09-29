@@ -119,7 +119,7 @@ typedef struct {
     uint64_t layers, attention, attention_qkv, attention_prepare;
     uint64_t attention_kv, attention_core, attention_output;
     uint64_t dense, router, experts, ff_other, embedding, final_norm, kv_free;
-    uint64_t moe_input_qdq, moe_gate, moe_up, moe_activation;
+    uint64_t moe_input_qdq, moe_gated;
     uint64_t moe_hidden_qdq, moe_down;
     uint64_t prompt_tokens, system_tokens, state_tokens;
     uint64_t omp_regions, alloc_calls, hot_alloc_calls, alloc_ns;
@@ -964,12 +964,23 @@ typedef struct {
     int nd, dtype;
 } DGTensor;
 
+/* One NVFP4 weight matrix: packed E2M1 weights, E4M3 block scales, and the
+ * global scale. */
+typedef struct {
+    const uint8_t *w, *s;
+    float global;
+} DGNvMatrix;
+
 typedef struct {
     const char *name;
     void (*nvfp4_qdq)(float *, const float *, int, int, float);
     void (*nvfp4_layout)(float *, int, int);
     void (*nvfp4_mm)(const uint8_t *, const uint8_t *, float, const float *, float *, int, int,
                      int);
+    /* h = gelu(gate x) * (up x), both products computed as nvfp4_mm does;
+     * g is scratch for tokens * rows floats. */
+    void (*nvfp4_gated)(const DGNvMatrix *gate, const DGNvMatrix *up, const float *x, float *g,
+                        float *h, int tokens, int rows, int cols);
     void (*bf16_mm)(const uint8_t *, const float *, float *, int, int, int);
     void (*rms)(float *, const float *, const DGTensor *, int);
     double (*dot)(const float *, const float *, int);
@@ -1820,17 +1831,52 @@ static void dg_nvfp4_mm_ref(const uint8_t *wd, const uint8_t *sd, float global, 
     }
 }
 
-/* x comes from dg_nvfp4_qdq, in the layout the selected kernel expects. */
-static void dg_nvfp4_mm(const DGTensor *w, const DGTensor *s, const DGTensor *g, const float *x,
-                        float *y, int tokens, int rows, int cols) {
+static float dg_gelu(float x) {
+    return .5f * x * (1.0f + tanhf(.7978845608028654f * (x + .044715f * x * x * x)));
+}
+
+static DGNvMatrix dg_nvfp4_matrix(const DGTensor *w, const DGTensor *s, const DGTensor *g, int rows,
+                                  int cols) {
     if (w->dtype != DG_U8 || w->nd != 2 || w->shape[0] != (uint64_t)rows ||
         w->shape[1] != (uint64_t)cols / 2 || s->dtype != DG_F8E4M3 || s->nd != 2 ||
         s->shape[0] != (uint64_t)rows || s->shape[1] != (uint64_t)cols / 16 || g->dtype != DG_F32 ||
         g->nd != 0 || g->bytes != 4 || cols % 32 || rows % 2)
         die2("bad NVFP4 expert tensor", w->name);
-    float global;
-    memcpy(&global, g->data, 4);
-    dg_kernels()->nvfp4_mm(w->data, s->data, global, x, y, tokens, rows, cols);
+    DGNvMatrix m = {w->data, s->data, 0};
+    memcpy(&m.global, g->data, 4);
+    return m;
+}
+
+/* x comes from dg_nvfp4_qdq, in the layout the selected kernel expects. */
+static void dg_nvfp4_mm(const DGTensor *w, const DGTensor *s, const DGTensor *g, const float *x,
+                        float *y, int tokens, int rows, int cols) {
+    DGNvMatrix m = dg_nvfp4_matrix(w, s, g, rows, cols);
+    dg_kernels()->nvfp4_mm(m.w, m.s, m.global, x, y, tokens, rows, cols);
+}
+
+/* The gated product as separate steps: two backend matrix products, then
+ * GELU, for backends without a fused form. */
+static void dg_nvfp4_gated_each(const DGNvMatrix *gate, const DGNvMatrix *up, const float *x,
+                                float *g, float *h, int tokens, int rows, int cols) {
+    dg_kernels()->nvfp4_mm(gate->w, gate->s, gate->global, x, g, tokens, rows, cols);
+    dg_kernels()->nvfp4_mm(up->w, up->s, up->global, x, h, tokens, rows, cols);
+    {
+        int i;
+#ifdef _OPENMP
+        JB_OMP();
+#pragma omp parallel for schedule(static) if (tokens * rows >= 4096)
+#endif
+        for (i = 0; i < tokens * rows; i++)
+            h[i] = dg_gelu(g[i]) * h[i];
+    }
+}
+
+/* gelu(gate x) * (up x) for one expert; g is scratch. */
+static void dg_nvfp4_gated(const DGNvExpert *v, const float *x, float *g, float *h, int tokens,
+                           int rows, int cols) {
+    DGNvMatrix gate = dg_nvfp4_matrix(v->wg, v->sg, v->gg, rows, cols),
+               up = dg_nvfp4_matrix(v->wu, v->su, v->gu, rows, cols);
+    dg_kernels()->nvfp4_gated(&gate, &up, x, g, h, tokens, rows, cols);
 }
 
 static void dg_mm_data_ref(const uint8_t *data, const float *x, float *y, int tokens, int rows,
@@ -1992,10 +2038,6 @@ static void dg_rms_ref(float *y, const float *x, const DGTensor *scale, int n) {
 
 static void dg_rms(float *y, const float *x, const DGTensor *scale, int n) {
     dg_kernels()->rms(y, x, scale, n);
-}
-
-static float dg_gelu(float x) {
-    return .5f * x * (1.0f + tanhf(.7978845608028654f * (x + .044715f * x * x * x)));
 }
 
 static double dg_dot_ref(const float *a, const float *b, int n) {
@@ -2510,9 +2552,34 @@ static float32x4_t dg_nvfp4_block_neon(float32x4_t acc, const float32x4_t *even,
     return acc;
 }
 
-/* x in the dg_nvfp4_qdq_ref layout. */
+/* Four rows' products with the nb tokens from tb, in the reference's order;
+ * rows past the end repeat the last row. x in the dg_nvfp4_qdq_ref layout. */
+static void dg_nvfp4_rows4_neon(const DGNvMatrix *m, const float *x, int r0, int rows, int cols,
+                                int tb, int nb, float32x4_t *acc) {
+    const uint8_t *wp[4], *sp[4];
+    for (int i = 0; i < 4; i++) {
+        int r = dg_neon_row(r0, i, rows);
+        wp[i] = m->w + (uint64_t)r * cols / 2;
+        sp[i] = m->s + (uint64_t)r * cols / 16;
+    }
+    for (int t = 0; t < nb; t++)
+        acc[t] = vdupq_n_f32(0);
+    for (int b = 0; b < cols / 16; b++) {
+        const uint8_t *q[4];
+        for (int i = 0; i < 4; i++)
+            q[i] = wp[i] + (size_t)b * 8;
+        uint32x4_t raw = {sp[0][b], sp[1][b], sp[2][b], sp[3][b]};
+        float32x4_t scale = vmulq_n_f32(dg_e4m3x4_neon(raw), m->global), even[8], odd[8];
+        dg_nvfp4_weights4_neon(q, even, odd);
+        for (int t = 0; t < nb; t++)
+            acc[t] = dg_nvfp4_block_neon(acc[t], even, odd, scale,
+                                         x + (size_t)(tb + t) * cols + (size_t)b * 16);
+    }
+}
+
 static void dg_nvfp4_mm_neon(const uint8_t *wd, const uint8_t *sd, float global, const float *x,
                              float *y, int tokens, int rows, int cols) {
+    DGNvMatrix m = {wd, sd, global};
     int blocks = (rows + 3) / 4;
     {
         int rb;
@@ -2522,33 +2589,46 @@ static void dg_nvfp4_mm_neon(const uint8_t *wd, const uint8_t *sd, float global,
 #endif
         for (rb = 0; rb < blocks; rb++) {
             int r0 = rb * 4, valid = rows - r0 < 4 ? rows - r0 : 4;
-            const uint8_t *wp[4], *sp[4];
-            for (int i = 0; i < 4; i++) {
-                int r = dg_neon_row(r0, i, rows);
-                wp[i] = wd + (uint64_t)r * cols / 2;
-                sp[i] = sd + (uint64_t)r * cols / 16;
-            }
             for (int tb = 0; tb < tokens; tb += DG_NEON_TOKENS) {
                 int nb = tokens - tb < DG_NEON_TOKENS ? tokens - tb : DG_NEON_TOKENS;
                 float32x4_t acc[DG_NEON_TOKENS];
-                for (int q = 0; q < nb; q++)
-                    acc[q] = vdupq_n_f32(0);
-                for (int b = 0; b < cols / 16; b++) {
-                    const uint8_t *q[4];
-                    for (int i = 0; i < 4; i++)
-                        q[i] = wp[i] + (size_t)b * 8;
-                    uint32x4_t raw = {sp[0][b], sp[1][b], sp[2][b], sp[3][b]};
-                    float32x4_t scale = vmulq_n_f32(dg_e4m3x4_neon(raw), global), even[8], odd[8];
-                    dg_nvfp4_weights4_neon(q, even, odd);
-                    for (int t = 0; t < nb; t++)
-                        acc[t] = dg_nvfp4_block_neon(acc[t], even, odd, scale,
-                                                     x + (size_t)(tb + t) * cols + (size_t)b * 16);
-                }
+                dg_nvfp4_rows4_neon(&m, x, r0, rows, cols, tb, nb, acc);
                 for (int t = 0; t < nb; t++) {
                     float sum[4];
                     vst1q_f32(sum, acc[t]);
                     for (int i = 0; i < valid; i++)
                         y[(size_t)(tb + t) * rows + r0 + i] = sum[i];
+                }
+            }
+        }
+    }
+}
+
+/* Gate and up products for the same four rows, then GELU, in one parallel
+ * region; each value is the one the separate steps compute. */
+static void dg_nvfp4_gated_neon(const DGNvMatrix *gate, const DGNvMatrix *up, const float *x,
+                                float *g, float *h, int tokens, int rows, int cols) {
+    (void)g;
+    int blocks = (rows + 3) / 4;
+    {
+        int rb;
+#ifdef _OPENMP
+        JB_OMP();
+#pragma omp parallel for schedule(static)
+#endif
+        for (rb = 0; rb < blocks; rb++) {
+            int r0 = rb * 4, valid = rows - r0 < 4 ? rows - r0 : 4;
+            for (int tb = 0; tb < tokens; tb += DG_NEON_TOKENS) {
+                int nb = tokens - tb < DG_NEON_TOKENS ? tokens - tb : DG_NEON_TOKENS;
+                float32x4_t ga[DG_NEON_TOKENS], ua[DG_NEON_TOKENS];
+                dg_nvfp4_rows4_neon(gate, x, r0, rows, cols, tb, nb, ga);
+                dg_nvfp4_rows4_neon(up, x, r0, rows, cols, tb, nb, ua);
+                for (int t = 0; t < nb; t++) {
+                    float gs[4], us[4];
+                    vst1q_f32(gs, ga[t]);
+                    vst1q_f32(us, ua[t]);
+                    for (int i = 0; i < valid; i++)
+                        h[(size_t)(tb + t) * rows + r0 + i] = dg_gelu(gs[i]) * us[i];
                 }
             }
         }
@@ -2616,9 +2696,16 @@ static const DGKernelOps *dg_kernels(void) {
     (void)dg_mm_data_ref;
     (void)dg_rms_ref;
     (void)dg_dot_ref;
-    static const DGKernelOps selected = {"avx512",           dg_nvfp4_qdq_avx512, dg_nvfp4_swizzle,
-                                         dg_nvfp4_mm_avx512, dg_mm_data_avx512,   dg_rms_avx512,
-                                         dg_dot_avx512,      dg_dots_each,        0};
+    static const DGKernelOps selected = {"avx512",
+                                         dg_nvfp4_qdq_avx512,
+                                         dg_nvfp4_swizzle,
+                                         dg_nvfp4_mm_avx512,
+                                         dg_nvfp4_gated_each,
+                                         dg_mm_data_avx512,
+                                         dg_rms_avx512,
+                                         dg_dot_avx512,
+                                         dg_dots_each,
+                                         0};
     return &selected;
 #elif defined(JB_AVX2)
     (void)dg_nvfp4_qdq_ref;
@@ -2626,9 +2713,9 @@ static const DGKernelOps *dg_kernels(void) {
     (void)dg_mm_data_ref;
     (void)dg_rms_ref;
     (void)dg_dot_ref;
-    static const DGKernelOps selected = {"avx2",           dg_nvfp4_qdq_parallel, NULL,
-                                         dg_nvfp4_mm_avx2, dg_mm_data_avx2,       dg_rms_avx2,
-                                         dg_dot_avx2,      dg_dots_each,          0};
+    static const DGKernelOps selected = {
+        "avx2",          dg_nvfp4_qdq_parallel, NULL,        dg_nvfp4_mm_avx2, dg_nvfp4_gated_each,
+        dg_mm_data_avx2, dg_rms_avx2,           dg_dot_avx2, dg_dots_each,     0};
     return &selected;
 #elif defined(JB_NEON)
     (void)dg_nvfp4_qdq_ref;
@@ -2636,15 +2723,16 @@ static const DGKernelOps *dg_kernels(void) {
     (void)dg_mm_data_ref;
     (void)dg_rms_ref;
     (void)dg_dots_each;
-    static const DGKernelOps selected = {"neon",           dg_nvfp4_qdq_parallel, NULL,
-                                         dg_nvfp4_mm_neon, dg_mm_data_neon,       dg_rms_neon,
-                                         dg_dot_ref,       dg_dots_neon,          1};
+    (void)dg_nvfp4_gated_each;
+    static const DGKernelOps selected = {
+        "neon",          dg_nvfp4_qdq_parallel, NULL,       dg_nvfp4_mm_neon, dg_nvfp4_gated_neon,
+        dg_mm_data_neon, dg_rms_neon,           dg_dot_ref, dg_dots_neon,     1};
     return &selected;
 #else
     (void)dg_nvfp4_qdq_parallel;
-    static const DGKernelOps scalar = {"scalar",        dg_nvfp4_qdq_ref, NULL,
-                                       dg_nvfp4_mm_ref, dg_mm_data_ref,   dg_rms_ref,
-                                       dg_dot_ref,      dg_dots_each,     1};
+    static const DGKernelOps scalar = {
+        "scalar",       dg_nvfp4_qdq_ref, NULL,       dg_nvfp4_mm_ref, dg_nvfp4_gated_each,
+        dg_mm_data_ref, dg_rms_ref,       dg_dot_ref, dg_dots_each,    1};
     return &scalar;
 #endif
 }
@@ -3168,23 +3256,9 @@ static void dg_ff(DGModel *m, int l, float *x, int n, JBArena *workspace) {
             continue;
         if (m->nvfp4) {
             DGNvExpert *v = &m->nvexpert[l * DG_EXPERTS + e];
-            JB_TICK(gate_start);
-            dg_nvfp4_mm(v->wg, v->sg, v->gg, gather, gu, ne, DG_MOE, DG_H);
-            JB_TO(moe_gate, gate_start);
-            JB_TICK(up_start);
-            dg_nvfp4_mm(v->wu, v->su, v->gu, gather, hid, ne, DG_MOE, DG_H);
-            JB_TO(moe_up, up_start);
-            JB_TICK(act_start);
-            {
-                int qi;
-#ifdef _OPENMP
-                JB_OMP();
-#pragma omp parallel for schedule(static) if (ne * DG_MOE >= 4096)
-#endif
-                for (qi = 0; qi < ne * DG_MOE; qi++)
-                    hid[qi] = dg_gelu(gu[qi]) * hid[qi];
-            }
-            JB_TO(moe_activation, act_start);
+            JB_TICK(gated_start);
+            dg_nvfp4_gated(v, gather, gu, hid, ne, DG_MOE, DG_H);
+            JB_TO(moe_gated, gated_start);
             JB_TICK(hidden_qdq_start);
             dg_nvfp4_qdq(qh, hid, ne, DG_MOE, m->nv_a2[l]);
             JB_TO(moe_hidden_qdq, hidden_qdq_start);
@@ -4604,8 +4678,8 @@ static int dg_systemone(DGModel *m, DGTokenizer *tok, const char *j, size_t len,
                                 prefill_ns / 1e6, cand_ms, job.reads, job.groups, cache_state,
                                 cache_tokens, processed_tokens, 1, output_length);
 #ifdef JB_PROFILE
-    uint64_t detailed = profile->moe_input_qdq + profile->moe_gate + profile->moe_up +
-                        profile->moe_activation + profile->moe_hidden_qdq + profile->moe_down;
+    uint64_t detailed =
+        profile->moe_input_qdq + profile->moe_gated + profile->moe_hidden_qdq + profile->moe_down;
     double moe_misc =
         (double)(profile->experts >= detailed ? profile->experts - detailed : 0) / 1e6;
     uint64_t ad = profile->attention_qkv + profile->attention_prepare + profile->attention_kv +
@@ -4622,8 +4696,8 @@ static int dg_systemone(DGModel *m, DGTokenizer *tok, const char *j, size_t len,
             "alloc_calls=%llu hot_alloc_calls=%llu alloc_ms=%.3f workspace_mb=%.3f kv_mb=%.3f "
             "attention=%.3f attention_qkv=%.3f attention_prepare=%.3f "
             "attention_kv=%.3f attention_core=%.3f attention_output=%.3f attention_misc=%.3f "
-            "dense=%.3f router=%.3f experts=%.3f moe_input_qdq=%.3f moe_gate=%.3f moe_up=%.3f "
-            "moe_activation=%.3f moe_hidden_qdq=%.3f moe_down=%.3f moe_misc=%.3f ff_other=%.3f "
+            "dense=%.3f router=%.3f experts=%.3f moe_input_qdq=%.3f moe_gated=%.3f "
+            "moe_hidden_qdq=%.3f moe_down=%.3f moe_misc=%.3f ff_other=%.3f "
             "layer_other=%.3f embedding=%.3f final_norm=%.3f kv_free=%.3f candidates=%.3f "
             "unaccounted=%.3f total=%.3f\n",
             (unsigned long long)profile->prompt_tokens, (unsigned long long)profile->system_tokens,
@@ -4634,10 +4708,10 @@ static int dg_systemone(DGModel *m, DGTokenizer *tok, const char *j, size_t len,
             profile->attention_prepare / 1e6, profile->attention_kv / 1e6,
             profile->attention_core / 1e6, profile->attention_output / 1e6, attention_misc,
             profile->dense / 1e6, profile->router / 1e6, profile->experts / 1e6,
-            profile->moe_input_qdq / 1e6, profile->moe_gate / 1e6, profile->moe_up / 1e6,
-            profile->moe_activation / 1e6, profile->moe_hidden_qdq / 1e6, profile->moe_down / 1e6,
-            moe_misc, profile->ff_other / 1e6, layer_other, profile->embedding / 1e6,
-            profile->final_norm / 1e6, profile->kv_free / 1e6, cand_ms, unaccounted, ms);
+            profile->moe_input_qdq / 1e6, profile->moe_gated / 1e6, profile->moe_hidden_qdq / 1e6,
+            profile->moe_down / 1e6, moe_misc, profile->ff_other / 1e6, layer_other,
+            profile->embedding / 1e6, profile->final_norm / 1e6, profile->kv_free / 1e6, cand_ms,
+            unaccounted, ms);
     jb_profile_active = previous_profile;
 #endif
     dg_job_free(&job);
@@ -5711,6 +5785,41 @@ static void dg_test_nvfp4(uint64_t *rs) {
             jb_check_close(dg_kernels()->name, y[i], want[i], 1e-4 * mag[i]);
         jb_check_reference_bits("NVFP4 matmul", y, yref, (size_t)tokens * rows * 4);
         jb_release(yref);
+        /* The fused expert product, against the backend's separate steps:
+         * the same bits in strict builds, whose GELU is the same scalar
+         * call in both. */
+        const float up_global = 0.013f;
+        size_t out = (size_t)tokens * rows;
+        uint8_t *wu = xmalloc((size_t)rows * cols / 2);
+        float *g = xmalloc(out * 4), *u = xmalloc(out * 4), *h = xmalloc(out * 4),
+              *scratch = xmalloc(out * 4);
+        for (int i = 0; i < rows * cols / 2; i++)
+            wu[i] = (uint8_t)(wd[i] ^ 0x5a);
+        DGTensor uw = tw, ug = tg;
+        uw.data = wu;
+        ug.data = (const uint8_t *)&up_global;
+        DGNvExpert v = {0};
+        v.wg = &tw;
+        v.sg = v.su = &ts;
+        v.gg = &tg;
+        v.wu = &uw;
+        v.gu = &ug;
+        dg_nvfp4_mm(&tw, &ts, &tg, xs, g, tokens, rows, cols);
+        dg_nvfp4_mm(&uw, &ts, &ug, xs, u, tokens, rows, cols);
+        jb_poison(h, out);
+        dg_nvfp4_gated(&v, xs, scratch, h, tokens, rows, cols);
+        for (size_t i = 0; i < out; i++) {
+            float want_h = dg_gelu(g[i]) * u[i];
+            jb_check_close(dg_kernels()->name, h[i], want_h,
+                           1e-5 * (1 + fabs(g[i])) * (1 + fabs(u[i])));
+            if (JB_STRICT_MATH && memcmp(&h[i], &want_h, 4))
+                die2("kernel self-test failed: fused expert product differs", dg_kernels()->name);
+        }
+        jb_release(wu);
+        jb_release(g);
+        jb_release(u);
+        jb_release(h);
+        jb_release(scratch);
         jb_release(wd);
         jb_release(sd);
         jb_release(x);
