@@ -37,6 +37,10 @@
  * but does not define __FMA__. */
 #define JB_AVX2 1
 #include <immintrin.h>
+#elif defined(__aarch64__) && defined(__ARM_NEON) && !defined(__AARCH64EB__)
+/* Little-endian only: the kernels load BF16 bytes in little-endian order. */
+#define JB_NEON 1
+#include <arm_neon.h>
 #endif
 #ifdef _OPENMP
 /* Parallel loops declare a signed index before the loop, each in its own
@@ -95,8 +99,10 @@
 
 #if defined(__FAST_MATH__)
 #define JB_MATH_MODE "fast"
+#define JB_STRICT_MATH 0
 #else
 #define JB_MATH_MODE "strict"
+#define JB_STRICT_MATH 1
 #endif
 
 #ifdef JB_PROFILE
@@ -958,6 +964,8 @@ typedef struct {
     void (*bf16_mm)(const uint8_t *, const float *, float *, int, int, int);
     void (*rms)(float *, const float *, const DGTensor *, int);
     double (*dot)(const float *, const float *, int);
+    /* Bit-identical to the reference kernels in strict builds. */
+    int matches_reference;
 } DGKernelOps;
 
 static const DGKernelOps *dg_kernels(void);
@@ -1947,11 +1955,16 @@ static double dg_slot_logits_entropy(const DGTensor *w, const float *hidden, int
     return max_entropy;
 }
 
-static void dg_rms_ref(float *y, const float *x, const DGTensor *scale, int n) {
+/* The reference RMS scale factor: a sequential double sum of squares. */
+static float dg_rms_inverse(const float *x, int n) {
     double ss = 0.0;
     for (int i = 0; i < n; i++)
         ss += (double)x[i] * x[i];
-    float q = 1.0f / sqrtf((float)(ss / n) + 1e-6f);
+    return 1.0f / sqrtf((float)(ss / n) + 1e-6f);
+}
+
+static void dg_rms_ref(float *y, const float *x, const DGTensor *scale, int n) {
+    float q = dg_rms_inverse(x, n);
     for (int i = 0; i < n; i++)
         y[i] = x[i] * q * (scale ? dg_at(scale, i) : 1.0f);
 }
@@ -2317,6 +2330,189 @@ static double dg_dot_avx512(const float *a, const float *b, int n) {
 }
 #endif
 
+/* NEON backend (AArch64). Each vector lane computes one output row, and each
+ * lane accumulates in the reference kernels' order with a separate multiply
+ * and add. Strict builds therefore match the reference bit for bit, which
+ * the selftest checks. Attention dots keep the reference: their sequential
+ * double sum has no reordering-free vector form. */
+#if defined(JB_NEON)
+enum { DG_NEON_TOKENS = 8 };
+
+static float32x4_t dg_bf16x4_neon(const uint8_t *p) {
+    uint16x4_t h = vreinterpret_u16_u8(vld1_u8(p));
+    return vreinterpretq_f32_u32(vshll_n_u16(h, 16));
+}
+
+/* Four rows of four columns become four columns of four rows. */
+static void dg_transpose4_neon(float32x4_t *v) {
+    float32x4_t t0 = vtrn1q_f32(v[0], v[1]), t1 = vtrn2q_f32(v[0], v[1]);
+    float32x4_t t2 = vtrn1q_f32(v[2], v[3]), t3 = vtrn2q_f32(v[2], v[3]);
+    v[0] = vreinterpretq_f32_f64(vtrn1q_f64(vreinterpretq_f64_f32(t0), vreinterpretq_f64_f32(t2)));
+    v[1] = vreinterpretq_f32_f64(vtrn1q_f64(vreinterpretq_f64_f32(t1), vreinterpretq_f64_f32(t3)));
+    v[2] = vreinterpretq_f32_f64(vtrn2q_f64(vreinterpretq_f64_f32(t0), vreinterpretq_f64_f32(t2)));
+    v[3] = vreinterpretq_f32_f64(vtrn2q_f64(vreinterpretq_f64_f32(t1), vreinterpretq_f64_f32(t3)));
+}
+
+/* Rows past the end of the matrix repeat its last row; their lanes are
+ * computed but never stored. */
+static int dg_neon_row(int r0, int i, int rows) {
+    return r0 + i < rows ? r0 + i : rows - 1;
+}
+
+static void dg_mm_data_neon(const uint8_t *data, const float *x, float *y, int tokens, int rows,
+                            int cols) {
+    int blocks = (rows + 3) / 4, c4 = cols & ~3;
+    {
+        int rb;
+#ifdef _OPENMP
+        JB_OMP();
+#pragma omp parallel for schedule(static)
+#endif
+        for (rb = 0; rb < blocks; rb++) {
+            int r0 = rb * 4, valid = rows - r0 < 4 ? rows - r0 : 4;
+            const uint8_t *p[4];
+            for (int i = 0; i < 4; i++)
+                p[i] = data + (uint64_t)dg_neon_row(r0, i, rows) * cols * 2;
+            for (int tb = 0; tb < tokens; tb += DG_NEON_TOKENS) {
+                int nb = tokens - tb < DG_NEON_TOKENS ? tokens - tb : DG_NEON_TOKENS;
+                float32x4_t acc[DG_NEON_TOKENS];
+                for (int q = 0; q < nb; q++)
+                    acc[q] = vdupq_n_f32(0);
+                for (int c = 0; c < c4; c += 4) {
+                    float32x4_t w[4];
+                    for (int i = 0; i < 4; i++)
+                        w[i] = dg_bf16x4_neon(p[i] + (size_t)c * 2);
+                    dg_transpose4_neon(w);
+                    for (int q = 0; q < nb; q++) {
+                        const float *xp = x + (size_t)(tb + q) * cols + c;
+                        for (int k = 0; k < 4; k++)
+                            acc[q] = vaddq_f32(acc[q], vmulq_n_f32(w[k], xp[k]));
+                    }
+                }
+                for (int q = 0; q < nb; q++) {
+                    const float *xp = x + (size_t)(tb + q) * cols;
+                    float sum[4];
+                    vst1q_f32(sum, acc[q]);
+                    for (int i = 0; i < valid; i++) {
+                        for (int c = c4; c < cols; c++)
+                            sum[i] += dg_bf(p[i] + (size_t)c * 2) * xp[c];
+                        y[(size_t)(tb + q) * rows + r0 + i] = sum[i];
+                    }
+                }
+            }
+        }
+    }
+}
+
+/* Four E2M1 values, one per row, from four bytes' nibbles: magnitudes are
+ * stored doubled so they are exact small integers, and the sign bit sits
+ * at `sign_shift` below bit 31. */
+static float32x4_t dg_e2m1x4_neon(uint32x4_t doubled, uint32x4_t sign, int sign_shift) {
+    float32x4_t v = vmulq_n_f32(vcvtq_f32_u32(doubled), .5f);
+    uint32x4_t bit = sign_shift == 28 ? vshlq_n_u32(sign, 28) : vshlq_n_u32(sign, 24);
+    return vreinterpretq_f32_u32(veorq_u32(vreinterpretq_u32_f32(v), bit));
+}
+
+static void dg_widen4_neon(uint8x16_t v, uint32x4_t *out) {
+    uint16x8_t l = vmovl_u8(vget_low_u8(v)), h = vmovl_high_u8(v);
+    out[0] = vmovl_u16(vget_low_u16(l));
+    out[1] = vmovl_high_u16(l);
+    out[2] = vmovl_u16(vget_low_u16(h));
+    out[3] = vmovl_high_u16(h);
+}
+
+/* One packed 16-weight block (eight bytes) from each of four rows, as eight
+ * vectors of even-column weights and eight of odd-column weights, each
+ * holding the four rows' values for one byte position. */
+static void dg_nvfp4_weights4_neon(const uint8_t *const *q, float32x4_t *even, float32x4_t *odd) {
+    static const uint8_t doubled[16] = {0, 1, 2, 3, 4, 6, 8, 12};
+    const uint8x16_t table = vld1q_u8(doubled);
+    uint8x8x2_t z01 = vzip_u8(vld1_u8(q[0]), vld1_u8(q[1]));
+    uint8x8x2_t z23 = vzip_u8(vld1_u8(q[2]), vld1_u8(q[3]));
+    for (int half = 0; half < 2; half++) {
+        uint16x4x2_t z =
+            vzip_u16(vreinterpret_u16_u8(z01.val[half]), vreinterpret_u16_u8(z23.val[half]));
+        uint8x16_t bytes =
+            vcombine_u8(vreinterpret_u8_u16(z.val[0]), vreinterpret_u8_u16(z.val[1]));
+        uint32x4_t lo[4], lo_sign[4], hi[4], hi_sign[4];
+        dg_widen4_neon(vqtbl1q_u8(table, vandq_u8(bytes, vdupq_n_u8(7))), lo);
+        dg_widen4_neon(vandq_u8(bytes, vdupq_n_u8(8)), lo_sign);
+        dg_widen4_neon(vqtbl1q_u8(table, vshrq_n_u8(vandq_u8(bytes, vdupq_n_u8(0x70)), 4)), hi);
+        dg_widen4_neon(vandq_u8(bytes, vdupq_n_u8(0x80)), hi_sign);
+        for (int k = 0; k < 4; k++) {
+            even[half * 4 + k] = dg_e2m1x4_neon(lo[k], lo_sign[k], 28);
+            odd[half * 4 + k] = dg_e2m1x4_neon(hi[k], hi_sign[k], 24);
+        }
+    }
+}
+
+/* x in the dg_nvfp4_qdq_ref layout. */
+static void dg_nvfp4_mm_neon(const uint8_t *wd, const uint8_t *sd, float global, const float *x,
+                             float *y, int tokens, int rows, int cols) {
+    int blocks = (rows + 3) / 4;
+    {
+        int rb;
+#ifdef _OPENMP
+        JB_OMP();
+#pragma omp parallel for schedule(static)
+#endif
+        for (rb = 0; rb < blocks; rb++) {
+            int r0 = rb * 4, valid = rows - r0 < 4 ? rows - r0 : 4;
+            const uint8_t *wp[4], *sp[4];
+            for (int i = 0; i < 4; i++) {
+                int r = dg_neon_row(r0, i, rows);
+                wp[i] = wd + (uint64_t)r * cols / 2;
+                sp[i] = sd + (uint64_t)r * cols / 16;
+            }
+            for (int tb = 0; tb < tokens; tb += DG_NEON_TOKENS) {
+                int nb = tokens - tb < DG_NEON_TOKENS ? tokens - tb : DG_NEON_TOKENS;
+                float32x4_t acc[DG_NEON_TOKENS];
+                for (int q = 0; q < nb; q++)
+                    acc[q] = vdupq_n_f32(0);
+                for (int b = 0; b < cols / 16; b++) {
+                    float s[4];
+                    const uint8_t *q[4];
+                    for (int i = 0; i < 4; i++) {
+                        s[i] = dg_f8e4m3(sp[i][b]) * global;
+                        q[i] = wp[i] + (size_t)b * 8;
+                    }
+                    float32x4_t scale = vld1q_f32(s), even[8], odd[8];
+                    dg_nvfp4_weights4_neon(q, even, odd);
+                    for (int t = 0; t < nb; t++) {
+                        const float *a = x + (size_t)(tb + t) * cols + (size_t)b * 16;
+                        for (int k = 0; k < 8; k++) {
+                            float32x4_t pair = vaddq_f32(vmulq_n_f32(even[k], a[k * 2]),
+                                                         vmulq_n_f32(odd[k], a[k * 2 + 1]));
+                            acc[t] = vaddq_f32(acc[t], vmulq_f32(scale, pair));
+                        }
+                    }
+                }
+                for (int t = 0; t < nb; t++) {
+                    float sum[4];
+                    vst1q_f32(sum, acc[t]);
+                    for (int i = 0; i < valid; i++)
+                        y[(size_t)(tb + t) * rows + r0 + i] = sum[i];
+                }
+            }
+        }
+    }
+}
+
+static void dg_rms_neon(float *y, const float *x, const DGTensor *scale, int n) {
+    float q = dg_rms_inverse(x, n);
+    int i = 0;
+    if (scale)
+        for (; i + 3 < n; i += 4)
+            vst1q_f32(y + i, vmulq_f32(vmulq_n_f32(vld1q_f32(x + i), q),
+                                       dg_bf16x4_neon(scale->data + (size_t)i * 2)));
+    else
+        for (; i + 3 < n; i += 4)
+            vst1q_f32(y + i, vmulq_n_f32(vld1q_f32(x + i), q));
+    for (; i < n; i++)
+        y[i] = x[i] * q * (scale ? dg_at(scale, i) : 1.0f);
+}
+#endif
+
 static const DGKernelOps *dg_kernels(void) {
 #if defined(JB_AVX512)
     (void)dg_nvfp4_qdq_parallel;
@@ -2325,9 +2521,9 @@ static const DGKernelOps *dg_kernels(void) {
     (void)dg_mm_data_ref;
     (void)dg_rms_ref;
     (void)dg_dot_ref;
-    static const DGKernelOps selected = {"avx512",           dg_nvfp4_qdq_avx512, dg_nvfp4_swizzle,
-                                         dg_nvfp4_mm_avx512, dg_mm_data_avx512,   dg_rms_avx512,
-                                         dg_dot_avx512};
+    static const DGKernelOps selected = {
+        "avx512",          dg_nvfp4_qdq_avx512, dg_nvfp4_swizzle, dg_nvfp4_mm_avx512,
+        dg_mm_data_avx512, dg_rms_avx512,       dg_dot_avx512,    0};
     return &selected;
 #elif defined(JB_AVX2)
     (void)dg_nvfp4_qdq_ref;
@@ -2335,14 +2531,24 @@ static const DGKernelOps *dg_kernels(void) {
     (void)dg_mm_data_ref;
     (void)dg_rms_ref;
     (void)dg_dot_ref;
-    static const DGKernelOps selected = {"avx2",           dg_nvfp4_qdq_parallel, NULL,
-                                         dg_nvfp4_mm_avx2, dg_mm_data_avx2,       dg_rms_avx2,
-                                         dg_dot_avx2};
+    static const DGKernelOps selected = {
+        "avx2",          dg_nvfp4_qdq_parallel, NULL,        dg_nvfp4_mm_avx2,
+        dg_mm_data_avx2, dg_rms_avx2,           dg_dot_avx2, 0};
+    return &selected;
+#elif defined(JB_NEON)
+    (void)dg_nvfp4_qdq_ref;
+    (void)dg_nvfp4_mm_ref;
+    (void)dg_mm_data_ref;
+    (void)dg_rms_ref;
+    static const DGKernelOps selected = {
+        "neon",          dg_nvfp4_qdq_parallel, NULL,       dg_nvfp4_mm_neon,
+        dg_mm_data_neon, dg_rms_neon,           dg_dot_ref, 1};
     return &selected;
 #else
     (void)dg_nvfp4_qdq_parallel;
-    static const DGKernelOps scalar = {"scalar",       dg_nvfp4_qdq_ref, NULL,      dg_nvfp4_mm_ref,
-                                       dg_mm_data_ref, dg_rms_ref,       dg_dot_ref};
+    static const DGKernelOps scalar = {
+        "scalar",       dg_nvfp4_qdq_ref, NULL,       dg_nvfp4_mm_ref,
+        dg_mm_data_ref, dg_rms_ref,       dg_dot_ref, 1};
     return &scalar;
 #endif
 }
@@ -5265,6 +5471,14 @@ static void jb_put_bf16(uint8_t *p, float v) {
     p[1] = (uint8_t)(u >> 24);
 }
 
+/* Kernels that claim bit-identity with the reference must deliver it in
+ * strict builds; fast math lets the compiler reorder the reference itself. */
+static void jb_check_reference_bits(const char *what, const void *got, const void *ref,
+                                    size_t bytes) {
+    if (dg_kernels()->matches_reference && JB_STRICT_MATH && memcmp(got, ref, bytes))
+        die2("kernel self-test failed: differs from the reference", what);
+}
+
 /* Fill a kernel's output with NaN before each call, so an output the kernel
  * fails to write cannot inherit a correct value from an earlier pass. */
 static void jb_poison(float *y, size_t count) {
@@ -5304,6 +5518,7 @@ static void dg_test_mm(uint64_t *rs) {
                 want[(size_t)t * rows + r] = s;
                 mag[(size_t)t * rows + r] = a;
             }
+        float *yref = xmalloc((size_t)tokens * rows * 4);
         for (int pass = 0; pass < 2; pass++) {
             jb_poison(y, (size_t)tokens * rows);
             if (pass)
@@ -5313,7 +5528,12 @@ static void dg_test_mm(uint64_t *rs) {
             for (int i = 0; i < tokens * rows; i++)
                 jb_check_close(pass ? dg_kernels()->name : "BF16 matmul (ref)", y[i], want[i],
                                1e-4 * mag[i]);
+            if (pass)
+                jb_check_reference_bits("BF16 matmul", y, yref, (size_t)tokens * rows * 4);
+            else
+                memcpy(yref, y, (size_t)tokens * rows * 4);
         }
+        jb_release(yref);
         jb_release(w);
         jb_release(x);
         jb_release(y);
@@ -5359,6 +5579,8 @@ static void dg_test_nvfp4(uint64_t *rs) {
         dg_nvfp4_mm_ref(wd, sd, global, xq, y, tokens, rows, cols);
         for (int i = 0; i < tokens * rows; i++)
             jb_check_close("NVFP4 matmul (ref)", y[i], want[i], 1e-4 * mag[i]);
+        float *yref = xmalloc((size_t)tokens * rows * 4);
+        memcpy(yref, y, (size_t)tokens * rows * 4);
         /* The production path: QDQ into the selected kernel's layout, then
          * the validated tensor entry point. */
         dg_nvfp4_qdq(xs, x, tokens, cols, base);
@@ -5385,6 +5607,8 @@ static void dg_test_nvfp4(uint64_t *rs) {
         dg_nvfp4_mm(&tw, &ts, &tg, xs, y, tokens, rows, cols);
         for (int i = 0; i < tokens * rows; i++)
             jb_check_close(dg_kernels()->name, y[i], want[i], 1e-4 * mag[i]);
+        jb_check_reference_bits("NVFP4 matmul", y, yref, (size_t)tokens * rows * 4);
+        jb_release(yref);
         jb_release(wd);
         jb_release(sd);
         jb_release(x);
@@ -5421,6 +5645,7 @@ static void dg_test_rms_dot(uint64_t *rs) {
             dmag += fabs((double)x[i] * b[i]);
         }
         double q = 1.0 / sqrt(ss / n + 1e-6);
+        float *yref = xmalloc((size_t)n * 2 * 4);
         for (int pass = 0; pass < 4; pass++) {
             const DGTensor *sc = pass & 1 ? &scale : NULL;
             jb_poison(y, (size_t)n);
@@ -5433,9 +5658,17 @@ static void dg_test_rms_dot(uint64_t *rs) {
                 jb_check_close(pass & 2 ? dg_kernels()->name : "RMS norm (ref)", y[i], want,
                                1e-5 * fabs(want) + 1e-12);
             }
+            if (pass & 2)
+                jb_check_reference_bits("RMS norm", y, yref + (size_t)(pass & 1) * n,
+                                        (size_t)n * 4);
+            else
+                memcpy(yref + (size_t)(pass & 1) * n, y, (size_t)n * 4);
         }
+        jb_release(yref);
         jb_check_close("dot (ref)", dg_dot_ref(x, b, n), dot, 1e-12 * dmag);
         jb_check_close(dg_kernels()->name, dg_dot(x, b, n), dot, 1e-12 * dmag);
+        double dot_ref = dg_dot_ref(x, b, n), dot_kernel = dg_dot(x, b, n);
+        jb_check_reference_bits("dot", &dot_kernel, &dot_ref, sizeof dot_ref);
         jb_release(x);
         jb_release(b);
         jb_release(y);
