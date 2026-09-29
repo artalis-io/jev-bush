@@ -7,6 +7,11 @@ on:
 permissions:
   contents: read
 
+# bash with pipefail, so a failing command piped into tee fails its step.
+defaults:
+  run:
+    shell: bash
+
 jobs:
   selftest:
     name: Selftest (${{ matrix.os }})

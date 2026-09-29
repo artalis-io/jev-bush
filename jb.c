@@ -25,6 +25,15 @@
 
 #include "jb.h"
 
+/* Evaluate floating-point expressions as written, never fusing a multiply
+ * and an add. GCC does this in ISO C mode (-std=c11); clang fuses within a
+ * statement unless told not to. The reference kernels' rounding, which the
+ * NEON tier reproduces bit for bit, depends on it. Explicit FMA intrinsics
+ * are unaffected. */
+#if defined(__clang__)
+#pragma STDC FP_CONTRACT OFF
+#endif
+
 /* Kernel backend, chosen at compile time. -DJB_SCALAR forces the portable
  * reference kernels on any CPU: the oracle build other backends are checked
  * against. */
