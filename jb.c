@@ -1764,7 +1764,7 @@ static void dg_nvfp4_qdq_parallel(float *out, const float *in, int tokens, int c
         int z;
 #ifdef _OPENMP
         JB_OMP();
-#pragma omp parallel for schedule(static) if (blocks >= 256) reduction(| : nonfinite)
+#pragma omp parallel for schedule(dynamic, 16) if (blocks >= 256) reduction(| : nonfinite)
 #endif
         for (z = 0; z < blocks; z++) {
             int t = z / nb, b = z % nb, bad = 0;
@@ -1925,7 +1925,7 @@ static void dg_mv_slice(const DGTensor *w, uint64_t base, const float *x, float 
         int r;
 #ifdef _OPENMP
         JB_OMP();
-#pragma omp parallel for schedule(static)
+#pragma omp parallel for schedule(dynamic)
 #endif
         for (r = 0; r < rows; r++) {
             const uint8_t *p = w->data + (base + (uint64_t)r * cols) * 2;
@@ -2439,7 +2439,7 @@ static void dg_mm_data_neon(const uint8_t *data, const float *x, float *y, int t
         int rb;
 #ifdef _OPENMP
         JB_OMP();
-#pragma omp parallel for schedule(static)
+#pragma omp parallel for schedule(dynamic)
 #endif
         for (rb = 0; rb < blocks; rb++) {
             int r0 = rb * 4, valid = rows - r0 < 4 ? rows - r0 : 4;
@@ -2585,7 +2585,7 @@ static void dg_nvfp4_mm_neon(const uint8_t *wd, const uint8_t *sd, float global,
         int rb;
 #ifdef _OPENMP
         JB_OMP();
-#pragma omp parallel for schedule(static)
+#pragma omp parallel for schedule(dynamic)
 #endif
         for (rb = 0; rb < blocks; rb++) {
             int r0 = rb * 4, valid = rows - r0 < 4 ? rows - r0 : 4;
@@ -2614,7 +2614,7 @@ static void dg_nvfp4_gated_neon(const DGNvMatrix *gate, const DGNvMatrix *up, co
         int rb;
 #ifdef _OPENMP
         JB_OMP();
-#pragma omp parallel for schedule(static)
+#pragma omp parallel for schedule(dynamic)
 #endif
         for (rb = 0; rb < blocks; rb++) {
             int r0 = rb * 4, valid = rows - r0 < 4 ? rows - r0 : 4;
@@ -3019,7 +3019,7 @@ static void dg_attention_segments(DGModel *m, int l, float *x, int segments, int
         int ti;
 #ifdef _OPENMP
         JB_OMP();
-#pragma omp parallel for schedule(static)
+#pragma omp parallel for schedule(dynamic)
 #endif
         for (ti = 0; ti < n; ti++) {
             int s = ti / seq, t = ti % seq, old = cache ? cache[s]->n : 0,
@@ -3051,7 +3051,7 @@ static void dg_attention_segments(DGModel *m, int l, float *x, int segments, int
         int ti;
 #ifdef _OPENMP
         JB_OMP();
-#pragma omp parallel for schedule(static)
+#pragma omp parallel for schedule(dynamic)
 #endif
         for (ti = 0; ti < n; ti++)
             for (int h = 0; h < DG_HEADS; h++) {
@@ -3144,7 +3144,7 @@ static void dg_ff(DGModel *m, int l, float *x, int n, JBArena *workspace) {
         int t;
 #ifdef _OPENMP
         JB_OMP();
-#pragma omp parallel for schedule(static)
+#pragma omp parallel for schedule(dynamic)
 #endif
         for (t = 0; t < n; t++)
             dg_rms(z1 + (size_t)t * DG_H, x + (size_t)t * DG_H, pre, DG_H);
@@ -3167,7 +3167,7 @@ static void dg_ff(DGModel *m, int l, float *x, int n, JBArena *workspace) {
         int t;
 #ifdef _OPENMP
         JB_OMP();
-#pragma omp parallel for schedule(static)
+#pragma omp parallel for schedule(dynamic)
 #endif
         for (t = 0; t < n; t++) {
             float *r = x + (size_t)t * DG_H;
@@ -3188,7 +3188,7 @@ static void dg_ff(DGModel *m, int l, float *x, int n, JBArena *workspace) {
         int t;
 #ifdef _OPENMP
         JB_OMP();
-#pragma omp parallel for schedule(static)
+#pragma omp parallel for schedule(dynamic)
 #endif
         for (t = 0; t < n; t++) {
             float *rt = route + (size_t)t * DG_EXPERTS;
@@ -3319,7 +3319,7 @@ static void dg_layer(DGModel *m, int l, float *x, int n, int pos0, const DGKV *c
         int t;
 #ifdef _OPENMP
         JB_OMP();
-#pragma omp parallel for schedule(static)
+#pragma omp parallel for schedule(dynamic)
 #endif
         for (t = 0; t < n; t++)
             dg_rms(z + (size_t)t * DG_H, x + (size_t)t * DG_H, in, DG_H);
@@ -3331,7 +3331,7 @@ static void dg_layer(DGModel *m, int l, float *x, int n, int pos0, const DGKV *c
         int t;
 #ifdef _OPENMP
         JB_OMP();
-#pragma omp parallel for schedule(static)
+#pragma omp parallel for schedule(dynamic)
 #endif
         for (t = 0; t < n; t++) {
             dg_rms(x + (size_t)t * DG_H, z + (size_t)t * DG_H, pa, DG_H);
@@ -3362,7 +3362,7 @@ static void dg_layer_multi(DGModel *m, int l, float *x, int segments, int seq,
         int t;
 #ifdef _OPENMP
         JB_OMP();
-#pragma omp parallel for schedule(static)
+#pragma omp parallel for schedule(dynamic)
 #endif
         for (t = 0; t < n; t++)
             dg_rms(z + (size_t)t * DG_H, x + (size_t)t * DG_H, in, DG_H);
@@ -3374,7 +3374,7 @@ static void dg_layer_multi(DGModel *m, int l, float *x, int segments, int seq,
         int t;
 #ifdef _OPENMP
         JB_OMP();
-#pragma omp parallel for schedule(static)
+#pragma omp parallel for schedule(dynamic)
 #endif
         for (t = 0; t < n; t++) {
             dg_rms(x + (size_t)t * DG_H, z + (size_t)t * DG_H, pa, DG_H);
