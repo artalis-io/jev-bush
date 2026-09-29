@@ -35,6 +35,8 @@
 #include <immintrin.h>
 #endif
 #ifdef _OPENMP
+/* Parallel loops declare a signed index before the loop, each in its own
+ * block: MSVC implements OpenMP 2.0, which requires that form. */
 #include <omp.h>
 #endif
 
@@ -1712,32 +1714,35 @@ static void dg_nvfp4_qdq(float *out, const float *in, int tokens, int cols, floa
 /* x in the dg_nvfp4_qdq_ref layout. */
 static void dg_nvfp4_mm_ref(const uint8_t *wd, const uint8_t *sd, float global, const float *x,
                             float *y, int tokens, int rows, int cols) {
+    {
+        int r;
 #ifdef _OPENMP
 #pragma omp parallel for schedule(static)
 #endif
-    for (int r = 0; r < rows; r++)
-        for (int t = 0; t < tokens; t++) {
-            const uint8_t *wp = wd + (uint64_t)r * cols / 2, *sp = sd + (uint64_t)r * cols / 16;
-            const float *xp = x + (size_t)t * cols;
-            float sum = 0;
-            for (int b = 0; b < cols / 16; b++) {
-                float scale = dg_f8e4m3(sp[b]) * global;
-                const uint8_t *q = wp + (size_t)b * 8;
-                const float *a = xp + (size_t)b * 16;
-                for (int k = 0; k < 8; k++) {
-                    uint8_t v = q[k];
-                    int lo = v & 7, hi = (v >> 4) & 7;
-                    float wl = (float[]){0, .5f, 1, 1.5f, 2, 3, 4, 6}[lo],
-                          wh = (float[]){0, .5f, 1, 1.5f, 2, 3, 4, 6}[hi];
-                    if (v & 8)
-                        wl = -wl;
-                    if (v & 128)
-                        wh = -wh;
-                    sum += scale * (wl * a[k * 2] + wh * a[k * 2 + 1]);
+        for (r = 0; r < rows; r++)
+            for (int t = 0; t < tokens; t++) {
+                const uint8_t *wp = wd + (uint64_t)r * cols / 2, *sp = sd + (uint64_t)r * cols / 16;
+                const float *xp = x + (size_t)t * cols;
+                float sum = 0;
+                for (int b = 0; b < cols / 16; b++) {
+                    float scale = dg_f8e4m3(sp[b]) * global;
+                    const uint8_t *q = wp + (size_t)b * 8;
+                    const float *a = xp + (size_t)b * 16;
+                    for (int k = 0; k < 8; k++) {
+                        uint8_t v = q[k];
+                        int lo = v & 7, hi = (v >> 4) & 7;
+                        float wl = (float[]){0, .5f, 1, 1.5f, 2, 3, 4, 6}[lo],
+                              wh = (float[]){0, .5f, 1, 1.5f, 2, 3, 4, 6}[hi];
+                        if (v & 8)
+                            wl = -wl;
+                        if (v & 128)
+                            wh = -wh;
+                        sum += scale * (wl * a[k * 2] + wh * a[k * 2 + 1]);
+                    }
                 }
+                y[(size_t)t * rows + r] = sum;
             }
-            y[(size_t)t * rows + r] = sum;
-        }
+    }
 }
 
 /* x comes from dg_nvfp4_qdq, in the layout the selected kernel expects. */
@@ -1755,21 +1760,24 @@ static void dg_nvfp4_mm(const DGTensor *w, const DGTensor *s, const DGTensor *g,
 
 static void dg_mm_data_ref(const uint8_t *data, const float *x, float *y, int tokens, int rows,
                            int cols) {
+    {
+        int r;
 #ifdef _OPENMP
 #pragma omp parallel for schedule(static)
 #endif
-    for (int r = 0; r < rows; r++) {
-        float sum[JB_MAX_CTX];
-        for (int t = 0; t < tokens; t++)
-            sum[t] = 0;
-        const uint8_t *p = data + (uint64_t)r * cols * 2;
-        for (int c = 0; c < cols; c++) {
-            float a = dg_bf(p + c * 2);
+        for (r = 0; r < rows; r++) {
+            float sum[JB_MAX_CTX];
             for (int t = 0; t < tokens; t++)
-                sum[t] += a * x[(size_t)t * cols + c];
+                sum[t] = 0;
+            const uint8_t *p = data + (uint64_t)r * cols * 2;
+            for (int c = 0; c < cols; c++) {
+                float a = dg_bf(p + c * 2);
+                for (int t = 0; t < tokens; t++)
+                    sum[t] += a * x[(size_t)t * cols + c];
+            }
+            for (int t = 0; t < tokens; t++)
+                y[(size_t)t * rows + r] = sum[t];
         }
-        for (int t = 0; t < tokens; t++)
-            y[(size_t)t * rows + r] = sum[t];
     }
 }
 
@@ -1792,16 +1800,19 @@ static void dg_mm(const DGTensor *w, const float *x, float *y, int tokens, int r
 
 static void dg_mv_slice(const DGTensor *w, uint64_t base, const float *x, float *y, int rows,
                         int cols) {
+    {
+        int r;
 #ifdef _OPENMP
-    JB_OMP();
+        JB_OMP();
 #pragma omp parallel for schedule(static)
 #endif
-    for (int r = 0; r < rows; r++) {
-        const uint8_t *p = w->data + (base + (uint64_t)r * cols) * 2;
-        float s = 0.0f;
-        for (int c = 0; c < cols; c++)
-            s += dg_bf(p + c * 2) * x[c];
-        y[r] = s;
+        for (r = 0; r < rows; r++) {
+            const uint8_t *p = w->data + (base + (uint64_t)r * cols) * 2;
+            float s = 0.0f;
+            for (int c = 0; c < cols; c++)
+                s += dg_bf(p + c * 2) * x[c];
+            y[r] = s;
+        }
     }
 }
 
@@ -1936,35 +1947,38 @@ static void dg_mm_data_avx2(const uint8_t *data, const float *x, float *y, int t
                             int cols) {
     if (rows % 2)
         die("AVX2 matrix row count must be even");
+    {
+        int r;
 #ifdef _OPENMP
-    JB_OMP();
+        JB_OMP();
 #pragma omp parallel for schedule(static)
 #endif
-    for (int r = 0; r < rows; r += 2) {
-        const uint8_t *p0 = data + (uint64_t)r * cols * 2, *p1 = p0 + (uint64_t)cols * 2;
-        for (int tb = 0; tb < tokens; tb += 4) {
-            int nb = tokens - tb < 4 ? tokens - tb : 4;
-            __m256 a[4], b[4];
-            for (int q = 0; q < nb; q++)
-                a[q] = b[q] = _mm256_setzero_ps();
-            int c = 0;
-            for (; c + 7 < cols; c += 8) {
-                __m256 w0 = dg_bf16x8(p0 + c * 2), w1 = dg_bf16x8(p1 + c * 2);
+        for (r = 0; r < rows; r += 2) {
+            const uint8_t *p0 = data + (uint64_t)r * cols * 2, *p1 = p0 + (uint64_t)cols * 2;
+            for (int tb = 0; tb < tokens; tb += 4) {
+                int nb = tokens - tb < 4 ? tokens - tb : 4;
+                __m256 a[4], b[4];
+                for (int q = 0; q < nb; q++)
+                    a[q] = b[q] = _mm256_setzero_ps();
+                int c = 0;
+                for (; c + 7 < cols; c += 8) {
+                    __m256 w0 = dg_bf16x8(p0 + c * 2), w1 = dg_bf16x8(p1 + c * 2);
+                    for (int q = 0; q < nb; q++) {
+                        __m256 v = _mm256_loadu_ps(x + (size_t)(tb + q) * cols + c);
+                        a[q] = _mm256_fmadd_ps(w0, v, a[q]);
+                        b[q] = _mm256_fmadd_ps(w1, v, b[q]);
+                    }
+                }
                 for (int q = 0; q < nb; q++) {
-                    __m256 v = _mm256_loadu_ps(x + (size_t)(tb + q) * cols + c);
-                    a[q] = _mm256_fmadd_ps(w0, v, a[q]);
-                    b[q] = _mm256_fmadd_ps(w1, v, b[q]);
+                    float z0 = dg_hsum8(a[q]), z1 = dg_hsum8(b[q]);
+                    for (int k = c; k < cols; k++) {
+                        float v = x[(size_t)(tb + q) * cols + k];
+                        z0 += dg_bf(p0 + k * 2) * v;
+                        z1 += dg_bf(p1 + k * 2) * v;
+                    }
+                    y[(size_t)(tb + q) * rows + r] = z0;
+                    y[(size_t)(tb + q) * rows + r + 1] = z1;
                 }
-            }
-            for (int q = 0; q < nb; q++) {
-                float z0 = dg_hsum8(a[q]), z1 = dg_hsum8(b[q]);
-                for (int k = c; k < cols; k++) {
-                    float v = x[(size_t)(tb + q) * cols + k];
-                    z0 += dg_bf(p0 + k * 2) * v;
-                    z1 += dg_bf(p1 + k * 2) * v;
-                }
-                y[(size_t)(tb + q) * rows + r] = z0;
-                y[(size_t)(tb + q) * rows + r + 1] = z1;
             }
         }
     }
@@ -1977,30 +1991,33 @@ static void dg_nvfp4_qdq_avx2(float *out, const float *in, int tokens, int cols,
     /* die() must not run inside the parallel region: OpenMP workers have no
      * error frame, so it would exit the host process, and a longjmp out of
      * the region is undefined. Record the failure and report it afterwards. */
+    {
+        int z;
 #ifdef _OPENMP
-    JB_OMP();
+        JB_OMP();
 #pragma omp parallel for schedule(static) if (blocks >= 256) reduction(| : nonfinite)
 #endif
-    for (int z = 0; z < blocks; z++) {
-        int t = z / nb, b = z % nb, bad = 0;
-        const float *x = in + (size_t)t * cols + (size_t)b * 16;
-        float *y = out + (size_t)t * cols + (size_t)b * 16, amax = 0;
-        for (int k = 0; k < 16; k++) {
-            bad |= !jb_finitef(x[k]);
-            if (fabsf(x[k]) > amax)
-                amax = fabsf(x[k]);
+        for (z = 0; z < blocks; z++) {
+            int t = z / nb, b = z % nb, bad = 0;
+            const float *x = in + (size_t)t * cols + (size_t)b * 16;
+            float *y = out + (size_t)t * cols + (size_t)b * 16, amax = 0;
+            for (int k = 0; k < 16; k++) {
+                bad |= !jb_finitef(x[k]);
+                if (fabsf(x[k]) > amax)
+                    amax = fabsf(x[k]);
+            }
+            if (bad) {
+                nonfinite = 1;
+                continue;
+            }
+            float s = dg_f8e4m3_round((amax / 6) / base) * base;
+            if (s == 0) {
+                memset(y, 0, 16 * sizeof *y);
+                continue;
+            }
+            for (int k = 0; k < 16; k++)
+                y[k] = dg_e2m1_round(x[k] / s) * s;
         }
-        if (bad) {
-            nonfinite = 1;
-            continue;
-        }
-        float s = dg_f8e4m3_round((amax / 6) / base) * base;
-        if (s == 0) {
-            memset(y, 0, 16 * sizeof *y);
-            continue;
-        }
-        for (int k = 0; k < 16; k++)
-            y[k] = dg_e2m1_round(x[k] / s) * s;
     }
     if (nonfinite)
         die("non-finite NVFP4 activation");
@@ -2023,28 +2040,31 @@ static void dg_nvfp4_weights16_avx2(const uint8_t *q, float scale, __m256 *w0, _
  * reference interleaved lane order and reusing it across four tokens. */
 static void dg_nvfp4_mm_avx2(const uint8_t *wd, const uint8_t *sd, float global, const float *x,
                              float *y, int tokens, int rows, int cols) {
+    {
+        int r;
 #ifdef _OPENMP
-    JB_OMP();
+        JB_OMP();
 #pragma omp parallel for schedule(static)
 #endif
-    for (int r = 0; r < rows; r++) {
-        const uint8_t *wp = wd + (uint64_t)r * cols / 2, *sp = sd + (uint64_t)r * cols / 16;
-        for (int tb = 0; tb < tokens; tb += 4) {
-            int nb = tokens - tb < 4 ? tokens - tb : 4;
-            __m256 acc0[4], acc1[4];
-            for (int q = 0; q < nb; q++)
-                acc0[q] = acc1[q] = _mm256_setzero_ps();
-            for (int c = 0; c < cols; c += 16) {
-                __m256 w0, w1;
-                dg_nvfp4_weights16_avx2(wp + c / 2, dg_f8e4m3(sp[c / 16]) * global, &w0, &w1);
-                for (int q = 0; q < nb; q++) {
-                    const float *xp = x + (size_t)(tb + q) * cols + c;
-                    acc0[q] = _mm256_fmadd_ps(w0, _mm256_loadu_ps(xp), acc0[q]);
-                    acc1[q] = _mm256_fmadd_ps(w1, _mm256_loadu_ps(xp + 8), acc1[q]);
+        for (r = 0; r < rows; r++) {
+            const uint8_t *wp = wd + (uint64_t)r * cols / 2, *sp = sd + (uint64_t)r * cols / 16;
+            for (int tb = 0; tb < tokens; tb += 4) {
+                int nb = tokens - tb < 4 ? tokens - tb : 4;
+                __m256 acc0[4], acc1[4];
+                for (int q = 0; q < nb; q++)
+                    acc0[q] = acc1[q] = _mm256_setzero_ps();
+                for (int c = 0; c < cols; c += 16) {
+                    __m256 w0, w1;
+                    dg_nvfp4_weights16_avx2(wp + c / 2, dg_f8e4m3(sp[c / 16]) * global, &w0, &w1);
+                    for (int q = 0; q < nb; q++) {
+                        const float *xp = x + (size_t)(tb + q) * cols + c;
+                        acc0[q] = _mm256_fmadd_ps(w0, _mm256_loadu_ps(xp), acc0[q]);
+                        acc1[q] = _mm256_fmadd_ps(w1, _mm256_loadu_ps(xp + 8), acc1[q]);
+                    }
                 }
+                for (int q = 0; q < nb; q++)
+                    y[(size_t)(tb + q) * rows + r] = dg_hsum8(_mm256_add_ps(acc0[q], acc1[q]));
             }
-            for (int q = 0; q < nb; q++)
-                y[(size_t)(tb + q) * rows + r] = dg_hsum8(_mm256_add_ps(acc0[q], acc1[q]));
         }
     }
 }
@@ -2110,53 +2130,56 @@ static void dg_mm_data_avx512(const uint8_t *data, const float *x, float *y, int
                               int cols) {
     if (rows % 2)
         die("AVX-512 matrix row count must be even");
+    {
+        int r;
 #ifdef _OPENMP
-    JB_OMP();
+        JB_OMP();
 #pragma omp parallel for schedule(static)
 #endif
-    for (int r = 0; r < rows; r += 2) {
-        const uint8_t *p0 = data + (uint64_t)r * cols * 2, *p1 = p0 + (uint64_t)cols * 2;
-        int t = 0;
-        for (; t + 7 < tokens; t += 8) {
-            __m512 a[8], b[8];
-            for (int q = 0; q < 8; q++)
-                a[q] = b[q] = _mm512_setzero_ps();
-            int c = 0;
-            for (; c + 15 < cols; c += 16) {
-                __m512 w0 = dg_bf16x16(p0 + c * 2), w1 = dg_bf16x16(p1 + c * 2);
+        for (r = 0; r < rows; r += 2) {
+            const uint8_t *p0 = data + (uint64_t)r * cols * 2, *p1 = p0 + (uint64_t)cols * 2;
+            int t = 0;
+            for (; t + 7 < tokens; t += 8) {
+                __m512 a[8], b[8];
+                for (int q = 0; q < 8; q++)
+                    a[q] = b[q] = _mm512_setzero_ps();
+                int c = 0;
+                for (; c + 15 < cols; c += 16) {
+                    __m512 w0 = dg_bf16x16(p0 + c * 2), w1 = dg_bf16x16(p1 + c * 2);
+                    for (int q = 0; q < 8; q++) {
+                        __m512 v = _mm512_loadu_ps(x + (size_t)(t + q) * cols + c);
+                        a[q] = _mm512_fmadd_ps(w0, v, a[q]);
+                        b[q] = _mm512_fmadd_ps(w1, v, b[q]);
+                    }
+                }
                 for (int q = 0; q < 8; q++) {
-                    __m512 v = _mm512_loadu_ps(x + (size_t)(t + q) * cols + c);
-                    a[q] = _mm512_fmadd_ps(w0, v, a[q]);
-                    b[q] = _mm512_fmadd_ps(w1, v, b[q]);
+                    float z0 = _mm512_reduce_add_ps(a[q]), z1 = _mm512_reduce_add_ps(b[q]);
+                    for (int k = (cols & ~15); k < cols; k++) {
+                        float v = x[(size_t)(t + q) * cols + k];
+                        z0 += dg_bf(p0 + k * 2) * v;
+                        z1 += dg_bf(p1 + k * 2) * v;
+                    }
+                    y[(size_t)(t + q) * rows + r] = z0;
+                    y[(size_t)(t + q) * rows + r + 1] = z1;
                 }
             }
-            for (int q = 0; q < 8; q++) {
-                float z0 = _mm512_reduce_add_ps(a[q]), z1 = _mm512_reduce_add_ps(b[q]);
-                for (int k = (cols & ~15); k < cols; k++) {
-                    float v = x[(size_t)(t + q) * cols + k];
-                    z0 += dg_bf(p0 + k * 2) * v;
-                    z1 += dg_bf(p1 + k * 2) * v;
+            for (; t < tokens; t++) {
+                __m512 s0 = _mm512_setzero_ps(), s1 = s0;
+                int c = 0;
+                for (; c + 15 < cols; c += 16) {
+                    __m512 v = _mm512_loadu_ps(x + (size_t)t * cols + c);
+                    s0 = _mm512_fmadd_ps(dg_bf16x16(p0 + c * 2), v, s0);
+                    s1 = _mm512_fmadd_ps(dg_bf16x16(p1 + c * 2), v, s1);
                 }
-                y[(size_t)(t + q) * rows + r] = z0;
-                y[(size_t)(t + q) * rows + r + 1] = z1;
+                float z0 = _mm512_reduce_add_ps(s0), z1 = _mm512_reduce_add_ps(s1);
+                for (; c < cols; c++) {
+                    float v = x[(size_t)t * cols + c];
+                    z0 += dg_bf(p0 + c * 2) * v;
+                    z1 += dg_bf(p1 + c * 2) * v;
+                }
+                y[(size_t)t * rows + r] = z0;
+                y[(size_t)t * rows + r + 1] = z1;
             }
-        }
-        for (; t < tokens; t++) {
-            __m512 s0 = _mm512_setzero_ps(), s1 = s0;
-            int c = 0;
-            for (; c + 15 < cols; c += 16) {
-                __m512 v = _mm512_loadu_ps(x + (size_t)t * cols + c);
-                s0 = _mm512_fmadd_ps(dg_bf16x16(p0 + c * 2), v, s0);
-                s1 = _mm512_fmadd_ps(dg_bf16x16(p1 + c * 2), v, s1);
-            }
-            float z0 = _mm512_reduce_add_ps(s0), z1 = _mm512_reduce_add_ps(s1);
-            for (; c < cols; c++) {
-                float v = x[(size_t)t * cols + c];
-                z0 += dg_bf(p0 + c * 2) * v;
-                z1 += dg_bf(p1 + c * 2) * v;
-            }
-            y[(size_t)t * rows + r] = z0;
-            y[(size_t)t * rows + r + 1] = z1;
         }
     }
 }
@@ -2185,50 +2208,55 @@ static void dg_nvfp4_mm_avx512(const uint8_t *wd, const uint8_t *sd, float globa
                                float *y, int tokens, int rows, int cols) {
     static const float lut[16] = {0, .5f, 1, 1.5f, 2, 3, 4, 6, 0, -.5f, -1, -1.5f, -2, -3, -4, -6};
     __m512 table = _mm512_loadu_ps(lut);
+    {
+        int r;
 #ifdef _OPENMP
-    JB_OMP();
+        JB_OMP();
 #pragma omp parallel for schedule(static)
 #endif
-    for (int r = 0; r < rows; r += 2) {
-        const uint8_t *wp0 = wd + (uint64_t)r * cols / 2, *wp1 = wp0 + cols / 2;
-        const uint8_t *sp0 = sd + (uint64_t)r * cols / 16, *sp1 = sp0 + cols / 16;
-        for (int tb = 0; tb < tokens; tb += 8) {
-            int nb = tokens - tb < 8 ? tokens - tb : 8;
-            __m512 a[8], b[8];
-            for (int q = 0; q < nb; q++)
-                a[q] = b[q] = _mm512_setzero_ps();
-            for (int c = 0; c < cols; c += 32) {
-                __m512i z = _mm512_set1_epi32(15),
-                        raw0 =
-                            _mm512_cvtepu8_epi32(_mm_loadu_si128((const __m128i *)(wp0 + c / 2))),
-                        raw1 =
-                            _mm512_cvtepu8_epi32(_mm_loadu_si128((const __m128i *)(wp1 + c / 2)));
-                __m512 wl0 = _mm512_permutexvar_ps(_mm512_and_si512(raw0, z), table),
-                       wh0 = _mm512_permutexvar_ps(_mm512_srli_epi32(raw0, 4), table);
-                __m512 wl1 = _mm512_permutexvar_ps(_mm512_and_si512(raw1, z), table),
-                       wh1 = _mm512_permutexvar_ps(_mm512_srli_epi32(raw1, 4), table);
-                float a0 = dg_f8e4m3(sp0[c / 16]) * global,
-                      a1 = dg_f8e4m3(sp0[c / 16 + 1]) * global,
-                      b0 = dg_f8e4m3(sp1[c / 16]) * global,
-                      b1 = dg_f8e4m3(sp1[c / 16 + 1]) * global;
-                __m512 sv0 = _mm512_mask_blend_ps(0xff00, _mm512_set1_ps(a0), _mm512_set1_ps(a1)),
-                       sv1 = _mm512_mask_blend_ps(0xff00, _mm512_set1_ps(b0), _mm512_set1_ps(b1));
-                wl0 = _mm512_mul_ps(wl0, sv0);
-                wh0 = _mm512_mul_ps(wh0, sv0);
-                wl1 = _mm512_mul_ps(wl1, sv1);
-                wh1 = _mm512_mul_ps(wh1, sv1);
-                for (int q = 0; q < nb; q++) {
-                    const float *xp = x + (size_t)(tb + q) * cols + c;
-                    __m512 xe = _mm512_loadu_ps(xp), xo = _mm512_loadu_ps(xp + 16);
-                    a[q] = _mm512_fmadd_ps(wl0, xe, a[q]);
-                    a[q] = _mm512_fmadd_ps(wh0, xo, a[q]);
-                    b[q] = _mm512_fmadd_ps(wl1, xe, b[q]);
-                    b[q] = _mm512_fmadd_ps(wh1, xo, b[q]);
+        for (r = 0; r < rows; r += 2) {
+            const uint8_t *wp0 = wd + (uint64_t)r * cols / 2, *wp1 = wp0 + cols / 2;
+            const uint8_t *sp0 = sd + (uint64_t)r * cols / 16, *sp1 = sp0 + cols / 16;
+            for (int tb = 0; tb < tokens; tb += 8) {
+                int nb = tokens - tb < 8 ? tokens - tb : 8;
+                __m512 a[8], b[8];
+                for (int q = 0; q < nb; q++)
+                    a[q] = b[q] = _mm512_setzero_ps();
+                for (int c = 0; c < cols; c += 32) {
+                    __m512i z = _mm512_set1_epi32(15),
+                            raw0 = _mm512_cvtepu8_epi32(
+                                _mm_loadu_si128((const __m128i *)(wp0 + c / 2))),
+                            raw1 = _mm512_cvtepu8_epi32(
+                                _mm_loadu_si128((const __m128i *)(wp1 + c / 2)));
+                    __m512 wl0 = _mm512_permutexvar_ps(_mm512_and_si512(raw0, z), table),
+                           wh0 = _mm512_permutexvar_ps(_mm512_srli_epi32(raw0, 4), table);
+                    __m512 wl1 = _mm512_permutexvar_ps(_mm512_and_si512(raw1, z), table),
+                           wh1 = _mm512_permutexvar_ps(_mm512_srli_epi32(raw1, 4), table);
+                    float a0 = dg_f8e4m3(sp0[c / 16]) * global,
+                          a1 = dg_f8e4m3(sp0[c / 16 + 1]) * global,
+                          b0 = dg_f8e4m3(sp1[c / 16]) * global,
+                          b1 = dg_f8e4m3(sp1[c / 16 + 1]) * global;
+                    __m512 sv0 =
+                               _mm512_mask_blend_ps(0xff00, _mm512_set1_ps(a0), _mm512_set1_ps(a1)),
+                           sv1 =
+                               _mm512_mask_blend_ps(0xff00, _mm512_set1_ps(b0), _mm512_set1_ps(b1));
+                    wl0 = _mm512_mul_ps(wl0, sv0);
+                    wh0 = _mm512_mul_ps(wh0, sv0);
+                    wl1 = _mm512_mul_ps(wl1, sv1);
+                    wh1 = _mm512_mul_ps(wh1, sv1);
+                    for (int q = 0; q < nb; q++) {
+                        const float *xp = x + (size_t)(tb + q) * cols + c;
+                        __m512 xe = _mm512_loadu_ps(xp), xo = _mm512_loadu_ps(xp + 16);
+                        a[q] = _mm512_fmadd_ps(wl0, xe, a[q]);
+                        a[q] = _mm512_fmadd_ps(wh0, xo, a[q]);
+                        b[q] = _mm512_fmadd_ps(wl1, xe, b[q]);
+                        b[q] = _mm512_fmadd_ps(wh1, xo, b[q]);
+                    }
                 }
-            }
-            for (int q = 0; q < nb; q++) {
-                y[(size_t)(tb + q) * rows + r] = _mm512_reduce_add_ps(a[q]);
-                y[(size_t)(tb + q) * rows + r + 1] = _mm512_reduce_add_ps(b[q]);
+                for (int q = 0; q < nb; q++) {
+                    y[(size_t)(tb + q) * rows + r] = _mm512_reduce_add_ps(a[q]);
+                    y[(size_t)(tb + q) * rows + r + 1] = _mm512_reduce_add_ps(b[q]);
+                }
             }
         }
     }
@@ -2588,23 +2616,26 @@ static void dg_attention_segments(DGModel *m, int l, float *x, int segments, int
     float inv[DG_FULL_HEAD_DIM / 2];
     for (int i = 0; i < half; i++)
         inv[i] = i < rotated ? powf(full ? 1000000.0f : 10000.0f, -(float)(2 * i) / hd) : 0;
+    {
+        int ti;
 #ifdef _OPENMP
-    JB_OMP();
+        JB_OMP();
 #pragma omp parallel for schedule(static)
 #endif
-    for (int ti = 0; ti < n; ti++) {
-        int s = ti / seq, t = ti % seq, old = cache ? cache[s]->n : 0,
-            pos = (cache ? old : pos0) + t;
-        float cv[DG_FULL_HEAD_DIM / 2], sv[DG_FULL_HEAD_DIM / 2];
-        for (int i = 0; i < half; i++) {
-            cv[i] = cosf(pos * inv[i]);
-            sv[i] = sinf(pos * inv[i]);
+        for (ti = 0; ti < n; ti++) {
+            int s = ti / seq, t = ti % seq, old = cache ? cache[s]->n : 0,
+                pos = (cache ? old : pos0) + t;
+            float cv[DG_FULL_HEAD_DIM / 2], sv[DG_FULL_HEAD_DIM / 2];
+            for (int i = 0; i < half; i++) {
+                cv[i] = cosf(pos * inv[i]);
+                sv[i] = sinf(pos * inv[i]);
+            }
+            dg_norm_heads(q + (size_t)ti * qn, DG_HEADS, hd, qnrm);
+            dg_norm_heads(k + (size_t)ti * kn, kvh, hd, knrm);
+            dg_norm_heads(v + (size_t)ti * kn, kvh, hd, NULL);
+            dg_rope(q + (size_t)ti * qn, DG_HEADS, hd, cv, sv);
+            dg_rope(k + (size_t)ti * kn, kvh, hd, cv, sv);
         }
-        dg_norm_heads(q + (size_t)ti * qn, DG_HEADS, hd, qnrm);
-        dg_norm_heads(k + (size_t)ti * kn, kvh, hd, knrm);
-        dg_norm_heads(v + (size_t)ti * kn, kvh, hd, NULL);
-        dg_rope(q + (size_t)ti * qn, DG_HEADS, hd, cv, sv);
-        dg_rope(k + (size_t)ti * kn, kvh, hd, cv, sv);
     }
     JB_TO(attention_prepare, prepare_start);
     JB_TICK(kv_start);
@@ -2617,45 +2648,50 @@ static void dg_attention_segments(DGModel *m, int l, float *x, int segments, int
           *score = jb_arena_alloc(workspace, (size_t)n * (maxold + seq), sizeof *score, 0);
     JB_TO(attention_kv, kv_start);
     JB_TICK(core_start);
+    {
+        int ti;
 #ifdef _OPENMP
-    JB_OMP();
+        JB_OMP();
 #pragma omp parallel for schedule(static)
 #endif
-    for (int ti = 0; ti < n; ti++)
-        for (int h = 0; h < DG_HEADS; h++) {
-            int s = ti / seq, t = ti % seq, old = cache ? cache[s]->n : 0,
-                kh = h / (DG_HEADS / kvh), end = mode == DG_CANVAS ? old + seq : old + t + 1,
-                start = 0;
-            if (!full) {
-                if (mode == DG_CANVAS) {
-                    int pos = old + t;
-                    start = pos >= DG_LOCAL_WINDOW ? pos - DG_LOCAL_WINDOW + 1 : 0;
-                    if (end > pos + DG_LOCAL_WINDOW)
-                        end = pos + DG_LOCAL_WINDOW;
-                } else
-                    start = end > DG_LOCAL_WINDOW ? end - DG_LOCAL_WINDOW : 0;
-            }
-            float *ts = score + (size_t)ti * (maxold + seq), mx = -FLT_MAX;
-            const float *qq = q + (size_t)ti * qn + (size_t)h * hd;
-            for (int j = start; j < end; j++) {
-                const float *kk = j < old ? cache[s]->k + (size_t)j * kn + (size_t)kh * hd
+        for (ti = 0; ti < n; ti++)
+            for (int h = 0; h < DG_HEADS; h++) {
+                int s = ti / seq, t = ti % seq, old = cache ? cache[s]->n : 0,
+                    kh = h / (DG_HEADS / kvh), end = mode == DG_CANVAS ? old + seq : old + t + 1,
+                    start = 0;
+                if (!full) {
+                    if (mode == DG_CANVAS) {
+                        int pos = old + t;
+                        start = pos >= DG_LOCAL_WINDOW ? pos - DG_LOCAL_WINDOW + 1 : 0;
+                        if (end > pos + DG_LOCAL_WINDOW)
+                            end = pos + DG_LOCAL_WINDOW;
+                    } else
+                        start = end > DG_LOCAL_WINDOW ? end - DG_LOCAL_WINDOW : 0;
+                }
+                float *ts = score + (size_t)ti * (maxold + seq), mx = -FLT_MAX;
+                const float *qq = q + (size_t)ti * qn + (size_t)h * hd;
+                for (int j = start; j < end; j++) {
+                    const float *kk = j < old
+                                          ? cache[s]->k + (size_t)j * kn + (size_t)kh * hd
                                           : k + ((size_t)s * seq + j - old) * kn + (size_t)kh * hd;
-                ts[j] = (float)dg_dot(qq, kk, hd);
-                if (ts[j] > mx)
-                    mx = ts[j];
-            }
-            float den = 0;
-            for (int j = start; j < end; j++)
-                den += expf(ts[j] - mx);
-            float *oo = a + (size_t)ti * qn + (size_t)h * hd;
-            for (int j = start; j < end; j++) {
-                float p = expf(ts[j] - mx) / den;
-                const float *vv = j < old ? cache[s]->v + (size_t)j * kn + (size_t)kh * hd
+                    ts[j] = (float)dg_dot(qq, kk, hd);
+                    if (ts[j] > mx)
+                        mx = ts[j];
+                }
+                float den = 0;
+                for (int j = start; j < end; j++)
+                    den += expf(ts[j] - mx);
+                float *oo = a + (size_t)ti * qn + (size_t)h * hd;
+                for (int j = start; j < end; j++) {
+                    float p = expf(ts[j] - mx) / den;
+                    const float *vv = j < old
+                                          ? cache[s]->v + (size_t)j * kn + (size_t)kh * hd
                                           : v + ((size_t)s * seq + j - old) * kn + (size_t)kh * hd;
-                for (int d = 0; d < hd; d++)
-                    oo[d] += p * vv[d];
+                    for (int d = 0; d < hd; d++)
+                        oo[d] += p * vv[d];
+                }
             }
-        }
+    }
     JB_TO(attention_core, core_start);
     JB_TICK(output_start);
     DGTensor *ow = dg_layer_tensor(m, l, "self_attn.o_proj.weight");
@@ -2699,34 +2735,43 @@ static void dg_ff(DGModel *m, int l, float *x, int n, JBArena *workspace) {
           *z2 = jb_arena_alloc(workspace, (size_t)n * DG_H, sizeof *z2, 0),
           *rin = jb_arena_alloc(workspace, (size_t)n * DG_H, sizeof *rin, 1),
           *route = jb_arena_alloc(workspace, (size_t)n * DG_EXPERTS, sizeof *route, 0);
+    {
+        int t;
 #ifdef _OPENMP
-    JB_OMP();
+        JB_OMP();
 #pragma omp parallel for schedule(static)
 #endif
-    for (int t = 0; t < n; t++)
-        dg_rms(z1 + (size_t)t * DG_H, x + (size_t)t * DG_H, pre, DG_H);
+        for (t = 0; t < n; t++)
+            dg_rms(z1 + (size_t)t * DG_H, x + (size_t)t * DG_H, pre, DG_H);
+    }
     dg_mm(gw, z1, g, n, DG_DENSE, DG_H);
     dg_mm(uw, z1, u, n, DG_DENSE, DG_H);
+    {
+        ptrdiff_t i;
 #ifdef _OPENMP
-    JB_OMP();
+        JB_OMP();
 #pragma omp parallel for schedule(static)
 #endif
-    for (size_t i = 0; i < (size_t)n * DG_DENSE; i++)
-        g[i] = dg_gelu(g[i]) * u[i];
+        for (i = 0; i < (ptrdiff_t)n * DG_DENSE; i++)
+            g[i] = dg_gelu(g[i]) * u[i];
+    }
     dg_mm(dw, g, d, n, DG_H, DG_DENSE);
     JB_TO(dense, ff_start);
     JB_TICK(router_start);
+    {
+        int t;
 #ifdef _OPENMP
-    JB_OMP();
+        JB_OMP();
 #pragma omp parallel for schedule(static)
 #endif
-    for (int t = 0; t < n; t++) {
-        float *r = x + (size_t)t * DG_H;
-        dg_rms(d + (size_t)t * DG_H, d + (size_t)t * DG_H, p1, DG_H);
-        dg_rms(z2 + (size_t)t * DG_H, r, pre2, DG_H);
-        dg_rms(rin + (size_t)t * DG_H, r, NULL, DG_H);
-        for (int i = 0; i < DG_H; i++)
-            rin[(size_t)t * DG_H + i] *= dg_at(rs, i) / sqrtf(DG_H);
+        for (t = 0; t < n; t++) {
+            float *r = x + (size_t)t * DG_H;
+            dg_rms(d + (size_t)t * DG_H, d + (size_t)t * DG_H, p1, DG_H);
+            dg_rms(z2 + (size_t)t * DG_H, r, pre2, DG_H);
+            dg_rms(rin + (size_t)t * DG_H, r, NULL, DG_H);
+            for (int i = 0; i < DG_H; i++)
+                rin[(size_t)t * DG_H + i] *= dg_at(rs, i) / sqrtf(DG_H);
+        }
     }
     dg_mm(rw, rin, route, n, DG_EXPERTS, DG_H);
     for (size_t i = 0; i < (size_t)n * DG_EXPERTS; i++)
@@ -2734,43 +2779,46 @@ static void dg_ff(DGModel *m, int l, float *x, int n, JBArena *workspace) {
             die("non-finite DiffusionGemma router logits");
     int *top = jb_arena_alloc(workspace, (size_t)n * DG_TOPK, sizeof *top, 0);
     float *tw = jb_arena_alloc(workspace, (size_t)n * DG_TOPK, sizeof *tw, 0);
+    {
+        int t;
 #ifdef _OPENMP
-    JB_OMP();
+        JB_OMP();
 #pragma omp parallel for schedule(static)
 #endif
-    for (int t = 0; t < n; t++) {
-        float *rt = route + (size_t)t * DG_EXPERTS;
-        int ix[DG_TOPK];
-        float ev[DG_TOPK];
-        for (int k = 0; k < DG_TOPK; k++) {
-            ix[k] = k;
-            ev[k] = -FLT_MAX;
-        }
-        for (int e = 0; e < DG_EXPERTS; e++)
-            for (int k = 0; k < DG_TOPK; k++)
-                if (rt[e] > ev[k]) {
-                    for (int q = DG_TOPK - 1; q > k; q--) {
-                        ev[q] = ev[q - 1];
-                        ix[q] = ix[q - 1];
+        for (t = 0; t < n; t++) {
+            float *rt = route + (size_t)t * DG_EXPERTS;
+            int ix[DG_TOPK];
+            float ev[DG_TOPK];
+            for (int k = 0; k < DG_TOPK; k++) {
+                ix[k] = k;
+                ev[k] = -FLT_MAX;
+            }
+            for (int e = 0; e < DG_EXPERTS; e++)
+                for (int k = 0; k < DG_TOPK; k++)
+                    if (rt[e] > ev[k]) {
+                        for (int q = DG_TOPK - 1; q > k; q--) {
+                            ev[q] = ev[q - 1];
+                            ix[q] = ix[q - 1];
+                        }
+                        ev[k] = rt[e];
+                        ix[k] = e;
+                        break;
                     }
-                    ev[k] = rt[e];
-                    ix[k] = e;
-                    break;
-                }
-        float mx = rt[0];
-        for (int e = 1; e < DG_EXPERTS; e++)
-            if (rt[e] > mx)
-                mx = rt[e];
-        double all = 0, sel = 0;
-        for (int e = 0; e < DG_EXPERTS; e++)
-            all += exp((double)rt[e] - mx);
-        for (int k = 0; k < DG_TOPK; k++) {
-            ev[k] = (float)(exp((double)ev[k] - mx) / all);
-            sel += ev[k];
-        }
-        for (int k = 0; k < DG_TOPK; k++) {
-            top[(size_t)t * DG_TOPK + k] = ix[k];
-            tw[(size_t)t * DG_TOPK + k] = ev[k] / (float)sel * dg_at(re, ix[k]);
+            float mx = rt[0];
+            for (int e = 1; e < DG_EXPERTS; e++)
+                if (rt[e] > mx)
+                    mx = rt[e];
+            double all = 0, sel = 0;
+            for (int e = 0; e < DG_EXPERTS; e++)
+                all += exp((double)rt[e] - mx);
+            for (int k = 0; k < DG_TOPK; k++) {
+                ev[k] = (float)(exp((double)ev[k] - mx) / all);
+                sel += ev[k];
+            }
+            for (int k = 0; k < DG_TOPK; k++) {
+                top[(size_t)t * DG_TOPK + k] = ix[k];
+                tw[(size_t)t * DG_TOPK + k] = ev[k] / (float)sel * dg_at(re, ix[k]);
+            }
         }
     }
     JB_TO(router, router_start);
@@ -2810,12 +2858,15 @@ static void dg_ff(DGModel *m, int l, float *x, int n, JBArena *workspace) {
             dg_nvfp4_mm(v->wu, v->su, v->gu, gather, hid, ne, DG_MOE, DG_H);
             JB_TO(moe_up, up_start);
             JB_TICK(act_start);
+            {
+                int qi;
 #ifdef _OPENMP
-            JB_OMP();
+                JB_OMP();
 #pragma omp parallel for schedule(static) if (ne * DG_MOE >= 4096)
 #endif
-            for (int qi = 0; qi < ne * DG_MOE; qi++)
-                hid[qi] = dg_gelu(gu[qi]) * hid[qi];
+                for (qi = 0; qi < ne * DG_MOE; qi++)
+                    hid[qi] = dg_gelu(gu[qi]) * hid[qi];
+            }
             JB_TO(moe_activation, act_start);
             JB_TICK(hidden_qdq_start);
             dg_nvfp4_qdq(qh, hid, ne, DG_MOE, m->nv_a2[l]);
@@ -2873,23 +2924,29 @@ static void dg_layer(DGModel *m, int l, float *x, int n, int pos0, const DGKV *c
     float *res = jb_arena_alloc(workspace, (size_t)n * DG_H, sizeof *res, 0),
           *z = jb_arena_alloc(workspace, (size_t)n * DG_H, sizeof *z, 0);
     memcpy(res, x, (size_t)n * DG_H * 4);
+    {
+        int t;
 #ifdef _OPENMP
-    JB_OMP();
+        JB_OMP();
 #pragma omp parallel for schedule(static)
 #endif
-    for (int t = 0; t < n; t++)
-        dg_rms(z + (size_t)t * DG_H, x + (size_t)t * DG_H, in, DG_H);
+        for (t = 0; t < n; t++)
+            dg_rms(z + (size_t)t * DG_H, x + (size_t)t * DG_H, in, DG_H);
+    }
     JB_TICK(attention_start);
     dg_attention(m, l, z, n, pos0, cache, out, mode, batch, workspace);
     JB_TO(attention, attention_start);
+    {
+        int t;
 #ifdef _OPENMP
-    JB_OMP();
+        JB_OMP();
 #pragma omp parallel for schedule(static)
 #endif
-    for (int t = 0; t < n; t++) {
-        dg_rms(x + (size_t)t * DG_H, z + (size_t)t * DG_H, pa, DG_H);
-        for (int i = 0; i < DG_H; i++)
-            x[(size_t)t * DG_H + i] += res[(size_t)t * DG_H + i];
+        for (t = 0; t < n; t++) {
+            dg_rms(x + (size_t)t * DG_H, z + (size_t)t * DG_H, pa, DG_H);
+            for (int i = 0; i < DG_H; i++)
+                x[(size_t)t * DG_H + i] += res[(size_t)t * DG_H + i];
+        }
     }
     dg_ff(m, l, x, n, workspace);
     float sc = dg_at(dg_layer_tensor(m, l, "layer_scalar"), 0);
@@ -2910,23 +2967,29 @@ static void dg_layer_multi(DGModel *m, int l, float *x, int segments, int seq,
     float *res = jb_arena_alloc(workspace, (size_t)n * DG_H, sizeof *res, 0),
           *z = jb_arena_alloc(workspace, (size_t)n * DG_H, sizeof *z, 0);
     memcpy(res, x, (size_t)n * DG_H * 4);
+    {
+        int t;
 #ifdef _OPENMP
-    JB_OMP();
+        JB_OMP();
 #pragma omp parallel for schedule(static)
 #endif
-    for (int t = 0; t < n; t++)
-        dg_rms(z + (size_t)t * DG_H, x + (size_t)t * DG_H, in, DG_H);
+        for (t = 0; t < n; t++)
+            dg_rms(z + (size_t)t * DG_H, x + (size_t)t * DG_H, in, DG_H);
+    }
     JB_TICK(attention_start);
     dg_attention_segments(m, l, z, segments, seq, 0, cache, lens, out, mode, workspace);
     JB_TO(attention, attention_start);
+    {
+        int t;
 #ifdef _OPENMP
-    JB_OMP();
+        JB_OMP();
 #pragma omp parallel for schedule(static)
 #endif
-    for (int t = 0; t < n; t++) {
-        dg_rms(x + (size_t)t * DG_H, z + (size_t)t * DG_H, pa, DG_H);
-        for (int i = 0; i < DG_H; i++)
-            x[(size_t)t * DG_H + i] += res[(size_t)t * DG_H + i];
+        for (t = 0; t < n; t++) {
+            dg_rms(x + (size_t)t * DG_H, z + (size_t)t * DG_H, pa, DG_H);
+            for (int i = 0; i < DG_H; i++)
+                x[(size_t)t * DG_H + i] += res[(size_t)t * DG_H + i];
+        }
     }
     dg_ff(m, l, x, n, workspace);
     float sc = dg_at(dg_layer_tensor(m, l, "layer_scalar"), 0);
@@ -5422,11 +5485,14 @@ static int bench_kernels(void) {
         buf[i] = i;
     for (int rep = 0; rep < 3; rep++) {
         uint64_t t0 = now_ns(), sum = 0;
+        {
+            ptrdiff_t i;
 #ifdef _OPENMP
 #pragma omp parallel for reduction(+ : sum) schedule(static)
 #endif
-        for (size_t i = 0; i < nw; i++)
-            sum += buf[i];
+            for (i = 0; i < (ptrdiff_t)nw; i++)
+                sum += buf[i];
+        }
         ns[rep] = now_ns() - t0;
         acc += sum;
     }
