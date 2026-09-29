@@ -2423,29 +2423,30 @@ static void dg_mm_data_neon(const uint8_t *data, const float *x, float *y, int t
     }
 }
 
-/* Four E2M1 values, one per row, from four bytes' nibbles: magnitudes are
- * stored doubled so they are exact small integers, and the sign bit sits
- * at `sign_shift` below bit 31. */
-static float32x4_t dg_e2m1x4_neon(uint32x4_t doubled, uint32x4_t sign, int sign_shift) {
-    float32x4_t v = vmulq_n_f32(vcvtq_f32_u32(doubled), .5f);
-    uint32x4_t bit = sign_shift == 28 ? vshlq_n_u32(sign, 28) : vshlq_n_u32(sign, 24);
-    return vreinterpretq_f32_u32(veorq_u32(vreinterpretq_u32_f32(v), bit));
-}
+/* Signed E2M1 values by nibble, sign bit included; entry 8 is -0.0, which
+ * the reference also produces and bit-identity must keep. */
+static const float dg_e2m1_neon[16] = {0,     .5f,  1,  1.5f,  2,  3,  4,  6,
+                                       -0.0f, -.5f, -1, -1.5f, -2, -3, -4, -6};
 
-static void dg_widen4_neon(uint8x16_t v, uint32x4_t *out) {
-    uint16x8_t l = vmovl_u8(vget_low_u8(v)), h = vmovl_high_u8(v);
-    out[0] = vmovl_u16(vget_low_u16(l));
-    out[1] = vmovl_high_u16(l);
-    out[2] = vmovl_u16(vget_low_u16(h));
-    out[3] = vmovl_high_u16(h);
+/* Four rows' float weights for byte position k from nibbles held as
+ * table offsets (nibble * 4): spread each row's offset over its lane's four
+ * bytes, add the byte index, and read the float's bytes from the table. */
+static float32x4_t dg_e2m1x4_neon(uint8x16x4_t table, uint8x16_t offsets, int k) {
+    static const uint8_t spread[4][16] = {
+        {0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3},
+        {4, 4, 4, 4, 5, 5, 5, 5, 6, 6, 6, 6, 7, 7, 7, 7},
+        {8, 8, 8, 8, 9, 9, 9, 9, 10, 10, 10, 10, 11, 11, 11, 11},
+        {12, 12, 12, 12, 13, 13, 13, 13, 14, 14, 14, 14, 15, 15, 15, 15}};
+    static const uint8_t byte[16] = {0, 1, 2, 3, 0, 1, 2, 3, 0, 1, 2, 3, 0, 1, 2, 3};
+    uint8x16_t index = vaddq_u8(vqtbl1q_u8(offsets, vld1q_u8(spread[k])), vld1q_u8(byte));
+    return vreinterpretq_f32_u8(vqtbl4q_u8(table, index));
 }
 
 /* One packed 16-weight block (eight bytes) from each of four rows, as eight
  * vectors of even-column weights and eight of odd-column weights, each
  * holding the four rows' values for one byte position. */
 static void dg_nvfp4_weights4_neon(const uint8_t *const *q, float32x4_t *even, float32x4_t *odd) {
-    static const uint8_t doubled[16] = {0, 1, 2, 3, 4, 6, 8, 12};
-    const uint8x16_t table = vld1q_u8(doubled);
+    const uint8x16x4_t table = vld1q_u8_x4((const uint8_t *)dg_e2m1_neon);
     uint8x8x2_t z01 = vzip_u8(vld1_u8(q[0]), vld1_u8(q[1]));
     uint8x8x2_t z23 = vzip_u8(vld1_u8(q[2]), vld1_u8(q[3]));
     for (int half = 0; half < 2; half++) {
@@ -2453,16 +2454,48 @@ static void dg_nvfp4_weights4_neon(const uint8_t *const *q, float32x4_t *even, f
             vzip_u16(vreinterpret_u16_u8(z01.val[half]), vreinterpret_u16_u8(z23.val[half]));
         uint8x16_t bytes =
             vcombine_u8(vreinterpret_u8_u16(z.val[0]), vreinterpret_u8_u16(z.val[1]));
-        uint32x4_t lo[4], lo_sign[4], hi[4], hi_sign[4];
-        dg_widen4_neon(vqtbl1q_u8(table, vandq_u8(bytes, vdupq_n_u8(7))), lo);
-        dg_widen4_neon(vandq_u8(bytes, vdupq_n_u8(8)), lo_sign);
-        dg_widen4_neon(vqtbl1q_u8(table, vshrq_n_u8(vandq_u8(bytes, vdupq_n_u8(0x70)), 4)), hi);
-        dg_widen4_neon(vandq_u8(bytes, vdupq_n_u8(0x80)), hi_sign);
+        uint8x16_t lo = vshlq_n_u8(vandq_u8(bytes, vdupq_n_u8(15)), 2);
+        uint8x16_t hi = vshlq_n_u8(vshrq_n_u8(bytes, 4), 2);
         for (int k = 0; k < 4; k++) {
-            even[half * 4 + k] = dg_e2m1x4_neon(lo[k], lo_sign[k], 28);
-            odd[half * 4 + k] = dg_e2m1x4_neon(hi[k], hi_sign[k], 24);
+            even[half * 4 + k] = dg_e2m1x4_neon(table, lo, k);
+            odd[half * 4 + k] = dg_e2m1x4_neon(table, hi, k);
         }
     }
+}
+
+/* dg_f8e4m3 for four rows' scale bytes: the same bit assembly, with the
+ * subnormals (exponent 0) selected by mask. */
+static float32x4_t dg_e4m3x4_neon(uint32x4_t u) {
+    uint32x4_t e = vandq_u32(vshrq_n_u32(u, 3), vdupq_n_u32(15)), m = vandq_u32(u, vdupq_n_u32(7));
+    uint32x4_t normal =
+        vorrq_u32(vshlq_n_u32(vaddq_u32(e, vdupq_n_u32(120)), 23), vshlq_n_u32(m, 20));
+    float32x4_t subnormal = vmulq_n_f32(vcvtq_f32_u32(m), 0x1p-9f);
+    float32x4_t v =
+        vbslq_f32(vcgtq_u32(e, vdupq_n_u32(0)), vreinterpretq_f32_u32(normal), subnormal);
+    uint32x4_t sign = vshlq_n_u32(vshrq_n_u32(u, 7), 31);
+    return vreinterpretq_f32_u32(veorq_u32(vreinterpretq_u32_f32(v), sign));
+}
+
+/* One block's contribution to one token's four rows, in the reference's
+ * order: acc += scale * (even * a[2k] + odd * a[2k + 1]) for k = 0..7. The
+ * activations are loaded once and used by lane. */
+static float32x4_t dg_nvfp4_block_neon(float32x4_t acc, const float32x4_t *even,
+                                       const float32x4_t *odd, float32x4_t scale, const float *a) {
+    float32x4_t a0 = vld1q_f32(a), a1 = vld1q_f32(a + 4), a2 = vld1q_f32(a + 8),
+                a3 = vld1q_f32(a + 12);
+#define DG_NVFP4_PAIR(k, v, even_lane, odd_lane)                                                   \
+    acc = vaddq_f32(acc, vmulq_f32(scale, vaddq_f32(vmulq_laneq_f32(even[k], v, even_lane),        \
+                                                    vmulq_laneq_f32(odd[k], v, odd_lane))))
+    DG_NVFP4_PAIR(0, a0, 0, 1);
+    DG_NVFP4_PAIR(1, a0, 2, 3);
+    DG_NVFP4_PAIR(2, a1, 0, 1);
+    DG_NVFP4_PAIR(3, a1, 2, 3);
+    DG_NVFP4_PAIR(4, a2, 0, 1);
+    DG_NVFP4_PAIR(5, a2, 2, 3);
+    DG_NVFP4_PAIR(6, a3, 0, 1);
+    DG_NVFP4_PAIR(7, a3, 2, 3);
+#undef DG_NVFP4_PAIR
+    return acc;
 }
 
 /* x in the dg_nvfp4_qdq_ref layout. */
@@ -2489,22 +2522,15 @@ static void dg_nvfp4_mm_neon(const uint8_t *wd, const uint8_t *sd, float global,
                 for (int q = 0; q < nb; q++)
                     acc[q] = vdupq_n_f32(0);
                 for (int b = 0; b < cols / 16; b++) {
-                    float s[4];
                     const uint8_t *q[4];
-                    for (int i = 0; i < 4; i++) {
-                        s[i] = dg_f8e4m3(sp[i][b]) * global;
+                    for (int i = 0; i < 4; i++)
                         q[i] = wp[i] + (size_t)b * 8;
-                    }
-                    float32x4_t scale = vld1q_f32(s), even[8], odd[8];
+                    uint32x4_t raw = {sp[0][b], sp[1][b], sp[2][b], sp[3][b]};
+                    float32x4_t scale = vmulq_n_f32(dg_e4m3x4_neon(raw), global), even[8], odd[8];
                     dg_nvfp4_weights4_neon(q, even, odd);
-                    for (int t = 0; t < nb; t++) {
-                        const float *a = x + (size_t)(tb + t) * cols + (size_t)b * 16;
-                        for (int k = 0; k < 8; k++) {
-                            float32x4_t pair = vaddq_f32(vmulq_n_f32(even[k], a[k * 2]),
-                                                         vmulq_n_f32(odd[k], a[k * 2 + 1]));
-                            acc[t] = vaddq_f32(acc[t], vmulq_f32(scale, pair));
-                        }
-                    }
+                    for (int t = 0; t < nb; t++)
+                        acc[t] = dg_nvfp4_block_neon(acc[t], even, odd, scale,
+                                                     x + (size_t)(tb + t) * cols + (size_t)b * 16);
                 }
                 for (int t = 0; t < nb; t++) {
                     float sum[4];
