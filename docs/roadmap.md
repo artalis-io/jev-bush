@@ -327,9 +327,10 @@ The NEON tier puts one output row in each vector lane, and each lane accumulates
 in the reference kernels' column order with a separate multiply and add. Strict
 NEON builds are therefore bit-identical to the reference kernels, a property the
 self-test checks for every kernel. BF16 and NVFP4 matrices and RMS scaling are
-vectorized; NVFP4 activation quantization uses the shared parallel quantizer,
-and attention dots keep the reference, whose sequential double sum cannot be
-vectorized without reordering it. `-DJB_SCALAR` builds the reference on any CPU.
+vectorized; NVFP4 activation quantization uses the shared parallel quantizer.
+Attention dots put one key in each double lane, eight keys at a time, so each
+key's sequential double sum keeps its order. `-DJB_SCALAR` builds the reference
+on any CPU.
 
 Measured on an NVIDIA DGX Spark (GB10, 10 Cortex-X925 + 10 Cortex-A725 cores,
 20 threads, gcc 13.3, `-O3 -march=native -std=c11 -fopenmp`) with the NVFP4
@@ -339,6 +340,8 @@ between the NEON and `-DJB_SCALAR` builds. NEON took 660 s against 3,325 s for
 the reference (16.3 against 81.6 s per row after the first), 5.0x faster. After
 the NVFP4 decoding work below, NEON takes 626 s against 3,322 s (15.4 against
 81.5 s per row after the first), 5.3x faster, still byte-identical on all 200.
+With the batched attention dots below, NEON takes 608 s, 5.5x faster than the
+reference, again byte-identical on all 200.
 
 Fast-math is not a parity configuration on ARM either: against the strict
 reference, fast-math NEON agrees on 93.5% of argmaxes (mean total variation
@@ -358,6 +361,21 @@ X925 core, single-token NVFP4 rose from 9.6 to 10.8 GFLOP/s; on 20 threads from
 Without fused multiply-adds, which bit-identity rules out, each weight pair
 costs five vector operations, so multi-token NVFP4 runs at about 70% of what
 exact arithmetic allows.
+
+Attention scores go through a batched `dots` kernel operation, which takes one
+query and a run of keys. On NEON, eight keys share the vector registers, one
+per double lane; a product of two floats is exact in double, so each lane's sum
+matches the reference bit for bit. The softmax also keeps each exponential
+instead of computing it twice, which changes no value on any backend. Over
+eight profiled rows, attention scoring went from 6.8 to 5.8 s, and the 40 rows
+went from 626 to 608 s. Scoring is only about 8% of a row, so the projections
+around it, not the dots, dominate attention.
+
+Fused multiply-adds for fast-math NEON builds, including summing each NVFP4
+block before scaling it, were measured and rejected: the 40 rows went from 915
+to 901 s (1.5%), NVFP4 matrices improved about 4%, and GCC's fast-math code was
+already close. The strict/fast split was not worth that. CI still builds and
+self-tests fast-math NEON.
 
 Kernel throughput against the reference on the same machine (`--bench-kernels`,
 20 threads, `OMP_PROC_BIND=close`): BF16 2.3x at one token, 3.5x at 64, and
