@@ -110,7 +110,7 @@ typedef struct {
  * for code that has no session in scope: allocators and kernels. */
 static _Thread_local JBProfile *jb_profile_active;
 #define JB_TICK(name) uint64_t name = now_ns()
-#define JB_TO(field, name)                                                                        \
+#define JB_TO(field, name)                                                                         \
     (jb_profile_active ? (void)(jb_profile_active->field += now_ns() - (name)) : (void)0)
 #define JB_OMP() (jb_profile_active ? (void)jb_profile_active->omp_regions++ : (void)0)
 #else
@@ -179,6 +179,7 @@ typedef union JBAllocation {
         uint64_t sequence;
         int tracked;
     } link;
+
     JBMaxAlign align;
 } JBAllocation;
 
@@ -4227,38 +4228,36 @@ static int dg_systemone(DGModel *m, DGTokenizer *tok, const char *j, size_t len,
                         profile->moe_activation + profile->moe_hidden_qdq + profile->moe_down;
     double moe_misc =
         (double)(profile->experts >= detailed ? profile->experts - detailed : 0) / 1e6;
-    uint64_t ad = profile->attention_qkv + profile->attention_prepare +
-                  profile->attention_kv + profile->attention_core + profile->attention_output;
-    double attention_misc =
-        (double)(profile->attention >= ad ? profile->attention - ad : 0) / 1e6;
+    uint64_t ad = profile->attention_qkv + profile->attention_prepare + profile->attention_kv +
+                  profile->attention_core + profile->attention_output;
+    double attention_misc = (double)(profile->attention >= ad ? profile->attention - ad : 0) / 1e6;
     uint64_t ld = profile->attention + profile->dense + profile->router + profile->experts +
                   profile->ff_other;
     double layer_other = (double)(profile->layers >= ld ? profile->layers - ld : 0) / 1e6;
     double accounted = profile->layers / 1e6 + profile->embedding / 1e6 +
                        profile->final_norm / 1e6 + profile->kv_free / 1e6 + cand_ms;
     double unaccounted = ms > accounted ? ms - accounted : 0;
-    fprintf(
-        stderr,
-        "JB_PROFILE prompt_tokens=%llu system_tokens=%llu state_tokens=%llu omp_regions=%llu "
-        "alloc_calls=%llu hot_alloc_calls=%llu alloc_ms=%.3f workspace_mb=%.3f kv_mb=%.3f "
-        "attention=%.3f attention_qkv=%.3f attention_prepare=%.3f "
-        "attention_kv=%.3f attention_core=%.3f attention_output=%.3f attention_misc=%.3f "
-        "dense=%.3f router=%.3f experts=%.3f moe_input_qdq=%.3f moe_gate=%.3f moe_up=%.3f "
-        "moe_activation=%.3f moe_hidden_qdq=%.3f moe_down=%.3f moe_misc=%.3f ff_other=%.3f "
-        "layer_other=%.3f embedding=%.3f final_norm=%.3f kv_free=%.3f candidates=%.3f "
-        "unaccounted=%.3f total=%.3f\n",
-        (unsigned long long)profile->prompt_tokens, (unsigned long long)profile->system_tokens,
-        (unsigned long long)profile->state_tokens, (unsigned long long)profile->omp_regions,
-        (unsigned long long)profile->alloc_calls, (unsigned long long)profile->hot_alloc_calls,
-        profile->alloc_ns / 1e6, workspace->capacity / 1048576.0, kv_mb,
-        profile->attention / 1e6, profile->attention_qkv / 1e6,
-        profile->attention_prepare / 1e6, profile->attention_kv / 1e6,
-        profile->attention_core / 1e6, profile->attention_output / 1e6, attention_misc,
-        profile->dense / 1e6, profile->router / 1e6, profile->experts / 1e6,
-        profile->moe_input_qdq / 1e6, profile->moe_gate / 1e6, profile->moe_up / 1e6,
-        profile->moe_activation / 1e6, profile->moe_hidden_qdq / 1e6, profile->moe_down / 1e6,
-        moe_misc, profile->ff_other / 1e6, layer_other, profile->embedding / 1e6,
-        profile->final_norm / 1e6, profile->kv_free / 1e6, cand_ms, unaccounted, ms);
+    fprintf(stderr,
+            "JB_PROFILE prompt_tokens=%llu system_tokens=%llu state_tokens=%llu omp_regions=%llu "
+            "alloc_calls=%llu hot_alloc_calls=%llu alloc_ms=%.3f workspace_mb=%.3f kv_mb=%.3f "
+            "attention=%.3f attention_qkv=%.3f attention_prepare=%.3f "
+            "attention_kv=%.3f attention_core=%.3f attention_output=%.3f attention_misc=%.3f "
+            "dense=%.3f router=%.3f experts=%.3f moe_input_qdq=%.3f moe_gate=%.3f moe_up=%.3f "
+            "moe_activation=%.3f moe_hidden_qdq=%.3f moe_down=%.3f moe_misc=%.3f ff_other=%.3f "
+            "layer_other=%.3f embedding=%.3f final_norm=%.3f kv_free=%.3f candidates=%.3f "
+            "unaccounted=%.3f total=%.3f\n",
+            (unsigned long long)profile->prompt_tokens, (unsigned long long)profile->system_tokens,
+            (unsigned long long)profile->state_tokens, (unsigned long long)profile->omp_regions,
+            (unsigned long long)profile->alloc_calls, (unsigned long long)profile->hot_alloc_calls,
+            profile->alloc_ns / 1e6, workspace->capacity / 1048576.0, kv_mb,
+            profile->attention / 1e6, profile->attention_qkv / 1e6,
+            profile->attention_prepare / 1e6, profile->attention_kv / 1e6,
+            profile->attention_core / 1e6, profile->attention_output / 1e6, attention_misc,
+            profile->dense / 1e6, profile->router / 1e6, profile->experts / 1e6,
+            profile->moe_input_qdq / 1e6, profile->moe_gate / 1e6, profile->moe_up / 1e6,
+            profile->moe_activation / 1e6, profile->moe_hidden_qdq / 1e6, profile->moe_down / 1e6,
+            moe_misc, profile->ff_other / 1e6, layer_other, profile->embedding / 1e6,
+            profile->final_norm / 1e6, profile->kv_free / 1e6, cand_ms, unaccounted, ms);
     jb_profile_active = previous_profile;
 #endif
     dg_job_free(&job);
@@ -4648,7 +4647,8 @@ static DGPrefixCache *jb_session_prefix(jb_session *session) {
 }
 
 static jb_status jb_session_decide_json_call(jb_session *session, const char *request_json,
-                                 size_t request_length, char **out_json, size_t *out_length) {
+                                             size_t request_length, char **out_json,
+                                             size_t *out_length) {
     if (out_json)
         *out_json = NULL;
     if (out_length)
@@ -4675,9 +4675,11 @@ static jb_status jb_session_decide_json_call(jb_session *session, const char *re
     return JB_OK;
 }
 
-static jb_status jb_session_decide_json_batch_call(jb_session *session, const char *const *request_json,
-                                       const size_t *request_lengths, size_t request_count,
-                                       char ***out_json, size_t **out_lengths) {
+static jb_status jb_session_decide_json_batch_call(jb_session *session,
+                                                   const char *const *request_json,
+                                                   const size_t *request_lengths,
+                                                   size_t request_count, char ***out_json,
+                                                   size_t **out_lengths) {
     if (out_json)
         *out_json = NULL;
     if (out_lengths)
@@ -4902,7 +4904,8 @@ static char *jb_typed_request(const jb_session *session, const jb_input *input, 
     return request.p;
 }
 
-static jb_status jb_session_decide_call(jb_session *session, const jb_input *input, jb_result **out_result) {
+static jb_status jb_session_decide_call(jb_session *session, const jb_input *input,
+                                        jb_result **out_result) {
     if (out_result)
         *out_result = NULL;
     if (!session || !input || !out_result)
@@ -4927,8 +4930,8 @@ static jb_status jb_session_decide_call(jb_session *session, const jb_input *inp
     return JB_OK;
 }
 
-static jb_status jb_session_decide_batch_call(jb_session *session, const jb_input *inputs, size_t input_count,
-                                  jb_result ***out_results) {
+static jb_status jb_session_decide_batch_call(jb_session *session, const jb_input *inputs,
+                                              size_t input_count, jb_result ***out_results) {
     if (out_results)
         *out_results = NULL;
     if (!session || !inputs || !input_count || input_count > 16 || !out_results)
@@ -4984,17 +4987,17 @@ const char *jb_session_last_error(const jb_session *session) {
 
 jb_status jb_session_decide_json(jb_session *session, const char *request_json,
                                  size_t request_length, char **out_json, size_t *out_length) {
-    return jb_session_record(session, jb_session_decide_json_call(session, request_json,
-                                                                  request_length, out_json,
-                                                                  out_length));
+    return jb_session_record(
+        session,
+        jb_session_decide_json_call(session, request_json, request_length, out_json, out_length));
 }
 
 jb_status jb_session_decide_json_batch(jb_session *session, const char *const *request_json,
                                        const size_t *request_lengths, size_t request_count,
                                        char ***out_json, size_t **out_lengths) {
-    return jb_session_record(session, jb_session_decide_json_batch_call(
-                                          session, request_json, request_lengths,
-                                          request_count, out_json, out_lengths));
+    return jb_session_record(
+        session, jb_session_decide_json_batch_call(session, request_json, request_lengths,
+                                                   request_count, out_json, out_lengths));
 }
 
 jb_status jb_session_decide(jb_session *session, const jb_input *input, jb_result **out_result) {
@@ -5003,8 +5006,8 @@ jb_status jb_session_decide(jb_session *session, const jb_input *input, jb_resul
 
 jb_status jb_session_decide_batch(jb_session *session, const jb_input *inputs, size_t input_count,
                                   jb_result ***out_results) {
-    return jb_session_record(session,
-                             jb_session_decide_batch_call(session, inputs, input_count, out_results));
+    return jb_session_record(
+        session, jb_session_decide_batch_call(session, inputs, input_count, out_results));
 }
 
 void jb_result_free(jb_result *result) {
@@ -5372,6 +5375,7 @@ static void dg_test_rms_dot(uint64_t *rs) {
  * the kernel runs its blocks in parallel and a worker thread finds it. */
 static void dg_test_nonfinite_activation(void) {
     enum { tokens = 8 };
+
     uint32_t nan_bits = 0x7fc00000u;
     float *in = xcalloc((size_t)tokens * DG_H, sizeof *in);
     float *out = xmalloc((size_t)tokens * DG_H * sizeof *out);
@@ -5518,8 +5522,8 @@ static int bench_kernels(void) {
 /* Numbers in results must use '.' even after a host sets a comma-decimal
  * locale. Skipped where no such locale is installed. */
 static void dg_test_locale_numbers(void) {
-    static const char *const names[] = {"de_DE.UTF-8", "de_DE.utf8", "de_DE", "de-DE",
-                                        "fr_FR.UTF-8", "fr-FR"};
+    static const char *const names[] = {"de_DE.UTF-8", "de_DE.utf8",  "de_DE",
+                                        "de-DE",       "fr_FR.UTF-8", "fr-FR"};
     const char *current = setlocale(LC_NUMERIC, NULL);
     char restore[128];
     snprintf(restore, sizeof restore, "%s", current ? current : "C");
