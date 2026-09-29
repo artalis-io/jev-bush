@@ -36,10 +36,14 @@ jobs:
 
       # ARM runners select the NEON backend, whose strict selftest also checks
       # bit-identity with the reference; -DJB_SCALAR builds that reference.
+      # Fast math switches NEON to fused multiply-adds, so test it too.
       - name: NEON backend and reference build
         if: runner.arch == 'ARM64'
         run: |
           grep -q '"kernels":"neon"' selftest.json
+          cc -O2 -std=c11 -Wall -Wextra -pedantic -Werror -ffast-math jb.c -lm -o jb-fast
+          ./jb-fast --selftest | tee fast.json
+          grep -q '"kernels":"neon"' fast.json
           cc -O2 -std=c11 -Wall -Wextra -pedantic -Werror -DJB_SCALAR jb.c -lm -o jb-scalar
           ./jb-scalar --selftest | tee scalar.json
           grep -q '"kernels":"scalar"' scalar.json
