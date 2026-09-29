@@ -192,6 +192,12 @@ Windows with MSYS2/MinGW-w64:
 gcc -O3 -std=c11 -Wall -Wextra -pedantic -fopenmp jb.c -lm -o jb.exe
 ```
 
+Windows with MSVC, which implements OpenMP 2.0:
+
+```bat
+cl /O2 /std:c11 /W4 /openmp /arch:AVX2 jb.c
+```
+
 Run the dependency-free smoke test without downloading a model:
 
 ```console
