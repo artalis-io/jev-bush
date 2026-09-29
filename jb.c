@@ -1656,10 +1656,20 @@ static float dg_at(const DGTensor *t, uint64_t i) {
     return dg_bf(t->data + i * 2);
 }
 
+/* E4M3 to float by assembling the bits: normal values rebias the exponent
+ * (7 to 127) and move the mantissa up; subnormals are m * 2^-9. Every E4M3
+ * value is exact in float, so this equals the ldexpf formulation for all 256
+ * inputs (the selftest checks each), at a fraction of the cost on the NVFP4
+ * scale and quantization paths. */
 static float dg_f8e4m3(uint8_t u) {
-    int sign = u >> 7, e = (u >> 3) & 15, m = u & 7;
-    float x = e ? ldexpf(1.0f + m / 8.0f, e - 7) : ldexpf((float)m, -9);
-    return sign ? -x : x;
+    uint32_t e = (u >> 3) & 15, m = u & 7, bits;
+    float x;
+    if (e) {
+        bits = ((e + 120) << 23) | (m << 20);
+        memcpy(&x, &bits, sizeof x);
+    } else
+        x = (float)m * 0x1p-9f;
+    return u >> 7 ? -x : x;
 }
 
 static float dg_f8e4m3_round(float x) {
@@ -5984,6 +5994,14 @@ static int selftest(void) {
     uint8_t one[2] = {0x80, 0x3f};
     if (dg_bf(one) != 1.0f)
         die("BF16 conversion self-test failed");
+    for (int u = 0; u < 256; u++) {
+        int e = (u >> 3) & 15, m = u & 7;
+        float x = e ? ldexpf(1.0f + m / 8.0f, e - 7) : ldexpf((float)m, -9),
+              got = dg_f8e4m3((uint8_t)u);
+        x = u >> 7 ? -x : x;
+        if (memcmp(&x, &got, sizeof x))
+            die("E4M3 decode self-test failed");
+    }
     if (dg_f8e4m3(0x01) != 0.001953125f || dg_f8e4m3(0x7e) != 448.0f ||
         dg_f8e4m3(0xfe) != -448.0f || dg_f8e4m3_round(5.25f) != 5.0f ||
         dg_e2m1_round(2.5f) != 2.0f || dg_e2m1_round(3.5f) != 4.0f)
