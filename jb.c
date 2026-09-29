@@ -973,6 +973,8 @@ typedef struct {
     void (*bf16_mm)(const uint8_t *, const float *, float *, int, int, int);
     void (*rms)(float *, const float *, const DGTensor *, int);
     double (*dot)(const float *, const float *, int);
+    /* out[j] = (float)dot(a, b + j * stride, n) for j < keys. */
+    void (*dots)(const float *a, const float *b, size_t stride, int keys, int n, float *out);
     /* Bit-identical to the reference kernels in strict builds. */
     int matches_reference;
 } DGKernelOps;
@@ -2007,6 +2009,17 @@ static double dg_dot(const float *a, const float *b, int n) {
     return dg_kernels()->dot(a, b, n);
 }
 
+/* One backend dot per key, for backends without a batched form. */
+static void dg_dots_each(const float *a, const float *b, size_t stride, int keys, int n,
+                         float *out) {
+    for (int j = 0; j < keys; j++)
+        out[j] = (float)dg_dot(a, b + (size_t)j * stride, n);
+}
+
+static void dg_dots(const float *a, const float *b, size_t stride, int keys, int n, float *out) {
+    dg_kernels()->dots(a, b, stride, keys, n, out);
+}
+
 /* AVX2 backend. */
 #if defined(JB_AVX2)
 static __m256 dg_bf16x8(const uint8_t *p) {
@@ -2349,13 +2362,12 @@ static double dg_dot_avx512(const float *a, const float *b, int n) {
 }
 #endif
 
-/* NEON backend (AArch64). Each vector lane computes one output row, and each
- * lane accumulates in the reference kernels' order with a separate multiply
- * and add. Strict builds therefore match the reference bit for bit, which
- * the selftest checks. Attention dots keep the reference: their sequential
- * double sum has no reordering-free vector form. */
+/* NEON backend (AArch64). Each vector lane computes one output row (or one
+ * attention key), and each lane accumulates in the reference kernels' order
+ * with a separate multiply and add. Strict builds therefore match the
+ * reference bit for bit, which the selftest checks. */
 #if defined(JB_NEON)
-enum { DG_NEON_TOKENS = 8 };
+enum { DG_NEON_TOKENS = 8, DG_NEON_KEYS = 8 };
 
 static float32x4_t dg_bf16x4_neon(const uint8_t *p) {
     uint16x4_t h = vreinterpret_u16_u8(vld1_u8(p));
@@ -2543,6 +2555,44 @@ static void dg_nvfp4_mm_neon(const uint8_t *wd, const uint8_t *sd, float global,
     }
 }
 
+/* Attention dots for eight keys at a time, one key per double lane. Each
+ * lane sums (double)a[i] * b[i] in index order like dg_dot_ref, and a
+ * product of two floats is exact in double, so the sums match it bit for
+ * bit. Keys past the end repeat the last key and are not stored. */
+static void dg_dots_neon(const float *a, const float *b, size_t stride, int keys, int n,
+                         float *out) {
+    int n4 = n & ~3;
+    for (int j0 = 0; j0 < keys; j0 += DG_NEON_KEYS) {
+        int valid = keys - j0 < DG_NEON_KEYS ? keys - j0 : DG_NEON_KEYS;
+        const float *k[DG_NEON_KEYS];
+        float64x2_t s[DG_NEON_KEYS / 2];
+        for (int j = 0; j < DG_NEON_KEYS; j++)
+            k[j] = b + (size_t)dg_neon_row(j0, j, keys) * stride;
+        for (int p = 0; p < DG_NEON_KEYS / 2; p++)
+            s[p] = vdupq_n_f64(0);
+        for (int i = 0; i < n4; i += 4)
+            for (int g = 0; g < DG_NEON_KEYS / 4; g++) {
+                float32x4_t w[4];
+                for (int j = 0; j < 4; j++)
+                    w[j] = vld1q_f32(k[g * 4 + j] + i);
+                dg_transpose4_neon(w);
+                for (int c = 0; c < 4; c++) {
+                    float64x2_t ac = vdupq_n_f64((double)a[i + c]);
+                    s[g * 2] = vaddq_f64(s[g * 2], vmulq_f64(vcvt_f64_f32(vget_low_f32(w[c])), ac));
+                    s[g * 2 + 1] = vaddq_f64(s[g * 2 + 1], vmulq_f64(vcvt_high_f64_f32(w[c]), ac));
+                }
+            }
+        double sum[DG_NEON_KEYS];
+        for (int p = 0; p < DG_NEON_KEYS / 2; p++)
+            vst1q_f64(sum + p * 2, s[p]);
+        for (int j = 0; j < valid; j++) {
+            for (int i = n4; i < n; i++)
+                sum[j] += (double)a[i] * k[j][i];
+            out[j0 + j] = (float)sum[j];
+        }
+    }
+}
+
 static void dg_rms_neon(float *y, const float *x, const DGTensor *scale, int n) {
     float q = dg_rms_inverse(x, n);
     int i = 0;
@@ -2566,9 +2616,9 @@ static const DGKernelOps *dg_kernels(void) {
     (void)dg_mm_data_ref;
     (void)dg_rms_ref;
     (void)dg_dot_ref;
-    static const DGKernelOps selected = {
-        "avx512",          dg_nvfp4_qdq_avx512, dg_nvfp4_swizzle, dg_nvfp4_mm_avx512,
-        dg_mm_data_avx512, dg_rms_avx512,       dg_dot_avx512,    0};
+    static const DGKernelOps selected = {"avx512",           dg_nvfp4_qdq_avx512, dg_nvfp4_swizzle,
+                                         dg_nvfp4_mm_avx512, dg_mm_data_avx512,   dg_rms_avx512,
+                                         dg_dot_avx512,      dg_dots_each,        0};
     return &selected;
 #elif defined(JB_AVX2)
     (void)dg_nvfp4_qdq_ref;
@@ -2576,24 +2626,25 @@ static const DGKernelOps *dg_kernels(void) {
     (void)dg_mm_data_ref;
     (void)dg_rms_ref;
     (void)dg_dot_ref;
-    static const DGKernelOps selected = {
-        "avx2",          dg_nvfp4_qdq_parallel, NULL,        dg_nvfp4_mm_avx2,
-        dg_mm_data_avx2, dg_rms_avx2,           dg_dot_avx2, 0};
+    static const DGKernelOps selected = {"avx2",           dg_nvfp4_qdq_parallel, NULL,
+                                         dg_nvfp4_mm_avx2, dg_mm_data_avx2,       dg_rms_avx2,
+                                         dg_dot_avx2,      dg_dots_each,          0};
     return &selected;
 #elif defined(JB_NEON)
     (void)dg_nvfp4_qdq_ref;
     (void)dg_nvfp4_mm_ref;
     (void)dg_mm_data_ref;
     (void)dg_rms_ref;
-    static const DGKernelOps selected = {
-        "neon",          dg_nvfp4_qdq_parallel, NULL,       dg_nvfp4_mm_neon,
-        dg_mm_data_neon, dg_rms_neon,           dg_dot_ref, 1};
+    (void)dg_dots_each;
+    static const DGKernelOps selected = {"neon",           dg_nvfp4_qdq_parallel, NULL,
+                                         dg_nvfp4_mm_neon, dg_mm_data_neon,       dg_rms_neon,
+                                         dg_dot_ref,       dg_dots_neon,          1};
     return &selected;
 #else
     (void)dg_nvfp4_qdq_parallel;
-    static const DGKernelOps scalar = {
-        "scalar",       dg_nvfp4_qdq_ref, NULL,       dg_nvfp4_mm_ref,
-        dg_mm_data_ref, dg_rms_ref,       dg_dot_ref, 1};
+    static const DGKernelOps scalar = {"scalar",        dg_nvfp4_qdq_ref, NULL,
+                                       dg_nvfp4_mm_ref, dg_mm_data_ref,   dg_rms_ref,
+                                       dg_dot_ref,      dg_dots_each,     1};
     return &scalar;
 #endif
 }
@@ -2930,20 +2981,26 @@ static void dg_attention_segments(DGModel *m, int l, float *x, int segments, int
                 }
                 float *ts = score + (size_t)ti * (maxold + seq), mx = -FLT_MAX;
                 const float *qq = q + (size_t)ti * qn + (size_t)h * hd;
-                for (int j = start; j < end; j++) {
-                    const float *kk = j < old
-                                          ? cache[s]->k + (size_t)j * kn + (size_t)kh * hd
-                                          : k + ((size_t)s * seq + j - old) * kn + (size_t)kh * hd;
-                    ts[j] = (float)dg_dot(qq, kk, hd);
+                /* Cached keys first, then this call's own. */
+                int split = end < old ? end : old, fresh = start > old ? start : old;
+                if (start < split)
+                    dg_dots(qq, cache[s]->k + (size_t)start * kn + (size_t)kh * hd, (size_t)kn,
+                            split - start, hd, ts + start);
+                if (fresh < end)
+                    dg_dots(qq, k + ((size_t)s * seq + fresh - old) * kn + (size_t)kh * hd,
+                            (size_t)kn, end - fresh, hd, ts + fresh);
+                for (int j = start; j < end; j++)
                     if (ts[j] > mx)
                         mx = ts[j];
-                }
+                /* Scores become their exponentials, computed once. */
                 float den = 0;
-                for (int j = start; j < end; j++)
-                    den += expf(ts[j] - mx);
+                for (int j = start; j < end; j++) {
+                    ts[j] = expf(ts[j] - mx);
+                    den += ts[j];
+                }
                 float *oo = a + (size_t)ti * qn + (size_t)h * hd;
                 for (int j = start; j < end; j++) {
-                    float p = expf(ts[j] - mx) / den;
+                    float p = ts[j] / den;
                     const float *vv = j < old
                                           ? cache[s]->v + (size_t)j * kn + (size_t)kh * hd
                                           : v + ((size_t)s * seq + j - old) * kn + (size_t)kh * hd;
@@ -5721,6 +5778,38 @@ static void dg_test_rms_dot(uint64_t *rs) {
     }
 }
 
+/* Batched attention dots, over key counts around the kernels' key groups
+ * and lengths around their column groups, with keys stored apart. */
+static void dg_test_dots(uint64_t *rs) {
+    static const int key_count[] = {1, 3, 7, 8, 9, 17}, len[] = {1, 3, 4, 5, 17, 256};
+    for (size_t kc = 0; kc < sizeof key_count / sizeof *key_count; kc++)
+        for (size_t k = 0; k < sizeof len / sizeof *len; k++) {
+            int keys = key_count[kc], n = len[k];
+            size_t stride = (size_t)n + 5;
+            float *a = xmalloc((size_t)n * 4), *b = xmalloc(stride * keys * 4),
+                  *got = xmalloc((size_t)keys * 4), *ref = xmalloc((size_t)keys * 4);
+            for (int i = 0; i < n; i++)
+                a[i] = 4 * jb_rng_unit(rs);
+            for (size_t i = 0; i < stride * keys; i++)
+                b[i] = jb_rng_unit(rs);
+            jb_poison(got, (size_t)keys);
+            dg_dots(a, b, stride, keys, n, got);
+            for (int j = 0; j < keys; j++) {
+                const float *bj = b + (size_t)j * stride;
+                double want = dg_dot_ref(a, bj, n), mag = 0;
+                for (int i = 0; i < n; i++)
+                    mag += fabs((double)a[i] * bj[i]);
+                ref[j] = (float)want;
+                jb_check_close(dg_kernels()->name, got[j], want, 1e-6 * fabs(want) + 1e-12 * mag);
+            }
+            jb_check_reference_bits("attention dots", got, ref, (size_t)keys * 4);
+            jb_release(a);
+            jb_release(b);
+            jb_release(got);
+            jb_release(ref);
+        }
+}
+
 /* A non-finite activation must come back through the error frame, even when
  * the kernel runs its blocks in parallel and a worker thread finds it. */
 static void dg_test_nonfinite_activation(void) {
@@ -5749,6 +5838,7 @@ static void dg_kernel_selftest(void) {
     dg_test_mm(&rs);
     dg_test_nvfp4(&rs);
     dg_test_rms_dot(&rs);
+    dg_test_dots(&rs);
     dg_test_nonfinite_activation();
 }
 
