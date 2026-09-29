@@ -198,6 +198,10 @@ Windows with MSVC, which implements OpenMP 2.0:
 cl /O2 /std:c11 /W4 /openmp /arch:AVX2 jb.c
 ```
 
+Any of these with `-DJB_SCALAR` forces the portable reference kernels whatever
+the CPU supports. That build is the oracle the vector backends are checked
+against.
+
 Run the dependency-free smoke test without downloading a model:
 
 ```console

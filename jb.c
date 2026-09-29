@@ -25,7 +25,11 @@
 
 #include "jb.h"
 
-#if defined(__AVX512F__) && defined(__AVX512DQ__)
+/* Kernel backend, chosen at compile time. -DJB_SCALAR forces the portable
+ * reference kernels on any CPU: the oracle build other backends are checked
+ * against. */
+#if defined(JB_SCALAR)
+#elif defined(__AVX512F__) && defined(__AVX512DQ__)
 #define JB_AVX512 1
 #include <immintrin.h>
 #elif defined(__AVX2__) && (defined(__FMA__) || (defined(_MSC_VER) && !defined(__clang__)))
