@@ -297,8 +297,8 @@ primitives against them and against the existing PyTorch checks.
 ### Machines without AVX-512
 
 AVX2-only x86 now has dedicated BF16, NVFP4, RMS-normalization, and attention-
-dot kernels. Apple Silicon and Graviton still use the portable reference
-kernels. The earlier portable baseline on a Ryzen 9 5950X (Zen 3, 32 threads,
+dot kernels, and little-endian AArch64 has the NEON tier described below. The
+earlier portable baseline on a Ryzen 9 5950X (Zen 3, 32 threads,
 `-O3 -march=native -ffast-math -fopenmp`, 35 GB/s measured streaming read):
 
 | Kernel | Tokens | GFLOP/s | Weight GB/s |
@@ -317,9 +317,37 @@ partly fits the 64 MB L3, so that figure may be cache-assisted. Every multi-toke
 compute-bound far below the CPU's roughly 1.9 TFLOP/s FP32 FMA peak, and the
 NVFP4 expert path, the largest share of model time in the profiles above,
 streams weights at under a tenth of the available bandwidth even for one token.
-NEON remains the main missing vector tier. Strict output is deterministic for
-each selected backend; different vector widths have different FP32 reduction
-orders and therefore are not promised to be byte-identical across ISAs.
+Strict output is deterministic for each selected backend. The AVX2 and AVX-512
+tiers use their own FP32 reduction orders and are therefore not promised to be
+byte-identical to the reference; the NEON tier is.
+
+### NEON: bit-identical to the reference
+
+The NEON tier puts one output row in each vector lane, and each lane accumulates
+in the reference kernels' column order with a separate multiply and add. Strict
+NEON builds are therefore bit-identical to the reference kernels, a property the
+self-test checks for every kernel. BF16 and NVFP4 matrices and RMS scaling are
+vectorized; NVFP4 activation quantization uses the shared parallel quantizer,
+and attention dots keep the reference, whose sequential double sum cannot be
+vectorized without reordering it. `-DJB_SCALAR` builds the reference on any CPU.
+
+Measured on an NVIDIA DGX Spark (GB10, 10 Cortex-X925 + 10 Cortex-A725 cores,
+20 threads, gcc 13.3, `-O3 -march=native -std=c11 -fopenmp`) with the NVFP4
+checkpoint at revision `ec4ff3d`, over 40 dataset rows (every tenth row, 10 per
+workflow, 200 decisions, one read): all 200 answer objects are byte-identical
+between the NEON and `-DJB_SCALAR` builds. NEON took 660 s against 3,325 s for
+the reference (16.3 against 81.6 s per row after the first), 5.0x faster.
+
+Fast-math is not a parity configuration on ARM either: against the strict
+reference, fast-math NEON agrees on 93.5% of argmaxes (mean total variation
+0.075) and fast-math reference on 92.0% (0.072). It is also slower on this
+workload, because it disables prefix reuse. On ARM the strict NEON build is both
+exact and the fastest.
+
+Kernel throughput against the reference on the same machine (`--bench-kernels`,
+20 threads, 96 GB/s streaming read): BF16 3.6x at 1 and 64 tokens and 10.9x at
+256; NVFP4 1.3x at one token, 2.2x at 4, 2.8x at 16, and 3.8x at 64. Single-
+token NVFP4 remains limited by decoding four rows' packed weights per block.
 
 Already completed: packed activation swizzling, two-output-row NVFP4 expert
 tiles, and routed-token grouping by expert. BF16 dot-product instructions were
