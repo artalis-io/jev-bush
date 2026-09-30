@@ -69,6 +69,28 @@
       "brier": 0.32720616244156403,
       "ece": 0.24543986445063573,
       "score_mae": 0.4440945542665864
+    },
+    {
+      "engine": "jev-bush",
+      "checkpoint": "NVFP4",
+      "read_policy": "one",
+      "math": "strict",
+      "transcendentals": "portable dg_expf and dg_tanhf; platform-independent",
+      "hardware": "NVIDIA DGX Spark, NEON with the CUDA accelerator (bit-identical to -DJB_SCALAR)",
+      "accuracy": 0.6595,
+      "label_log_loss": 1.429638462777114,
+      "brier": 0.31683813697417934,
+      "ece": 0.24423595094387063,
+      "score_mae": 0.43658718720974915,
+      "same_code_with_c_library_transcendentals": {
+        "accuracy": 0.6585,
+        "label_log_loss": 1.4381763342642195,
+        "brier": 0.3167807174349746,
+        "ece": 0.24725223167072286,
+        "score_mae": 0.442730289537325,
+        "argmax_agreement_with_portable": 0.954,
+        "mean_total_variation_to_portable": 0.05182083931187553
+      }
     }
   ],
   "agreement": {

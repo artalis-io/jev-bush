@@ -446,6 +446,26 @@ tiles, and routed-token grouping by expert. BF16 dot-product instructions were
 about 12% slower. Keep both rejected experiments out of the hot path unless a
 new profile changes their economics.
 
+### Portable expf and tanhf
+
+The CUDA path keeps GELU and softmax on the CPU because the reference used the
+C library's `expf` and `tanhf`, which no GPU reproduces and which also differ
+between C libraries. Strict builds now use `dg_expf` and `dg_tanhf`, Cephes
+forms built from IEEE additions, multiplications and divisions in a fixed
+order: within 1 ulp and 1.33 ulp of double `exp` and `tanh` over 2.7 billion
+inputs. GCC, Clang and MSVC on x86-64 and GCC on AArch64 produce the same bits,
+and the self-test checks a hash of them. Fast-math builds keep the C library's
+functions: fast math reassociates the range reduction and flushes subnormals,
+and those builds make no bit-identity claim.
+
+The change moves the reference itself. On the 40 parity rows the new reference
+changed 6.5% of argmaxes against the old one, as much as fast math does; NEON
+and CUDA match the new reference on all 200 answers. On all 2,000 decisions it
+scores 65.95% accuracy and log loss 1.4296, against 65.85% and 1.4382 with the
+C library's functions on the same code and machine: the difference is
+rounding noise that this model amplifies, not quality. The next step is exact
+GELU and softmax on the GPU with the same functions.
+
 ## 7. Make benchmark comparisons auditable
 
 Before publishing a faster number:

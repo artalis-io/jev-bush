@@ -61,7 +61,11 @@ suffix. `decide` is always monolithic. Output reports `prefix_cache` as
 evaluated as `usage.prefill_tokens`.
 
 Strict arithmetic defines canonical Jev Bush semantics: reproducible output
-must not depend on batching or temporary-buffer shape.
+must not depend on batching or temporary-buffer shape. It does not depend on
+the platform either: strict builds compute `expf` and `tanhf` with their own
+portable implementations instead of the C library's, so every strict build and
+the CUDA accelerator produce the same bits, which the self-test checks with a
+recorded hash.
 
 Linux, approximate highest-throughput experiment:
 
@@ -426,6 +430,15 @@ The trusted reference is OpenJev commit `91d5005` with patched vLLM commit
 | OpenJev NVFP4, automatic reads | 66.80% | **1.3940** | **0.3107** | **0.2352** | 0.4404 |
 | Jev Bush NVFP4, strict, one read | 66.10% | 1.5476 | 0.3268 | 0.2540 | 0.4421 |
 | Jev Bush NVFP4, fast-math, one read | 66.80% | 1.5777 | 0.3272 | 0.2454 | 0.4441 |
+| Jev Bush NVFP4, strict, portable `expf`/`tanhf`, one read | 65.95% | 1.4296 | 0.3168 | 0.2442 | 0.4366 |
+
+The last row is the current strict build, whose output is the same on every
+platform; the rows above it were recorded with the C library's `expf` and
+`tanhf` at earlier commits. On the same code and machine, switching to the
+portable functions changed 4.6% of argmaxes and moved accuracy from 65.85% to
+65.95% and log loss from 1.4382 to 1.4296: this model's decisions shift with
+any one-ulp change, as between fast-math and strict builds, and the numbers
+here differ by that noise, not by quality.
 
 ### Why this matters
 
