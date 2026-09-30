@@ -399,6 +399,29 @@ loop dynamic with chunk 1 was slower (37 s over eight rows), because
 per-element loops pay for it; those stay static. The AVX2 and AVX-512 kernels
 keep static schedules until someone measures dynamic ones on x86.
 
+### CUDA: exact NVFP4 experts
+
+`-DJB_CUDA` adds an accelerator for the NVFP4 expert matrices, still inside
+`jb.c`: the CUDA driver and NVRTC are loaded with `dlopen`, and the kernel is
+compiled from a source string at first use with `--fmad=false`, so builds need
+neither `nvcc` nor CUDA headers. Expert weights are uploaded at model load, all
+or none. Each layer's routed tokens are gathered by expert, and gate, up and
+down each run as one grouped launch: a block computes 32 rows for up to eight
+tokens of one expert from weights, scales and activations staged in shared
+memory, and each thread sums one row and token in the reference's order. GELU,
+activation quantization, attention and the dense layer stay on the CPU, whose
+`tanhf` and `expf` the reference uses.
+
+On the DGX Spark the 40 rows take 196 s against 275 s for NEON alone and 3,353 s
+for the reference, 17.1x faster, byte-identical on all 200 answers. Over eight
+profiled rows, experts fell from 15.6 to 5.0 s and the total from 32.5 to 22.0
+s. Two earlier designs were slower than the CPU and dropped: one launch per
+expert (about 92,000 launches over eight rows, each too small to fill the GPU,
+with OpenMP threads sleeping between them), and a grouped launch in which every
+thread read its weight row from memory (experts 13.7 s). Attention, now 54% of
+a row, is the next cost; it stays on the CPU because exact GPU `expf` would have
+to reproduce glibc's.
+
 Kernel throughput against the reference on the same machine (`--bench-kernels`,
 20 threads, `OMP_PROC_BIND=close`): BF16 2.3x at one token, 3.5x at 64, and
 11x at 256; NVFP4 1.9x at one token and 4.5x at 64. This microbenchmark is

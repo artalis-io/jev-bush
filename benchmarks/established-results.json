@@ -165,6 +165,19 @@
         "reference_answers_unchanged": true,
         "profiled_eight_rows_seconds": {"static": 74, "dynamic": 33}
       },
+      "cuda_nvfp4_experts": {
+        "build": "-DJB_CUDA, driver and NVRTC loaded at run time, --fmad=false",
+        "gpu": "GB10 (compute capability 12.1), driver 580.173.02, NVRTC 13.0",
+        "binding": "OMP_PROC_BIND=close",
+        "strict_identical_answer_objects": 200,
+        "strict_cuda_seconds": 196,
+        "strict_neon_seconds_same_code": 275,
+        "strict_reference_seconds": 3353,
+        "profiled_eight_rows_seconds": {
+          "neon": {"total": 32.5, "experts": 15.6},
+          "cuda": {"total": 22.0, "experts": 5.0}
+        }
+      },
       "rejected_fast_math_fused_multiply_add": {
         "fast_neon_seconds": {"before": 915, "after": 901},
         "note": "fast math disables prefix reuse, so both are slower than strict NEON"
