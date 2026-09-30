@@ -3130,21 +3130,23 @@ static const char *const dg_cuda_source[] = {
     "    return .5f * x * (1.0f + dg_tanhf(.7978845608028654f * (x + .044715f * x * x * x)));\n"
     "}\n"
     "\n"
-    "/* dg_rms_inverse over a row in shared memory, on the calling thread. */\n"
-    "__device__ float dg_rms_inverse(const float *x, int n) {\n"
+    "/* dg_rms_inverse from the row's squares, which are exact in double and\n"
+    " * computed in parallel beforehand; only the additions are sequential. */\n"
+    "__device__ float dg_rms_inverse_squares(const double *sq, int n) {\n"
     "    double ss = 0.0;\n"
     "    for (int i = 0; i < n; i++)\n"
-    "        ss += (double)x[i] * x[i];\n"
+    "        ss += sq[i];\n"
     "    return 1.0f / sqrtf((float)(ss / n) + 1e-6f);\n"
     "}\n"
+    "\n"
     "\n"
     "extern \"C\" __global__ void __launch_bounds__(DG_ROWS)\n"
     "dg_nvfp4_mm(const dg_matrix *m, const dg_tile *tiles, int ntiles, const float *x,\n"
     "        float *y, int rows, int cols) {\n"
     "    __shared__ float e2m1[16];\n"
     "    __shared__ uint2 ws[DG_BLOCKS][DG_ROWS + 1];\n"
-    "    __shared__ float ss[DG_BLOCKS][DG_ROWS + 1];\n"
-    "    __shared__ float xs[DG_TOKENS][DG_BLOCKS * 16];\n",
+    "    __shared__ float ss[DG_BLOCKS][DG_ROWS + 1];\n",
+    "    __shared__ float xs[DG_TOKENS][DG_BLOCKS * 16];\n"
     "    int tx = threadIdx.x, r0 = blockIdx.x * DG_ROWS, r = r0 + tx, blocks = cols / 16;\n"
     "    if (tx < 16) {\n"
     "        const float mag[8] = {0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f};\n"
@@ -3225,8 +3227,8 @@ static const char *const dg_cuda_source[] = {
     "dg_bf16_mm(const unsigned short *w, const float *x, float *y, int tokens, int rows,\n"
     "        int cols) {\n"
     "    __shared__ unsigned ws[DG_BCOLS / 2][DG_ROWS + 1];\n"
-    "    __shared__ float xs[DG_BTOKENS][DG_BCOLS];\n"
-    "    int tx = threadIdx.x, r0 = blockIdx.x * DG_ROWS, r = r0 + tx;\n",
+    "    __shared__ float xs[DG_BTOKENS][DG_BCOLS];\n",
+    "    int tx = threadIdx.x, r0 = blockIdx.x * DG_ROWS, r = r0 + tx;\n"
     "    int ntiles = (tokens + DG_BTOKENS - 1) / DG_BTOKENS;\n"
     "    for (int ti = blockIdx.y; ti < ntiles; ti += gridDim.y) {\n"
     "        int t0 = ti * DG_BTOKENS, count = tokens - t0 < DG_BTOKENS ? tokens - t0 : "
@@ -3299,19 +3301,19 @@ static const char *const dg_cuda_source[] = {
     " * + add, each step when its input is given. */\n"
     "extern \"C\" __global__ void dg_rms(float *y, const float *x, const unsigned short *scale,\n"
     "        const unsigned short *factor, float divisor, const float *add, int tokens, int n) {\n"
-    "    __shared__ float row[DG_ROW_MAX];\n"
+    "    __shared__ double sq[DG_ROW_MAX];\n"
     "    __shared__ float q;\n"
     "    for (int t = blockIdx.x; t < tokens; t += gridDim.x) {\n"
     "        const float *xr = x + (size_t)t * n;\n"
     "        __syncthreads();\n"
-    "        for (int i = threadIdx.x; i < n; i += blockDim.x)\n"
-    "            row[i] = xr[i];\n"
+    "        for (int i = threadIdx.x; i < n; i += blockDim.x)\n",
+    "            sq[i] = (double)xr[i] * xr[i];\n"
     "        __syncthreads();\n"
-    "        if (threadIdx.x == 0)\n",
-    "            q = dg_rms_inverse(row, n);\n"
+    "        if (threadIdx.x == 0)\n"
+    "            q = dg_rms_inverse_squares(sq, n);\n"
     "        __syncthreads();\n"
     "        for (int i = threadIdx.x; i < n; i += blockDim.x) {\n"
-    "            float v = row[i] * q;\n"
+    "            float v = xr[i] * q;\n"
     "            if (scale)\n"
     "                v = v * dg_bf(scale[i]);\n"
     "            if (factor)\n"
@@ -3371,7 +3373,8 @@ static const char *const dg_cuda_source[] = {
     "extern \"C\" __global__ void dg_moe_tail(float *x, const float *eo, const int *slot,\n"
     "        const float *weight, const float *d, const unsigned short *p2,\n"
     "        const unsigned short *post, float scalar, int tokens, int n, int topk) {\n"
-    "    __shared__ float row[DG_ROW_MAX];\n"
+    "    __shared__ float row[DG_WIDTH];\n"
+    "    __shared__ double sq[DG_WIDTH];\n"
     "    __shared__ float q;\n"
     "    for (int t = blockIdx.x; t < tokens; t += gridDim.x) {\n"
     "        __syncthreads();\n"
@@ -3380,25 +3383,28 @@ static const char *const dg_cuda_source[] = {
     "            for (int k = 0; k < topk; k++)\n"
     "                mo += weight[t * topk + k] * eo[(size_t)slot[t * topk + k] * n + i];\n"
     "            row[i] = mo;\n"
+    "            sq[i] = (double)mo * mo;\n"
     "        }\n"
     "        __syncthreads();\n"
     "        if (threadIdx.x == 0)\n"
-    "            q = dg_rms_inverse(row, n);\n"
-    "        __syncthreads();\n"
-    "        for (int i = threadIdx.x; i < n; i += blockDim.x)\n"
-    "            row[i] = d[(size_t)t * n + i] + row[i] * q * dg_bf(p2[i]);\n"
-    "        __syncthreads();\n"
-    "        if (threadIdx.x == 0)\n"
-    "            q = dg_rms_inverse(row, n);\n"
+    "            q = dg_rms_inverse_squares(sq, n);\n"
     "        __syncthreads();\n"
     "        for (int i = threadIdx.x; i < n; i += blockDim.x) {\n"
+    "            row[i] = d[(size_t)t * n + i] + row[i] * q * dg_bf(p2[i]);\n"
+    "            sq[i] = (double)row[i] * row[i];\n"
+    "        }\n"
+    "        __syncthreads();\n"
+    "        if (threadIdx.x == 0)\n"
+    "            q = dg_rms_inverse_squares(sq, n);\n"
+    "        __syncthreads();\n"
+    "        for (int i = threadIdx.x; i < n; i += blockDim.x) {\n",
     "            float v = x[(size_t)t * n + i] + row[i] * q * dg_bf(post[i]);\n"
     "            x[(size_t)t * n + i] = v * scalar;\n"
     "        }\n"
     "    }\n"
     "}\n"
     "/* dg_rope over tokens * heads rows of hd values, stride apart per token;\n"
-    " * each token's cosines then sines are pitch apart in table. */\n",
+    " * each token's cosines then sines are pitch apart in table. */\n"
     "extern \"C\" __global__ void dg_rope(float *x, const float *table, int tokens, int heads, int "
     "hd,\n"
     "        int stride, int pitch) {\n"
@@ -3427,7 +3433,7 @@ static const char *const dg_cuda_source[] = {
     "full,\n"
     "        int window) {\n"
     "    __shared__ float ts[DG_ROW_MAX];\n"
-    "    __shared__ float qs[DG_HEAD_MAX];\n"
+    "    __shared__ double qs[DG_HEAD_MAX];\n"
     "    __shared__ float red[DG_THREADS];\n"
     "    __shared__ float den;\n"
     "    int tx = threadIdx.x, bd = blockDim.x, qn = heads * hd, kn = kvh * hd;\n"
@@ -3446,7 +3452,7 @@ static const char *const dg_cuda_source[] = {
     "        size_t cached = (size_t)seg_base[s], own = (size_t)s * seq, head = (size_t)kh * hd;\n"
     "        __syncthreads();\n"
     "        for (int i = tx; i < hd; i += bd)\n"
-    "            qs[i] = q[(size_t)ti * qn + (size_t)h * hd + i];\n"
+    "            qs[i] = (double)q[(size_t)ti * qn + (size_t)h * hd + i];\n"
     "        __syncthreads();\n"
     "        float mx = -3.402823466e+38f;\n"
     "        for (int j = start + tx; j < end; j += bd) {\n"
@@ -3454,7 +3460,7 @@ static const char *const dg_cuda_source[] = {
     "                                      : k + (own + (j - old)) * kn + head;\n"
     "            double sum = 0;\n"
     "            for (int i = 0; i < hd; i++)\n"
-    "                sum += (double)qs[i] * kk[i];\n"
+    "                sum += qs[i] * kk[i];\n"
     "            ts[j] = (float)sum;\n"
     "            if (ts[j] > mx)\n"
     "                mx = ts[j];\n"
@@ -3472,7 +3478,7 @@ static const char *const dg_cuda_source[] = {
     "        __syncthreads();\n"
     "        if (tx == 0) {\n"
     "            float sum = 0;\n"
-    "            for (int j = start; j < end; j++)\n"
+    "            for (int j = start; j < end; j++)\n",
     "                sum += ts[j];\n"
     "            den = sum;\n"
     "        }\n"
@@ -3481,7 +3487,7 @@ static const char *const dg_cuda_source[] = {
     "            ts[j] = ts[j] / den;\n"
     "        __syncthreads();\n"
     "        for (int d = tx; d < hd; d += bd) {\n"
-    "            float o = 0;\n",
+    "            float o = 0;\n"
     "            for (int j = start; j < end; j++)\n"
     "                o += ts[j] * (j < old ? v_old[(cached + j) * kn + head + d]\n"
     "                                      : v[(own + (j - old)) * kn + head + d]);\n"
@@ -3568,7 +3574,7 @@ static int dg_cuda_symbol(void *lib, const char *name, void *slot) {
  * and allocates with plain malloc. */
 static void dg_cuda_compile(int major, int minor) {
     char arch[48], tile_rows[32], tile_tokens[32], bf16_tokens[32], row_max[32], head_max[32],
-        threads[32];
+        threads[32], width[32];
     snprintf(arch, sizeof arch, "--gpu-architecture=compute_%d%d", major, minor);
     snprintf(tile_rows, sizeof tile_rows, "-DDG_ROWS=%d", DG_CUDA_ROWS);
     snprintf(tile_tokens, sizeof tile_tokens, "-DDG_TOKENS=%d", DG_CUDA_TOKENS);
@@ -3576,17 +3582,10 @@ static void dg_cuda_compile(int major, int minor) {
     snprintf(row_max, sizeof row_max, "-DDG_ROW_MAX=%d", DG_CUDA_ROW_MAX);
     snprintf(head_max, sizeof head_max, "-DDG_HEAD_MAX=%d", DG_FULL_HEAD_DIM);
     snprintf(threads, sizeof threads, "-DDG_THREADS=%d", DG_CUDA_THREADS);
-    const char *options[] = {arch,
-                             "--fmad=false",
-                             "--prec-div=true",
-                             "--prec-sqrt=true",
-                             "--ftz=false",
-                             tile_rows,
-                             tile_tokens,
-                             bf16_tokens,
-                             row_max,
-                             head_max,
-                             threads};
+    snprintf(width, sizeof width, "-DDG_WIDTH=%d", DG_H);
+    const char *options[] = {arch,          "--fmad=false", "--prec-div=true", "--prec-sqrt=true",
+                             "--ftz=false", tile_rows,      tile_tokens,       bf16_tokens,
+                             row_max,       head_max,       threads,           width};
     /* The source is split into pieces short enough for ISO C string
      * literals. */
     size_t length = 1;
@@ -3852,7 +3851,7 @@ static void dg_cuda_attention(DGDevice a, DGDevice q, DGDevice k, DGDevice v, DG
 static void dg_cuda_moe_tail(DGDevice x, DGDevice eo, DGDevice slot, DGDevice weight, DGDevice d,
                              DGDevice p2, DGDevice post, float scalar, int tokens) {
     CUdeviceptr dx = x, deo = eo, dslot = slot, dweight = weight, dd = d, dp2 = p2, dpost = post;
-    int n = DG_H, topk = DG_TOPK;
+    int n = DG_H, topk = DG_TOPK; /* the kernel's rows are DG_H wide */
     void *args[] = {&dx, &deo, &dslot, &dweight, &dd, &dp2, &dpost, &scalar, &tokens, &n, &topk};
     dg_cuda_launch(DG_CUDA_MOE_TAIL, dg_cuda_blocks(tokens, 1, 1u << 30), 1, DG_CUDA_THREADS, args);
 }
@@ -4313,14 +4312,10 @@ static void dg_attention_accel(DGModel *m, int l, int segments, int seq, int pos
         *seg_base = jb_arena_alloc(workspace, (size_t)segments, sizeof *seg_base, 0);
     float *k = jb_arena_alloc(workspace, (size_t)n * widest, sizeof *k, 0),
           *v = jb_arena_alloc(workspace, (size_t)n * widest, sizeof *v, 0);
-    dg_mm_accel(m, qw, dev->z, dev->q, n, qn, DG_H);
-    dg_mm_accel(m, kw, dev->z, dev->k, n, kn, DG_H);
-    if (vw)
-        dg_mm_accel(m, vw, dev->z, dev->v, n, kn, DG_H);
-    else
-        a->copy(dev->v, dev->k, (size_t)n * kn * 4);
+    /* The host's part comes first: each upload waits for the work queued
+     * before it, and nothing but the input norm is queued yet. */
     JB_TO(attention_qkv, qkv_start);
-    JB_TICK(prepare_start);
+    JB_TICK(kv_start);
     int half = hd / 2, rotated = full ? DG_FULL_ROPE_DIM : half;
     float inv[DG_FULL_HEAD_DIM / 2];
     for (int i = 0; i < half; i++)
@@ -4335,13 +4330,6 @@ static void dg_attention_accel(DGModel *m, int l, int segments, int seq, int pos
         }
     }
     a->to_device(dev->rope, table, (size_t)n * DG_FULL_HEAD_DIM * 4);
-    a->rms(dev->q, dev->q, qnrm->device, 0, 0, 0, n * DG_HEADS, hd);
-    a->rms(dev->k, dev->k, knrm->device, 0, 0, 0, n * kvh, hd);
-    a->rms(dev->v, dev->v, 0, 0, 0, 0, n * kvh, hd);
-    a->rope(dev->q, dev->rope, n, DG_HEADS, hd, qn);
-    a->rope(dev->k, dev->rope, n, kvh, hd, kn);
-    JB_TO(attention_prepare, prepare_start);
-    JB_TICK(kv_start);
     int rows = 0, max_keys = 0;
     for (int s = 0; s < segments; s++) {
         int shared = -1;
@@ -4371,6 +4359,19 @@ static void dg_attention_accel(DGModel *m, int l, int segments, int seq, int pos
     a->to_device(dev->seg_old, seg_old, (size_t)segments * sizeof *seg_old);
     a->to_device(dev->seg_base, seg_base, (size_t)segments * sizeof *seg_base);
     JB_TO(attention_kv, kv_start);
+    JB_TICK(prepare_start);
+    dg_mm_accel(m, qw, dev->z, dev->q, n, qn, DG_H);
+    dg_mm_accel(m, kw, dev->z, dev->k, n, kn, DG_H);
+    if (vw)
+        dg_mm_accel(m, vw, dev->z, dev->v, n, kn, DG_H);
+    else
+        a->copy(dev->v, dev->k, (size_t)n * kn * 4);
+    a->rms(dev->q, dev->q, qnrm->device, 0, 0, 0, n * DG_HEADS, hd);
+    a->rms(dev->k, dev->k, knrm->device, 0, 0, 0, n * kvh, hd);
+    a->rms(dev->v, dev->v, 0, 0, 0, 0, n * kvh, hd);
+    a->rope(dev->q, dev->rope, n, DG_HEADS, hd, qn);
+    a->rope(dev->k, dev->rope, n, kvh, hd, kn);
+    JB_TO(attention_prepare, prepare_start);
     JB_TICK(core_start);
     a->attention(dev->a, dev->q, dev->k, dev->v, dev->kv_k, dev->kv_v, dev->seg_old, dev->seg_base,
                  n, seq, kvh, hd, mode == DG_CANVAS, full, max_keys);
@@ -4738,6 +4739,8 @@ static void dg_ff_accel(DGModel *m, int l, int n, const DGDeviceLayout *d, JBAre
     a->rms(d->z2, d->x, pre2->device, 0, 0, 0, n, DG_H);
     a->rms(d->rin, d->x, 0, rs->device, sqrtf(DG_H), 0, n, DG_H);
     dg_mm_accel(m, rw, d->rin, d->route, n, DG_EXPERTS, DG_H);
+    /* Queued before the logits come down, so it runs during the wait. */
+    dg_nvfp4_qdq_accel(m, d->qz2, d->z2, n, DG_H, m->nv_a13[l], d->flag);
     float *route = jb_arena_alloc(workspace, (size_t)n * DG_EXPERTS, sizeof *route, 0);
     a->to_host(route, d->route, (size_t)n * DG_EXPERTS * 4);
     JB_TO(dense, ff_start);
@@ -4779,7 +4782,6 @@ static void dg_ff_accel(DGModel *m, int l, int n, const DGDeviceLayout *d, JBAre
                     rows++;
                 }
     }
-    dg_nvfp4_qdq_accel(m, d->qz2, d->z2, n, DG_H, m->nv_a13[l], d->flag);
     a->to_device(d->index, index, (size_t)rows * sizeof *index);
     a->to_device(d->slot, slot, total * sizeof *slot);
     a->to_device(d->weight, tw, total * sizeof *tw);
@@ -4805,21 +4807,38 @@ typedef struct {
     DGKV *out;
 } DGAttentionCall;
 
-/* dg_layer on the accelerator. x crosses to the device and back once;
- * device time is attributed to the next step that waits for it. */
-static void dg_layer_accel(DGModel *m, int l, float *x, int n, const DGAttentionCall *c,
-                           JBArena *workspace, const DGDeviceWork *work) {
+/* The accelerated layers keep the activations on the device between
+ * layers: they go up before the first and come back after the last, when
+ * the quantizers' non-finite flag is checked too. */
+static void dg_accel_enter(const DGModel *m, const DGDeviceWork *work, const float *x, int n) {
+    DGDeviceLayout d;
+    int bad = 0;
+    dg_device_layout(&d, work->base, n, work->kv_rows, m->accel);
+    m->accel->to_device(d.flag, &bad, sizeof bad);
+    m->accel->to_device(d.x, x, (size_t)n * DG_H * 4);
+}
+
+static void dg_accel_leave(const DGModel *m, const DGDeviceWork *work, float *x, int n) {
+    DGDeviceLayout d;
+    int bad = 0;
+    dg_device_layout(&d, work->base, n, work->kv_rows, m->accel);
+    m->accel->to_host(x, d.x, (size_t)n * DG_H * 4);
+    m->accel->to_host(&bad, d.flag, sizeof bad);
+    if (bad)
+        die("non-finite NVFP4 activation");
+}
+
+/* dg_layer on the accelerator, from and to the device's activations; device
+ * time is attributed to the next step that waits for it. */
+static void dg_layer_accel(DGModel *m, int l, int n, const DGAttentionCall *c, JBArena *workspace,
+                           const DGDeviceWork *work) {
     const DGAccelOps *a = m->accel;
     DGDeviceLayout d;
     dg_device_layout(&d, work->base, n, work->kv_rows, a);
     JB_TICK(layer_start);
     DGTensor *in = dg_layer_tensor(m, l, "input_layernorm.weight"),
              *pa = dg_layer_tensor(m, l, "post_attention_layernorm.weight");
-    size_t bytes = (size_t)n * DG_H * 4;
-    int bad = 0;
-    a->to_device(d.flag, &bad, sizeof bad);
-    a->to_device(d.x, x, bytes);
-    a->to_device(d.res, x, bytes);
+    a->copy(d.res, d.x, (size_t)n * DG_H * 4);
     a->rms(d.z, d.x, in->device, 0, 0, 0, n, DG_H);
     JB_TICK(attention_start);
     if (c->batch)
@@ -4830,10 +4849,6 @@ static void dg_layer_accel(DGModel *m, int l, float *x, int n, const DGAttention
     JB_TO(attention, attention_start);
     a->rms(d.x, d.z, pa->device, 0, 0, d.res, n, DG_H);
     dg_ff_accel(m, l, n, &d, workspace);
-    a->to_host(x, d.x, bytes);
-    a->to_host(&bad, d.flag, sizeof bad);
-    if (bad)
-        die("non-finite NVFP4 activation");
     JB_TO(layers, layer_start);
 }
 
@@ -4841,7 +4856,7 @@ static void dg_layer(DGModel *m, int l, float *x, int n, int pos0, const DGKV *c
                      int mode, int batch, JBArena *workspace, const DGDeviceWork *device) {
     if (device) {
         DGAttentionCall c = {batch, 0, 0, pos0, mode, cache, NULL, NULL, out};
-        dg_layer_accel(m, l, x, n, &c, workspace, device);
+        dg_layer_accel(m, l, n, &c, workspace, device);
         return;
     }
     size_t mark = jb_arena_mark(workspace);
@@ -4889,7 +4904,7 @@ static void dg_layer_multi(DGModel *m, int l, float *x, int segments, int seq,
     int n = segments * seq;
     if (device) {
         DGAttentionCall c = {0, segments, seq, 0, mode, NULL, cache, lens, out};
-        dg_layer_accel(m, l, x, n, &c, workspace, device);
+        dg_layer_accel(m, l, n, &c, workspace, device);
         return;
     }
     size_t mark = jb_arena_mark(workspace);
@@ -4957,8 +4972,12 @@ static void dg_prefill(DGModel *m, const int *prompt, int np, DGKV kv[DG_L], DGW
     JB_TICK(embed_start);
     dg_embed(m, prompt, np, 0, enc);
     JB_TO(embedding, embed_start);
+    if (device)
+        dg_accel_enter(m, device, enc, np);
     for (int l = 0; l < DG_L; l++)
         dg_layer(m, l, enc, np, 0, NULL, &kv[l], DG_CAUSAL, 1, workspace, device);
+    if (device)
+        dg_accel_leave(m, device, enc, np);
     jb_arena_reset(workspace, 0);
     dg_workspace_end(owner);
 }
@@ -4973,8 +4992,12 @@ static void dg_prefill_suffix(DGModel *m, const int *token, int n, const DGKV pr
     JB_TICK(embed_start);
     dg_embed(m, token, n, 0, x);
     JB_TO(embedding, embed_start);
+    if (device)
+        dg_accel_enter(m, device, x, n);
     for (int l = 0; l < DG_L; l++)
         dg_layer(m, l, x, n, prefix[l].n, &prefix[l], &kv[l], DG_SUFFIX, 1, workspace, device);
+    if (device)
+        dg_accel_leave(m, device, x, n);
     jb_arena_reset(workspace, 0);
     dg_workspace_end(owner);
 }
@@ -4989,8 +5012,12 @@ static float *dg_decode(DGModel *m, DGKV kv[DG_L], int np, const int *canvas, in
     JB_TICK(embed_start);
     dg_embed(m, canvas, nc * batch, 1, dec);
     JB_TO(embedding, embed_start);
+    if (device)
+        dg_accel_enter(m, device, dec, nc * batch);
     for (int l = 0; l < DG_L; l++)
         dg_layer(m, l, dec, nc * batch, np, &kv[l], NULL, DG_CANVAS, batch, workspace, device);
+    if (device)
+        dg_accel_leave(m, device, dec, nc * batch);
     JB_TICK(norm_start);
     dg_final_norm(m, dec, nc * batch);
     JB_TO(final_norm, norm_start);
@@ -5008,6 +5035,8 @@ static void dg_prefill_suffix_multi(DGModel *m, const int *token, const int *len
     JB_TICK(embed_start);
     dg_embed(m, token, batch * seq, 0, x);
     JB_TO(embedding, embed_start);
+    if (device)
+        dg_accel_enter(m, device, x, batch * seq);
     for (int l = 0; l < DG_L; l++) {
         for (int b = 0; b < batch; b++) {
             cache[b] = &prefix[l];
@@ -5015,6 +5044,8 @@ static void dg_prefill_suffix_multi(DGModel *m, const int *token, const int *len
         }
         dg_layer_multi(m, l, x, batch, seq, cache, lens, out, DG_SUFFIX, workspace, device);
     }
+    if (device)
+        dg_accel_leave(m, device, x, batch * seq);
     jb_arena_reset(workspace, 0);
     dg_workspace_end(owner);
 }
@@ -5038,11 +5069,15 @@ static float *dg_decode_multi(DGModel *m, DGKV *kv, const int *doc, int segments
     JB_TICK(embed_start);
     dg_embed(m, canvas, n, 1, x);
     JB_TO(embedding, embed_start);
+    if (device)
+        dg_accel_enter(m, device, x, n);
     for (int l = 0; l < DG_L; l++) {
         for (int s = 0; s < segments; s++)
             cache[s] = &kv[(size_t)doc[s] * DG_L + l];
         dg_layer_multi(m, l, x, segments, seq, cache, lens, NULL, DG_CANVAS, workspace, device);
     }
+    if (device)
+        dg_accel_leave(m, device, x, n);
     JB_TICK(norm_start);
     dg_final_norm(m, x, n);
     JB_TO(final_norm, norm_start);
