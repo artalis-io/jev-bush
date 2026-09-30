@@ -575,6 +575,20 @@ GPU time over eight rows fell from 4.84 to 4.08 s, and the 40 parity rows
 from 52.4 to 45.4 s back to back: 73x the reference, byte-identical on all
 200 answers. The NVFP4 expert products, at 1.33 s, are now the largest cost.
 
+### NVFP4 expert products
+
+The NVFP4 kernel turned out to be bound by issued instructions, not by
+memory: tiles of 16 or 32 tokens, which read each expert's weights fewer
+times, were slower than tiles of 8 (1.69 and 1.73 s against 1.33 s over
+eight rows). Decode routes about two tokens to each expert, and every thread
+ran all eight token slots, the empty ones predicated off but still issued.
+A tile's count is the same for every thread of its block, so the block now
+branches, without divergence, to a loop of 1, 2, 4 or 8 slots with no
+predicates; slots past the count read stale activations and are never
+stored. NVFP4 time fell from 1.33 to 1.08 s, GPU time from 4.07 to 3.81 s,
+and the 40 parity rows from 45.3 to 43.9 s back to back, byte-identical on
+all 200 answers: 76x the reference. The selftest gained a two-token shape.
+
 ## 7. Make benchmark comparisons auditable
 
 Before publishing a faster number:

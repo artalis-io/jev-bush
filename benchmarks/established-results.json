@@ -231,6 +231,14 @@
             "after": {"busy": 4.08, "attention": 0.83, "bf16": 1.27, "nvfp4": 1.33}
           }
         },
+        "nvfp4_slots_by_tile_count": {
+          "conditions": "runs back to back",
+          "strict_seconds": 43.9,
+          "previous_seconds_same_conditions": 45.3,
+          "strict_identical_answer_objects": 200,
+          "gpu_seconds_eight_rows": {"nvfp4": {"before": 1.33, "after": 1.08}, "busy": {"before": 4.07, "after": 3.81}},
+          "rejected_larger_tiles_nvfp4_seconds": {"16_tokens": 1.73, "32_tokens": 1.69}
+        },
         "strict_identical_answer_objects_register_tiles": 200,
         "strict_neon_seconds_same_code": 275,
         "strict_reference_seconds": 3353,
