@@ -1892,8 +1892,80 @@ static void dg_nvfp4_mm_ref(const uint8_t *wd, const uint8_t *sd, float global, 
     }
 }
 
+static float dg_float_bits(uint32_t u) {
+    float x;
+    memcpy(&x, &u, sizeof x);
+    return x;
+}
+
+/* expf and tanhf. Strict builds use these, from IEEE additions,
+ * multiplications and divisions in a fixed order and nothing else: no libm
+ * and no fused multiply-add, so every strict build, whatever its C library,
+ * and the CUDA kernels compute the same bits. Both follow Cephes. Fast math
+ * may reassociate the range reduction and flushes subnormals, so fast-math
+ * builds, which make no claim to identical bits, keep the C library's. */
+#if JB_STRICT_MATH
+
+/* Rounds x log2(e) half away from zero to n, reduces x by n ln 2 in two
+ * parts, the first exact for |n| <= 150, and scales a minimax polynomial by
+ * 2^n, in two steps outside the normal exponent range. */
+static float dg_expf(float x) {
+    if (x != x)
+        return x;
+    if (x > 88.72283935546875f)
+        return INFINITY;
+    if (x < -103.97207641601562f)
+        return 0;
+    int e = (int)(x * 1.44269504088896341f + (x < 0 ? -0.5f : 0.5f));
+    float n = (float)e;
+    float r = x - n * 0.693359375f;
+    r = r - n * -2.12194440e-4f;
+    float p = 1.9875691500e-4f;
+    p = p * r + 1.3981999507e-3f;
+    p = p * r + 8.3334519073e-3f;
+    p = p * r + 4.1665795894e-2f;
+    p = p * r + 1.6666665459e-1f;
+    p = p * r + 5.0000001201e-1f;
+    p = p * (r * r) + r + 1.0f;
+    if (e > 127)
+        return p * dg_float_bits(254u << 23) * 2.0f;
+    if (e < -126)
+        return p * dg_float_bits((uint32_t)(e + 253) << 23) * 0x1p-126f;
+    return p * dg_float_bits((uint32_t)(e + 127) << 23);
+}
+
+/* Odd polynomial below 0.625, 1 - 2 / (e^2|x| + 1) above, and +-1 from 10,
+ * where the result rounds to 1. Tiny arguments return themselves, keeping
+ * the sign of zero. */
+static float dg_tanhf(float x) {
+    float a = x < 0 ? -x : x;
+    if (a < 0x1p-12f)
+        return x;
+    if (a < 0.625f) {
+        float z = x * x, p = -5.70498872745e-3f;
+        p = p * z + 2.06390887954e-2f;
+        p = p * z - 5.37397155531e-2f;
+        p = p * z + 1.33314422036e-1f;
+        p = p * z - 3.33332819422e-1f;
+        return p * z * x + x;
+    }
+    if (a >= 10.0f)
+        return x < 0 ? -1.0f : 1.0f;
+    float t = 1.0f - 2.0f / (dg_expf(a + a) + 1.0f);
+    return x < 0 ? -t : t;
+}
+#else
+static float dg_expf(float x) {
+    return expf(x);
+}
+
+static float dg_tanhf(float x) {
+    return tanhf(x);
+}
+#endif
+
 static float dg_gelu(float x) {
-    return .5f * x * (1.0f + tanhf(.7978845608028654f * (x + .044715f * x * x * x)));
+    return .5f * x * (1.0f + dg_tanhf(.7978845608028654f * (x + .044715f * x * x * x)));
 }
 
 static DGNvMatrix dg_nvfp4_matrix(const DGTensor *w, const DGTensor *s, const DGTensor *g, int rows,
@@ -2052,7 +2124,7 @@ static double dg_slot_logits_entropy(const DGTensor *w, const float *hidden, int
         }
         float mx = -FLT_MAX;
         for (int v = 0; v < DG_VOCAB; v++) {
-            float z = 30.0f * tanhf(row[v] / 30.0f);
+            float z = 30.0f * dg_tanhf(row[v] / 30.0f);
             row[v] = z;
             if (z > mx)
                 mx = z;
@@ -3539,7 +3611,7 @@ static void dg_attention_segments(DGModel *m, int l, float *x, int segments, int
                 /* Scores become their exponentials, computed once. */
                 float den = 0;
                 for (int j = start; j < end; j++) {
-                    ts[j] = expf(ts[j] - mx);
+                    ts[j] = dg_expf(ts[j] - mx);
                     den += ts[j];
                 }
                 float *oo = a + (size_t)ti * qn + (size_t)h * hd;
@@ -6418,6 +6490,52 @@ static void dg_test_rms_dot(uint64_t *rs) {
     }
 }
 
+/* Distance in float units in the last place from a double reference. */
+static double jb_float_ulps(float got, double want) {
+    double spacing = fabs(want) < FLT_MIN ? 0x1p-149 : ldexp(1.0, ilogb(want) - 23);
+    return fabs((double)got - want) / spacing;
+}
+
+/* dg_expf and dg_tanhf against double libm over a sweep of every float
+ * exponent, for results in the normal range, which fast math's
+ * flush-to-zero leaves alone; and a hash of their bits, which strict builds
+ * must reproduce on every platform and compiler, as GCC, Clang and MSVC on
+ * x86-64 and GCC on AArch64 did when it was recorded. */
+static void dg_test_portable_math(void) {
+    uint64_t hash = 1469598103934665603u;
+    double worst_exp = 0, worst_tanh = 0;
+    for (uint32_t u = 0; u < 0xffffffffu - 4093; u += 4093) {
+        if (((u >> 23) & 255) == 255)
+            continue;
+        float x = dg_float_bits(u), e = dg_expf(x), t = dg_tanhf(x);
+        uint32_t be, bt;
+        memcpy(&be, &e, sizeof be);
+        memcpy(&bt, &t, sizeof bt);
+        hash = (hash ^ be) * 1099511628211u;
+        hash = (hash ^ bt) * 1099511628211u;
+        if (x > -87.0f && x < 88.7f) {
+            double err = jb_float_ulps(e, exp((double)x));
+            if (err > worst_exp)
+                worst_exp = err;
+        }
+        double err = jb_float_ulps(t, tanh((double)x));
+        if (err > worst_tanh)
+            worst_tanh = err;
+    }
+    if (worst_exp > 1.0 || worst_tanh > 1.5)
+        die("portable math self-test failed: accuracy");
+    /* Fast math assumes no infinities and ignores the sign of zero. */
+#if JB_STRICT_MATH
+    if (dg_expf(0) != 1 || dg_expf(-INFINITY) != 0 || dg_expf(INFINITY) != INFINITY ||
+        dg_tanhf(INFINITY) != 1 || dg_tanhf(-INFINITY) != -1 || !signbit(dg_tanhf(-0.0f)))
+        die("portable math self-test failed: special values");
+    if (hash != 0x5f90bd09fe8f8bdeu)
+        die("portable math self-test failed: bits differ from the recorded ones");
+#else
+    (void)hash;
+#endif
+}
+
 /* Batched attention dots, over key counts around the kernels' key groups
  * and lengths around their column groups, with keys stored apart. */
 static void dg_test_dots(uint64_t *rs) {
@@ -6479,6 +6597,7 @@ static void dg_kernel_selftest(void) {
     dg_test_nvfp4(&rs);
     dg_test_rms_dot(&rs);
     dg_test_dots(&rs);
+    dg_test_portable_math();
     dg_test_nonfinite_activation();
 }
 
