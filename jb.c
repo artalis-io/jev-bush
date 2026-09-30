@@ -1915,12 +1915,13 @@ static void dg_nvfp4_mm(const DGTensor *w, const DGTensor *s, const DGTensor *g,
     dg_kernels()->nvfp4_mm(m.w, m.s, m.global, x, y, tokens, rows, cols);
 }
 
-/* h = gelu(g) * h over n values. */
+/* h = gelu(g) * h over n values, in chunks the faster cores can take more
+ * of. */
 static void dg_gelu_gate(const float *g, float *h, int n) {
     int i;
 #ifdef _OPENMP
     JB_OMP();
-#pragma omp parallel for schedule(static) if (n >= 4096)
+#pragma omp parallel for schedule(dynamic, 1024) if (n >= 4096)
 #endif
     for (i = 0; i < n; i++)
         h[i] = dg_gelu(g[i]) * h[i];
@@ -2837,16 +2838,19 @@ typedef struct _nvrtcProgram *nvrtcProgram;
 enum {
     DG_CU_CC_MAJOR = 75,
     DG_CU_CC_MINOR = 76,
-    DG_CUDA_ROWS = 32,
+    DG_CUDA_ROWS = 128,
     DG_CUDA_TOKENS = 8,
     DG_CUDA_GRID_Y = 65535
 };
 
-/* dg_nvfp4_mm_ref, tiled: a block computes 32 rows for one tile of up to 8
- * tokens that share a matrix, staging 16 weight blocks of those rows, their
- * scales and the tokens' activations in shared memory at a time. Each
- * thread still sums one row and token in the reference's order. The E2M1
- * table keeps -0.0, as the reference's sign flip produces it. */
+/* dg_nvfp4_mm_ref, tiled: a block of DG_ROWS threads computes DG_ROWS rows
+ * for one tile of up to DG_TOKENS tokens that share a matrix. Each chunk of
+ * 16 weight blocks of those rows, their scales and the tokens' activations
+ * is staged in shared memory with coalesced loads; each thread then decodes
+ * its row's weights once and applies them to every token of the tile, one
+ * register sum per token, each in the reference's order. The E2M1 table
+ * keeps -0.0, as the reference's sign flip produces it. DG_ROWS and
+ * DG_TOKENS come from the compile options. */
 static const char dg_cuda_source[] =
     "struct dg_matrix {\n"
     "    const unsigned char *w, *s;\n"
@@ -2857,8 +2861,6 @@ static const char dg_cuda_source[] =
     "    int start, count, group;\n"
     "};\n"
     "\n"
-    "#define DG_ROWS 32\n"
-    "#define DG_TOKENS 8\n"
     "#define DG_BLOCKS 16\n"
     "\n"
     "__device__ float dg_f8e4m3(unsigned u) {\n"
@@ -2867,52 +2869,59 @@ static const char dg_cuda_source[] =
     "    return u >> 7 ? -x : x;\n"
     "}\n"
     "\n"
-    "extern \"C\" __global__ void __launch_bounds__(DG_ROWS * DG_TOKENS)\n"
+    "extern \"C\" __global__ void __launch_bounds__(DG_ROWS)\n"
     "dg_nvfp4_mm(const dg_matrix *m, const dg_tile *tiles, int ntiles, const float *x,\n"
     "        float *y, int rows, int cols) {\n"
     "    __shared__ float e2m1[16];\n"
-    "    __shared__ unsigned char ws[DG_BLOCKS * 8][DG_ROWS];\n"
+    "    __shared__ uint2 ws[DG_BLOCKS][DG_ROWS];\n"
     "    __shared__ float ss[DG_BLOCKS][DG_ROWS];\n"
     "    __shared__ float xs[DG_TOKENS][DG_BLOCKS * 16];\n"
-    "    int tx = threadIdx.x, ty = threadIdx.y, id = ty * DG_ROWS + tx;\n"
-    "    int r0 = blockIdx.x * DG_ROWS, r = r0 + tx, blocks = cols / 16;\n"
-    "    if (id < 16) {\n"
+    "    int tx = threadIdx.x, r0 = blockIdx.x * DG_ROWS, r = r0 + tx, blocks = cols / 16;\n"
+    "    if (tx < 16) {\n"
     "        const float mag[8] = {0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f};\n"
-    "        e2m1[id] = id & 8 ? -mag[id & 7] : mag[id & 7];\n"
+    "        e2m1[tx] = tx & 8 ? -mag[tx & 7] : mag[tx & 7];\n"
     "    }\n"
     "    for (int ti = blockIdx.y; ti < ntiles; ti += gridDim.y) {\n"
     "        dg_tile tile = tiles[ti];\n"
     "        dg_matrix mt = m[tile.group];\n"
-    "        float sum = 0;\n"
+    "        float sum[DG_TOKENS];\n"
+    "#pragma unroll\n"
+    "        for (int t = 0; t < DG_TOKENS; t++)\n"
+    "            sum[t] = 0;\n"
     "        for (int b0 = 0; b0 < blocks; b0 += DG_BLOCKS) {\n"
     "            int nb = blocks - b0 < DG_BLOCKS ? blocks - b0 : DG_BLOCKS;\n"
     "            __syncthreads();\n"
-    "            for (int i = id; i < DG_ROWS * nb; i += DG_ROWS * DG_TOKENS) {\n"
+    "            for (int i = tx; i < DG_ROWS * nb; i += DG_ROWS) {\n"
     "                int row = i / nb, b = i % nb, gr = r0 + row < rows ? r0 + row : rows - 1;\n"
-    "                const unsigned char *src = mt.w + (size_t)gr * (cols / 2) + (size_t)(b0 + b) "
-    "* 8;\n"
-    "                for (int k = 0; k < 8; k++)\n"
-    "                    ws[b * 8 + k][row] = src[k];\n"
+    "                ws[b][row] = *(const uint2 *)(mt.w + (size_t)gr * (cols / 2) +\n"
+    "                                              (size_t)(b0 + b) * 8);\n"
     "                ss[b][row] = dg_f8e4m3(mt.s[(size_t)gr * blocks + b0 + b]) * mt.global;\n"
     "            }\n"
-    "            for (int i = id; i < DG_TOKENS * nb * 16; i += DG_ROWS * DG_TOKENS) {\n"
+    "            for (int i = tx; i < tile.count * nb * 16; i += DG_ROWS) {\n"
     "                int t = i / (nb * 16), c = i % (nb * 16);\n"
-    "                if (t < tile.count)\n"
-    "                    xs[t][c] = x[(size_t)(tile.start + t) * cols + (size_t)b0 * 16 + c];\n"
+    "                xs[t][c] = x[(size_t)(tile.start + t) * cols + (size_t)b0 * 16 + c];\n"
     "            }\n"
     "            __syncthreads();\n"
-    "            if (ty < tile.count)\n"
-    "                for (int b = 0; b < nb; b++) {\n"
-    "                    float scale = ss[b][tx];\n"
-    "                    for (int k = 0; k < 8; k++) {\n"
-    "                        unsigned v = ws[b * 8 + k][tx];\n"
-    "                        sum += scale * (e2m1[v & 15] * xs[ty][b * 16 + k * 2] +\n"
-    "                                        e2m1[v >> 4] * xs[ty][b * 16 + k * 2 + 1]);\n"
-    "                    }\n"
+    "            for (int b = 0; b < nb; b++) {\n"
+    "                float scale = ss[b][tx];\n"
+    "                uint2 q = ws[b][tx];\n"
+    "#pragma unroll\n"
+    "                for (int k = 0; k < 8; k++) {\n"
+    "                    unsigned v = ((k < 4 ? q.x : q.y) >> (8 * (k & 3))) & 255;\n"
+    "                    float wl = e2m1[v & 15], wh = e2m1[v >> 4];\n"
+    "#pragma unroll\n"
+    "                    for (int t = 0; t < DG_TOKENS; t++)\n"
+    "                        if (t < tile.count)\n"
+    "                            sum[t] += scale * (wl * xs[t][b * 16 + k * 2] +\n"
+    "                                               wh * xs[t][b * 16 + k * 2 + 1]);\n"
     "                }\n"
+    "            }\n"
     "        }\n"
-    "        if (ty < tile.count && r < rows)\n"
-    "            y[(size_t)(tile.start + ty) * rows + r] = sum;\n"
+    "        if (r < rows)\n"
+    "#pragma unroll\n"
+    "            for (int t = 0; t < DG_TOKENS; t++)\n"
+    "                if (t < tile.count)\n"
+    "                    y[(size_t)(tile.start + t) * rows + r] = sum[t];\n"
     "    }\n"
     "}\n";
 
@@ -2978,9 +2987,11 @@ static int dg_cuda_symbol(void *lib, const char *name, void *slot) {
  * frame may unwind through, so it records a failure for dg_accel() to report
  * and allocates with plain malloc. */
 static void dg_cuda_compile(int major, int minor) {
-    char arch[48];
+    char arch[48], tile_rows[32], tile_tokens[32];
     snprintf(arch, sizeof arch, "--gpu-architecture=compute_%d%d", major, minor);
-    const char *options[] = {arch, "--fmad=false"};
+    snprintf(tile_rows, sizeof tile_rows, "-DDG_ROWS=%d", DG_CUDA_ROWS);
+    snprintf(tile_tokens, sizeof tile_tokens, "-DDG_TOKENS=%d", DG_CUDA_TOKENS);
+    const char *options[] = {arch, "--fmad=false", tile_rows, tile_tokens};
     nvrtcProgram prog;
     if (dg_cuda.create(&prog, dg_cuda_source, "jb_nvfp4.cu", 0, NULL, NULL)) {
         dg_cuda.failure = "nvrtcCreateProgram";
@@ -2989,7 +3000,7 @@ static void dg_cuda_compile(int major, int minor) {
     size_t size = 0;
     char *ptx = NULL;
     CUmodule module;
-    if (dg_cuda.compile(prog, 2, options) || dg_cuda.ptx_size(prog, &size) ||
+    if (dg_cuda.compile(prog, 4, options) || dg_cuda.ptx_size(prog, &size) ||
         !(ptx = malloc(size)) || dg_cuda.ptx(prog, ptx)) {
         size_t n = 0;
         char *log = NULL;
@@ -3093,8 +3104,8 @@ static int dg_cuda_reserve(CUdeviceptr *p, size_t *have, size_t need) {
 
 /* Splits tokens into tiles of up to DG_CUDA_TOKENS consecutive tokens that
  * share a matrix, stages the matrix table, the tiles and x in one device
- * buffer, each part 16-byte aligned, and runs one block per 32 rows and
- * tile. */
+ * buffer, each part 16-byte aligned, and runs one block per DG_CUDA_ROWS
+ * rows and tile. */
 static void dg_cuda_mm(const DGAccelMatrix *const *m, const int *group, const float *x, float *y,
                        int tokens) {
     if (tokens <= 0)
@@ -3142,7 +3153,7 @@ static void dg_cuda_mm(const DGAccelMatrix *const *m, const int *group, const fl
         void *args[] = {&dt, &dl, &ntiles, &dx, &dg_cuda.y, &rows, &cols};
         unsigned grid_y = ntiles < DG_CUDA_GRID_Y ? (unsigned)ntiles : DG_CUDA_GRID_Y;
         if (dg_cuda.launch(dg_cuda.mm, (unsigned)((rows + DG_CUDA_ROWS - 1) / DG_CUDA_ROWS), grid_y,
-                           1, DG_CUDA_ROWS, DG_CUDA_TOKENS, 1, 0, NULL, args, NULL))
+                           1, DG_CUDA_ROWS, 1, 1, 0, NULL, args, NULL))
             failed = "cuLaunchKernel";
         else if (dg_cuda.dtoh(y, dg_cuda.y, yb))
             failed = "cuMemcpyDtoH";
