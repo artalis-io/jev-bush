@@ -171,6 +171,8 @@
         "binding": "OMP_PROC_BIND=close",
         "strict_identical_answer_objects": 200,
         "strict_cuda_seconds": 196,
+        "strict_cuda_seconds_register_tiles": 186,
+        "strict_identical_answer_objects_register_tiles": 200,
         "strict_neon_seconds_same_code": 275,
         "strict_reference_seconds": 3353,
         "profiled_eight_rows_seconds": {

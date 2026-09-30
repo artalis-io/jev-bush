@@ -422,6 +422,16 @@ thread read its weight row from memory (experts 13.7 s). Attention, now 54% of
 a row, is the next cost; it stays on the CPU because exact GPU `expf` would have
 to reproduce glibc's.
 
+The kernel now gives each thread one row and every token of its tile, one
+register sum per token, so each weight is decoded once per tile; weights are
+staged with 8-byte coalesced loads in blocks of 128 rows. GELU between the
+products takes dynamic chunks. Over eight profiled rows, experts fell from 5.3
+to 3.6 s, and GPU kernels account for about 1.5 s of that at roughly 45% of
+memory bandwidth; the rest is copies, GELU, activation quantization and the
+serial gather. Block rows from 64 to 256 and tiles of 4 to 16 tokens were
+within 10% of each other. Parallelizing the gather and scatter was slower (0.47
+to 0.68 s). The 40 rows went from 196 to 186 s, byte-identical on all 200.
+
 Kernel throughput against the reference on the same machine (`--bench-kernels`,
 20 threads, `OMP_PROC_BIND=close`): BF16 2.3x at one token, 3.5x at 64, and
 11x at 256; NVFP4 1.9x at one token and 4.5x at 64. This microbenchmark is
