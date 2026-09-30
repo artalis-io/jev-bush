@@ -213,6 +213,14 @@
           "host_seconds_eight_profiled_rows": {"phase_1": 16.0, "phase_2": 10.0},
           "one_row_with_model_load_seconds": {"per_weight_allocations": 23.0, "one_allocation": 11.5}
         },
+        "fp64_throughput_and_resident_activations": {
+          "conditions": "quiet machine, runs back to back",
+          "strict_seconds": 51.5,
+          "previous_seconds_same_conditions": 60.9,
+          "strict_identical_answer_objects": 200,
+          "gpu_busy_seconds_two_rows": {"before": 2.07, "after": 1.72},
+          "rms_launch_us": {"before": 318, "after": 141}
+        },
         "strict_identical_answer_objects_register_tiles": 200,
         "strict_neon_seconds_same_code": 275,
         "strict_reference_seconds": 3353,
