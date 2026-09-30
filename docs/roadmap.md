@@ -519,6 +519,30 @@ What remains per layer is synchronization: the router's logits come down,
 and each attention call uploads the cached rows. A device-resident K/V cache
 and the router on the device are the next steps.
 
+### FP64 throughput and idle time
+
+A timeline of two rows on a quiet machine showed the GPU busy 83% of its
+window, so synchronization could win at most 17%; the kernels were the rest,
+and the exact FP64 sums a large part of them. GB10's FP64 turned out to be
+bound by throughput, not latency: computing a row's squares in parallel,
+each exact in double, and leaving only the additions to one thread cut an
+RMS launch from 318 to 141 us. The MoE tail's two norms do the same, and
+attention converts its query head to double once instead of once per key.
+GPU time for two rows fell from 2.07 to 1.72 s, with every result unchanged.
+
+The activations now stay on the device for a whole forward pass, and
+attention uploads its rotary tables, segment tables and cached rows before
+queueing the projections. The remaining idle time, about 18% of the window,
+is in three places: the router's round trip (top-k and grouping on the host,
+166 ms over two rows), prefill's K/V output (downloads and the host's cache
+copy, 158 ms), and the host's work between forward passes. The first needs
+the router, its double `exp`, and the expert grouping on the device; the
+second a device-resident K/V cache.
+
+The 40 parity rows take 51.5 s, against 60.9 s before, back to back on a
+quiet machine: 64x the reference, byte-identical on all 200 answers. The
+BF16 and NVFP4 products are now 60% of GPU time.
+
 ## 7. Make benchmark comparisons auditable
 
 Before publishing a faster number:
