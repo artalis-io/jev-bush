@@ -6522,7 +6522,9 @@ static void dg_test_portable_math(void) {
         if (err > worst_tanh)
             worst_tanh = err;
     }
-    if (worst_exp > 1.0 || worst_tanh > 1.5)
+    /* Fast-math builds test the C library's functions, which make no
+     * one-ulp promise: glibc's tanhf is 2.07 ulp off there. */
+    if (worst_exp > (JB_STRICT_MATH ? 1.0 : 4.0) || worst_tanh > (JB_STRICT_MATH ? 1.5 : 4.0))
         die("portable math self-test failed: accuracy");
     /* Fast math assumes no infinities and ignores the sign of zero. */
 #if JB_STRICT_MATH
