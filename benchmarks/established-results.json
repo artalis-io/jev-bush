@@ -194,6 +194,17 @@
         "strict_identical_answer_objects": 200,
         "strict_cuda_seconds": 196,
         "strict_cuda_seconds_register_tiles": 186,
+        "layers_phase_1": {
+          "reference": "portable expf and tanhf",
+          "strict_seconds": 84,
+          "strict_seconds_experts_only_same_reference": 204,
+          "strict_neon_seconds_same_reference": 284,
+          "strict_reference_seconds": 3318,
+          "strict_identical_answer_objects": 200,
+          "gpu_kernel_seconds_two_rows": {
+            "bf16_mm": 0.54, "nvfp4_mm": 0.50, "rms": 0.26, "moe_tail": 0.09
+          }
+        },
         "strict_identical_answer_objects_register_tiles": 200,
         "strict_neon_seconds_same_code": 275,
         "strict_reference_seconds": 3353,

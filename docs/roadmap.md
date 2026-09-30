@@ -466,6 +466,33 @@ C library's functions on the same code and machine: the difference is
 rounding noise that this model amplifies, not quality. The next step is exact
 GELU and softmax on the GPU with the same functions.
 
+### CUDA layers, phase 1
+
+The accelerator now runs whole layers, not only experts. The accelerator
+table gained device memory and one operation per layer step (BF16 product,
+RMS norm with an optional factor or residual, GELU, NVFP4 quantization, row
+gather, and the MoE tail with the layer scalar), and `dg_layer_accel` issues
+them in `dg_layer`'s order; the CUDA block holds only kernels and memory.
+Each session owns its device activations, so concurrent sessions share
+nothing but the uploaded weights. Two steps stay on the host: attention's
+middle, whose Q, K and V come down and whose output goes back up, and the
+router's top-k and softmax, which use the C library's double `exp`.
+
+On the 40 parity rows the layers take 84 s, against 204 s with GPU experts
+alone, 284 s on NEON and 3,318 s for the reference: 40x the reference, and
+byte-identical to it on all 200 answers. GPU kernel time over two rows is
+about 1.4 s: BF16 products 0.54 s, NVFP4 products 0.50 s, RMS norms 0.26 s,
+the MoE tail 0.09 s. Two fixes found by profiling each launch got the BF16
+products there. Staging loops with run-time trip counts had serialized every
+global load; fixed trip counts cut a launch from 1.34 to 0.57 ms. Padding
+shared memory against bank conflicts, by contrast, changed nothing.
+
+The RMS norms are bound by GB10's FP64 latency. The exact sum of squares is a
+chain of dependent double additions, about 80 ns each; unrolling it or
+fitting more tokens per SM did not help, and more tokens made it slower. Over
+eight rows the host's share is now attention's middle, about 7 s of 13;
+running it on the GPU, with the K/V cache in device memory, is phase 2.
+
 ## 7. Make benchmark comparisons auditable
 
 Before publishing a faster number:
