@@ -1000,15 +1000,16 @@ typedef uint64_t DGDevice;
 typedef struct DGAccelMatrix DGAccelMatrix;
 
 /* An optional accelerator for the transformer layers, bit-identical to the
- * reference. It holds the NVFP4 expert matrices (upload) and the layers'
- * BF16 tensors (alloc, to_device) in device memory and runs each step of a
- * layer on device addresses, in the order the caller issues them; to_host
- * waits for the steps before it. dg_accel() returns NULL when none is built
- * or available; upload and alloc return NULL and 0 when the device is out of
+ * reference. The caller places weights in device memory (alloc, to_device)
+ * and runs each step of a layer on device addresses, in the order it issues
+ * them; to_host waits for the steps before it. dg_accel() returns NULL when
+ * none is built or available; alloc returns 0 when the device is out of
  * memory. The other operations report failures through die(). */
 typedef struct {
     const char *name;
-    DGAccelMatrix *(*upload)(const DGNvMatrix *m, int rows, int cols);
+    /* A handle for an NVFP4 matrix whose packed weights and block scales the
+     * caller placed at w and s; release frees the handle only. */
+    DGAccelMatrix *(*matrix)(DGDevice w, DGDevice s, float global, int rows, int cols);
     void (*release)(DGAccelMatrix *m);
     DGDevice (*alloc)(size_t bytes);
     void (*free)(DGDevice p);
@@ -1035,6 +1036,18 @@ typedef struct {
     void (*nvfp4_qdq)(DGDevice out, DGDevice in, int tokens, int cols, float base, DGDevice flag);
     /* Row i of dst = row index[i] of src, index being device ints. */
     void (*gather)(DGDevice dst, DGDevice src, DGDevice index, int rows, int cols);
+    void (*copy)(DGDevice dst, DGDevice src, size_t bytes);
+    /* dg_rope on rows of heads * hd values, stride apart per token; table
+     * holds each token's cosines then sines, DG_FULL_HEAD_DIM apart. */
+    void (*rope)(DGDevice x, DGDevice table, int tokens, int heads, int hd, int stride);
+    /* The middle of dg_attention_segments for n = segments * seq tokens:
+     * scores against a segment's cached keys, rows seg_base[s]... of k_old
+     * and v_old (seg_old[s] of them), then its own, a softmax with dg_expf,
+     * and the weighted values into a, each in the reference's order.
+     * max_keys bounds any token's cached plus own keys. */
+    void (*attention)(DGDevice a, DGDevice q, DGDevice k, DGDevice v, DGDevice k_old,
+                      DGDevice v_old, DGDevice seg_old, DGDevice seg_base, int n, int seq, int kvh,
+                      int hd, int canvas, int full, int max_keys);
     /* dg_ff's tail per token t: the routed experts' rows eo[slot[t, k]],
      * weighted by weight[t, k] and summed in k order, normalized by p2,
      * added to d, normalized by post, added to x, and x scaled by scalar. */
@@ -1057,8 +1070,10 @@ typedef struct {
     int nshard, nvfp4;
     DGNvExpert *nvexpert;
     float nv_a13[DG_L], nv_a2[DG_L];
-    /* Set when every expert matrix is on the accelerator. */
+    /* Set when every weight the layers use is on the accelerator, in the one
+     * allocation weights. */
     const DGAccelOps *accel;
+    DGDevice weights;
 } DGModel;
 
 enum { DG_UNKNOWN = -1, DG_BF16, DG_U8, DG_F8E4M3, DG_F32 };
@@ -1354,10 +1369,10 @@ static void dg_release_accel(DGModel *m) {
                     m->nvexpert[i].accel[k] = NULL;
                 }
     for (size_t i = 0; i < m->nt; i++)
-        if (m->tensor[i].device) {
-            dg_accel()->free(m->tensor[i].device);
-            m->tensor[i].device = 0;
-        }
+        m->tensor[i].device = 0;
+    if (m->weights)
+        dg_accel()->free(m->weights);
+    m->weights = 0;
     m->accel = NULL;
 }
 
@@ -1370,6 +1385,8 @@ static const char *const dg_accel_tensors[] = {
     "self_attn.k_proj.weight",
     "self_attn.v_proj.weight",
     "self_attn.o_proj.weight",
+    "self_attn.q_norm.weight",
+    "self_attn.k_norm.weight",
     "post_attention_layernorm.weight",
     "pre_feedforward_layernorm.weight",
     "mlp.gate_proj.weight",
@@ -1383,45 +1400,57 @@ static const char *const dg_accel_tensors[] = {
     "post_feedforward_layernorm.weight",
 };
 
-static int dg_upload_tensor(const DGAccelOps *a, DGTensor *t) {
-    if (t->device)
-        return 1;
-    t->device = a->alloc((size_t)t->bytes);
-    if (t->device)
-        a->to_device(t->device, t->data, (size_t)t->bytes);
-    return t->device != 0;
+/* The next 256-byte-aligned place for bytes in the weights allocation at
+ * base, copying src there; with base 0 it only advances *at, to size the
+ * allocation. */
+static DGDevice dg_place(const DGAccelOps *a, DGDevice base, size_t *at, const void *src,
+                         size_t bytes) {
+    *at = jb_align_up(*at, 256);
+    DGDevice p = base ? base + *at : 0;
+    if (base)
+        a->to_device(p, src, bytes);
+    *at = jb_size_add(*at, bytes);
+    return p;
 }
 
 static DGNvMatrix dg_nvfp4_matrix(const DGTensor *w, const DGTensor *s, const DGTensor *g, int rows,
                                   int cols);
 
-/* Uploads every expert matrix and every layer tensor, or none: a device that
- * cannot hold them all leaves the model on the CPU kernels. */
+/* Places every expert matrix and every layer tensor in one device
+ * allocation, or none: allocations are slow one at a time, and a device that
+ * cannot hold them all leaves the model on the CPU kernels. A first pass
+ * sizes the allocation and a second fills it. */
 static void dg_upload_model(DGModel *m) {
     const DGAccelOps *a = m->nvfp4 ? dg_accel() : NULL;
     if (!a)
         return;
-    for (int i = 0; i < DG_L * DG_EXPERTS; i++) {
-        DGNvExpert *v = &m->nvexpert[i];
-        DGNvMatrix gate = dg_nvfp4_matrix(v->wg, v->sg, v->gg, DG_MOE, DG_H),
-                   up = dg_nvfp4_matrix(v->wu, v->su, v->gu, DG_MOE, DG_H),
-                   down = dg_nvfp4_matrix(v->wd, v->sd, v->gd, DG_H, DG_MOE);
-        v->accel[0] = a->upload(&gate, DG_MOE, DG_H);
-        v->accel[1] = v->accel[0] ? a->upload(&up, DG_MOE, DG_H) : NULL;
-        v->accel[2] = v->accel[1] ? a->upload(&down, DG_H, DG_MOE) : NULL;
-        if (!v->accel[2]) {
-            dg_release_accel(m);
-            return;
-        }
-    }
-    for (int l = 0; l < DG_L; l++) {
-        int full = l % DG_FULL_EVERY == DG_FULL_EVERY - 1;
-        for (size_t i = 0; i < sizeof dg_accel_tensors / sizeof *dg_accel_tensors; i++)
-            if ((!full || strcmp(dg_accel_tensors[i], "self_attn.v_proj.weight")) &&
-                !dg_upload_tensor(a, dg_layer_tensor(m, l, dg_accel_tensors[i]))) {
-                dg_release_accel(m);
-                return;
+    for (int pass = 0; pass < 2; pass++) {
+        size_t at = 0;
+        for (int i = 0; i < DG_L * DG_EXPERTS; i++) {
+            DGNvExpert *v = &m->nvexpert[i];
+            DGNvMatrix nv[3] = {dg_nvfp4_matrix(v->wg, v->sg, v->gg, DG_MOE, DG_H),
+                                dg_nvfp4_matrix(v->wu, v->su, v->gu, DG_MOE, DG_H),
+                                dg_nvfp4_matrix(v->wd, v->sd, v->gd, DG_H, DG_MOE)};
+            for (int k = 0; k < 3; k++) {
+                int rows = k < 2 ? DG_MOE : DG_H, cols = k < 2 ? DG_H : DG_MOE;
+                DGDevice w = dg_place(a, m->weights, &at, nv[k].w, (size_t)rows * cols / 2),
+                         sc = dg_place(a, m->weights, &at, nv[k].s, (size_t)rows * cols / 16);
+                if (pass)
+                    v->accel[k] = a->matrix(w, sc, nv[k].global, rows, cols);
             }
+        }
+        for (int l = 0; l < DG_L; l++) {
+            int full = l % DG_FULL_EVERY == DG_FULL_EVERY - 1;
+            for (size_t i = 0; i < sizeof dg_accel_tensors / sizeof *dg_accel_tensors; i++)
+                if (!full || strcmp(dg_accel_tensors[i], "self_attn.v_proj.weight")) {
+                    DGTensor *t = dg_layer_tensor(m, l, dg_accel_tensors[i]);
+                    DGDevice p = dg_place(a, m->weights, &at, t->data, (size_t)t->bytes);
+                    if (pass)
+                        t->device = p;
+                }
+        }
+        if (!pass && !(m->weights = a->alloc(at)))
+            return;
     }
     m->accel = a;
 }
@@ -3367,6 +3396,98 @@ static const char *const dg_cuda_source[] = {
     "            x[(size_t)t * n + i] = v * scalar;\n"
     "        }\n"
     "    }\n"
+    "}\n"
+    "/* dg_rope over tokens * heads rows of hd values, stride apart per token;\n"
+    " * each token's cosines then sines are pitch apart in table. */\n",
+    "extern \"C\" __global__ void dg_rope(float *x, const float *table, int tokens, int heads, int "
+    "hd,\n"
+    "        int stride, int pitch) {\n"
+    "    int half = hd / 2;\n"
+    "    long long total = (long long)tokens * heads * half;\n"
+    "    for (long long z = blockIdx.x * (long long)blockDim.x + threadIdx.x; z < total;\n"
+    "         z += (long long)gridDim.x * blockDim.x) {\n"
+    "        int i = (int)(z % half);\n"
+    "        long long th = z / half, t = th / heads;\n"
+    "        int h = (int)(th % heads);\n"
+    "        float *v = x + t * stride + (long long)h * hd;\n"
+    "        const float *cv = table + t * pitch, *sv = cv + half;\n"
+    "        float a = v[i], b = v[i + half];\n"
+    "        v[i] = a * cv[i] - b * sv[i];\n"
+    "        v[i + half] = b * cv[i] + a * sv[i];\n"
+    "    }\n"
+    "}\n"
+    "\n"
+    "/* One block per token and head: each key's score is a double sum in index\n"
+    " * order, as dg_dot_ref; the maximum is order-free; exponentials use\n"
+    " * dg_expf; the denominator is summed in key order on one thread; and each\n"
+    " * output value sums its weighted values in key order. */\n"
+    "extern \"C\" __global__ void dg_attention(float *out, const float *q, const float *k,\n"
+    "        const float *v, const float *k_old, const float *v_old, const int *seg_old,\n"
+    "        const int *seg_base, int n, int seq, int heads, int kvh, int hd, int canvas, int "
+    "full,\n"
+    "        int window) {\n"
+    "    __shared__ float ts[DG_ROW_MAX];\n"
+    "    __shared__ float qs[DG_HEAD_MAX];\n"
+    "    __shared__ float red[DG_THREADS];\n"
+    "    __shared__ float den;\n"
+    "    int tx = threadIdx.x, bd = blockDim.x, qn = heads * hd, kn = kvh * hd;\n"
+    "    for (int job = blockIdx.x; job < n * heads; job += gridDim.x) {\n"
+    "        int ti = job / heads, h = job % heads, s = ti / seq, t = ti % seq, old = seg_old[s];\n"
+    "        int kh = h / (heads / kvh), end = canvas ? old + seq : old + t + 1, start = 0;\n"
+    "        if (!full) {\n"
+    "            if (canvas) {\n"
+    "                int pos = old + t;\n"
+    "                start = pos >= window ? pos - window + 1 : 0;\n"
+    "                if (end > pos + window)\n"
+    "                    end = pos + window;\n"
+    "            } else\n"
+    "                start = end > window ? end - window : 0;\n"
+    "        }\n"
+    "        size_t cached = (size_t)seg_base[s], own = (size_t)s * seq, head = (size_t)kh * hd;\n"
+    "        __syncthreads();\n"
+    "        for (int i = tx; i < hd; i += bd)\n"
+    "            qs[i] = q[(size_t)ti * qn + (size_t)h * hd + i];\n"
+    "        __syncthreads();\n"
+    "        float mx = -3.402823466e+38f;\n"
+    "        for (int j = start + tx; j < end; j += bd) {\n"
+    "            const float *kk = j < old ? k_old + (cached + j) * kn + head\n"
+    "                                      : k + (own + (j - old)) * kn + head;\n"
+    "            double sum = 0;\n"
+    "            for (int i = 0; i < hd; i++)\n"
+    "                sum += (double)qs[i] * kk[i];\n"
+    "            ts[j] = (float)sum;\n"
+    "            if (ts[j] > mx)\n"
+    "                mx = ts[j];\n"
+    "        }\n"
+    "        red[tx] = mx;\n"
+    "        __syncthreads();\n"
+    "        for (int w = bd / 2; w > 0; w >>= 1) {\n"
+    "            if (tx < w && red[tx + w] > red[tx])\n"
+    "                red[tx] = red[tx + w];\n"
+    "            __syncthreads();\n"
+    "        }\n"
+    "        mx = red[0];\n"
+    "        for (int j = start + tx; j < end; j += bd)\n"
+    "            ts[j] = dg_expf(ts[j] - mx);\n"
+    "        __syncthreads();\n"
+    "        if (tx == 0) {\n"
+    "            float sum = 0;\n"
+    "            for (int j = start; j < end; j++)\n"
+    "                sum += ts[j];\n"
+    "            den = sum;\n"
+    "        }\n"
+    "        __syncthreads();\n"
+    "        for (int j = start + tx; j < end; j += bd)\n"
+    "            ts[j] = ts[j] / den;\n"
+    "        __syncthreads();\n"
+    "        for (int d = tx; d < hd; d += bd) {\n"
+    "            float o = 0;\n",
+    "            for (int j = start; j < end; j++)\n"
+    "                o += ts[j] * (j < old ? v_old[(cached + j) * kn + head + d]\n"
+    "                                      : v[(own + (j - old)) * kn + head + d]);\n"
+    "            out[(size_t)ti * qn + (size_t)h * hd + d] = o;\n"
+    "        }\n"
+    "    }\n"
     "}\n"};
 
 /* The kernel's struct dg_tile: tokens start..start + count - 1 use matrix
@@ -3395,12 +3516,14 @@ enum {
     DG_CUDA_NVFP4_QDQ,
     DG_CUDA_GATHER,
     DG_CUDA_MOE_TAIL,
+    DG_CUDA_ROPE,
+    DG_CUDA_ATTENTION,
     DG_CUDA_KERNELS
 };
 
 static const char *const dg_cuda_kernel_names[DG_CUDA_KERNELS] = {
-    "dg_nvfp4_mm",  "dg_bf16_mm", "dg_rms",     "dg_gelu_mul",
-    "dg_nvfp4_qdq", "dg_gather",  "dg_moe_tail"};
+    "dg_nvfp4_mm", "dg_bf16_mm",  "dg_rms",  "dg_gelu_mul", "dg_nvfp4_qdq",
+    "dg_gather",   "dg_moe_tail", "dg_rope", "dg_attention"};
 
 /* The driver and NVRTC entry points, and the process-wide context and
  * kernels. */
@@ -3416,6 +3539,7 @@ static struct {
     CUresult (*free)(CUdeviceptr);
     CUresult (*htod)(CUdeviceptr, const void *, size_t);
     CUresult (*dtoh)(void *, CUdeviceptr, size_t);
+    CUresult (*dtod)(CUdeviceptr, CUdeviceptr, size_t);
     CUresult (*launch)(CUfunction, unsigned, unsigned, unsigned, unsigned, unsigned, unsigned,
                        unsigned, void *, void **, void **);
     nvrtcResult (*create)(nvrtcProgram *, const char *, const char *, int, const char *const *,
@@ -3443,15 +3567,26 @@ static int dg_cuda_symbol(void *lib, const char *name, void *slot) {
  * frame may unwind through, so it records a failure for dg_accel() to report
  * and allocates with plain malloc. */
 static void dg_cuda_compile(int major, int minor) {
-    char arch[48], tile_rows[32], tile_tokens[32], bf16_tokens[32], row_max[32];
+    char arch[48], tile_rows[32], tile_tokens[32], bf16_tokens[32], row_max[32], head_max[32],
+        threads[32];
     snprintf(arch, sizeof arch, "--gpu-architecture=compute_%d%d", major, minor);
     snprintf(tile_rows, sizeof tile_rows, "-DDG_ROWS=%d", DG_CUDA_ROWS);
     snprintf(tile_tokens, sizeof tile_tokens, "-DDG_TOKENS=%d", DG_CUDA_TOKENS);
     snprintf(bf16_tokens, sizeof bf16_tokens, "-DDG_BTOKENS=%d", DG_CUDA_BF16_TOKENS);
     snprintf(row_max, sizeof row_max, "-DDG_ROW_MAX=%d", DG_CUDA_ROW_MAX);
-    const char *options[] = {arch,          "--fmad=false", "--prec-div=true", "--prec-sqrt=true",
-                             "--ftz=false", tile_rows,      tile_tokens,       bf16_tokens,
-                             row_max};
+    snprintf(head_max, sizeof head_max, "-DDG_HEAD_MAX=%d", DG_FULL_HEAD_DIM);
+    snprintf(threads, sizeof threads, "-DDG_THREADS=%d", DG_CUDA_THREADS);
+    const char *options[] = {arch,
+                             "--fmad=false",
+                             "--prec-div=true",
+                             "--prec-sqrt=true",
+                             "--ftz=false",
+                             tile_rows,
+                             tile_tokens,
+                             bf16_tokens,
+                             row_max,
+                             head_max,
+                             threads};
     /* The source is split into pieces short enough for ISO C string
      * literals. */
     size_t length = 1;
@@ -3516,6 +3651,7 @@ static void dg_cuda_open(void) {
                  dg_cuda_symbol(cu, "cuMemFree_v2", &dg_cuda.free) &
                  dg_cuda_symbol(cu, "cuMemcpyHtoD_v2", &dg_cuda.htod) &
                  dg_cuda_symbol(cu, "cuMemcpyDtoH_v2", &dg_cuda.dtoh) &
+                 dg_cuda_symbol(cu, "cuMemcpyDtoD_v2", &dg_cuda.dtod) &
                  dg_cuda_symbol(cu, "cuLaunchKernel", &dg_cuda.launch) &
                  dg_cuda_symbol(rtc, "nvrtcCreateProgram", &dg_cuda.create) &
                  dg_cuda_symbol(rtc, "nvrtcCompileProgram", &dg_cuda.compile) &
@@ -3579,27 +3715,16 @@ static void dg_cuda_to_host(void *dst, DGDevice src, size_t bytes) {
 }
 
 static void dg_cuda_release(DGAccelMatrix *a) {
-    if (a->w)
-        dg_cuda_free(a->w);
-    if (a->s)
-        dg_cuda_free(a->s);
     jb_release(a);
 }
 
-static DGAccelMatrix *dg_cuda_upload(const DGNvMatrix *m, int rows, int cols) {
+static DGAccelMatrix *dg_cuda_matrix(DGDevice w, DGDevice s, float global, int rows, int cols) {
     DGAccelMatrix *a = xcalloc(1, sizeof *a);
-    size_t wb = (size_t)rows * cols / 2, sb = (size_t)rows * cols / 16;
-    a->global = m->global;
+    a->w = w;
+    a->s = s;
+    a->global = global;
     a->rows = rows;
     a->cols = cols;
-    a->w = dg_cuda_alloc(wb);
-    a->s = a->w ? dg_cuda_alloc(sb) : 0;
-    if (!a->s) {
-        dg_cuda_release(a);
-        return NULL;
-    }
-    dg_cuda_to_device(a->w, m->w, wb);
-    dg_cuda_to_device(a->s, m->s, sb);
     return a;
 }
 
@@ -3696,6 +3821,34 @@ static void dg_cuda_gather(DGDevice dst, DGDevice src, DGDevice index, int rows,
     dg_cuda_launch(DG_CUDA_GATHER, dg_cuda_blocks(rows, 1, 1u << 30), 1, DG_CUDA_THREADS, args);
 }
 
+static void dg_cuda_copy(DGDevice dst, DGDevice src, size_t bytes) {
+    dg_cuda_current();
+    dg_cuda_check(dg_cuda.dtod((CUdeviceptr)dst, (CUdeviceptr)src, bytes), "cuMemcpyDtoD");
+}
+
+static void dg_cuda_rope(DGDevice x, DGDevice table, int tokens, int heads, int hd, int stride) {
+    CUdeviceptr dx = x, dt = table;
+    int pitch = DG_FULL_HEAD_DIM;
+    void *args[] = {&dx, &dt, &tokens, &heads, &hd, &stride, &pitch};
+    dg_cuda_launch(DG_CUDA_ROPE,
+                   dg_cuda_blocks((long long)tokens * heads * (hd / 2), DG_CUDA_THREADS, 1u << 20),
+                   1, DG_CUDA_THREADS, args);
+}
+
+static void dg_cuda_attention(DGDevice a, DGDevice q, DGDevice k, DGDevice v, DGDevice k_old,
+                              DGDevice v_old, DGDevice seg_old, DGDevice seg_base, int n, int seq,
+                              int kvh, int hd, int canvas, int full, int max_keys) {
+    if (max_keys > DG_CUDA_ROW_MAX || hd > DG_FULL_HEAD_DIM)
+        die("accelerator attention span is too long");
+    CUdeviceptr da = a, dq = q, dk = k, dv = v, dko = k_old, dvo = v_old, dso = seg_old,
+                dsb = seg_base;
+    int heads = DG_HEADS, window = DG_LOCAL_WINDOW;
+    void *args[] = {&da, &dq,  &dk,    &dv,  &dko, &dvo,    &dso,  &dsb,
+                    &n,  &seq, &heads, &kvh, &hd,  &canvas, &full, &window};
+    dg_cuda_launch(DG_CUDA_ATTENTION, dg_cuda_blocks((long long)n * heads, 1, 1u << 30), 1,
+                   DG_CUDA_THREADS, args);
+}
+
 static void dg_cuda_moe_tail(DGDevice x, DGDevice eo, DGDevice slot, DGDevice weight, DGDevice d,
                              DGDevice p2, DGDevice post, float scalar, int tokens) {
     CUdeviceptr dx = x, deo = eo, dslot = slot, dweight = weight, dd = d, dp2 = p2, dpost = post;
@@ -3707,7 +3860,7 @@ static void dg_cuda_moe_tail(DGDevice x, DGDevice eo, DGDevice slot, DGDevice we
 static const DGAccelOps *dg_accel(void) {
     static pthread_once_t once = PTHREAD_ONCE_INIT;
     static const DGAccelOps cuda = {"cuda",
-                                    dg_cuda_upload,
+                                    dg_cuda_matrix,
                                     dg_cuda_release,
                                     dg_cuda_alloc,
                                     dg_cuda_free,
@@ -3720,6 +3873,9 @@ static const DGAccelOps *dg_accel(void) {
                                     dg_cuda_gelu_mul,
                                     dg_cuda_nvfp4_qdq,
                                     dg_cuda_gather,
+                                    dg_cuda_copy,
+                                    dg_cuda_rope,
+                                    dg_cuda_attention,
                                     dg_cuda_moe_tail};
     pthread_once(&once, dg_cuda_open);
     if (dg_cuda.failure)
@@ -3763,11 +3919,24 @@ static void jb_workspace_plan(size_t *used, size_t count, size_t element_size) {
 }
 
 static size_t dg_attention_workspace_bytes(int n, int old, int seq, int segments,
-                                           int wrapper_arrays) {
+                                           int wrapper_arrays, int accel) {
     size_t used = 0;
     if (wrapper_arrays && segments > 1) {
         jb_workspace_plan(&used, (size_t)segments, sizeof(DGKV *));
         jb_workspace_plan(&used, (size_t)segments, sizeof(int));
+    }
+    /* dg_attention_accel: rotary tables, segment tables, and K and V for
+     * the K/V output, at the widest width. */
+    if (accel) {
+        int kn = DG_LOCAL_KV_HEADS * DG_LOCAL_HEAD_DIM > DG_FULL_KV_HEADS * DG_FULL_HEAD_DIM
+                     ? DG_LOCAL_KV_HEADS * DG_LOCAL_HEAD_DIM
+                     : DG_FULL_KV_HEADS * DG_FULL_HEAD_DIM;
+        jb_workspace_plan(&used, (size_t)n * DG_FULL_HEAD_DIM, sizeof(float));
+        jb_workspace_plan(&used, (size_t)segments, sizeof(int));
+        jb_workspace_plan(&used, (size_t)segments, sizeof(int));
+        jb_workspace_plan(&used, (size_t)n * kn, sizeof(float));
+        jb_workspace_plan(&used, (size_t)n * kn, sizeof(float));
+        return used;
     }
     /* Full attention has the largest Q/K/V projections in this model. */
     int qn = DG_HEADS * DG_FULL_HEAD_DIM;
@@ -3828,7 +3997,8 @@ static size_t dg_workspace_bytes(const DGModel *m, int n, int old, int seq, int 
         jb_workspace_plan(&persistent, (size_t)n * DG_H, sizeof(float));
         jb_workspace_plan(&persistent, (size_t)n * DG_H, sizeof(float));
     }
-    size_t attention = dg_attention_workspace_bytes(n, old, seq, segments, wrapper_arrays);
+    size_t attention =
+        dg_attention_workspace_bytes(n, old, seq, segments, wrapper_arrays, m->accel != NULL);
     size_t ff = dg_ff_workspace_bytes(m, n);
     return jb_size_add(persistent, attention > ff ? attention : ff);
 }
@@ -3881,10 +4051,20 @@ static void dg_workspace_destroy(DGWorkspace *workspace) {
  * either layer kind. */
 typedef struct {
     DGDevice x, res, z, q, k, v, a, g, u, d, z2, rin, route, qz2, weight, index, slot, flag, gather,
-        eg, eh, eqh, eo, scratch;
+        eg, eh, eqh, eo, scratch, rope, seg_old, seg_base, kv_k, kv_v;
+    /* Rows of the widest K/V width that kv_k and kv_v each hold. */
+    int kv_rows;
 } DGDeviceLayout;
 
-static size_t dg_device_layout(DGDeviceLayout *d, DGDevice base, int n, const DGAccelOps *a) {
+/* A forward call's device workspace: its base, and how many cached K/V rows
+ * it holds for attention. */
+typedef struct {
+    DGDevice base;
+    int kv_rows;
+} DGDeviceWork;
+
+static size_t dg_device_layout(DGDeviceLayout *d, DGDevice base, int n, int kv_rows,
+                               const DGAccelOps *a) {
     size_t at = 0, total = (size_t)n * DG_TOPK;
     size_t qn = DG_HEADS * DG_FULL_HEAD_DIM,
            kn = DG_LOCAL_KV_HEADS * DG_LOCAL_HEAD_DIM > DG_FULL_KV_HEADS * DG_FULL_HEAD_DIM
@@ -3916,17 +4096,24 @@ static size_t dg_device_layout(DGDeviceLayout *d, DGDevice base, int n, const DG
     DG_CARVE(eqh, jb_size_mul(total, DG_MOE * 4));
     DG_CARVE(eo, jb_size_mul(total, DG_H * 4));
     DG_CARVE(scratch, a->nvfp4_scratch((int)total));
+    DG_CARVE(rope, jb_size_mul((size_t)n, DG_FULL_HEAD_DIM * 4));
+    DG_CARVE(seg_old, jb_size_mul((size_t)n, 4));
+    DG_CARVE(seg_base, jb_size_mul((size_t)n, 4));
+    DG_CARVE(kv_k, jb_size_mul((size_t)kv_rows, kn * 4));
+    DG_CARVE(kv_v, jb_size_mul((size_t)kv_rows, kn * 4));
 #undef DG_CARVE
+    d->kv_rows = kv_rows;
     return at;
 }
 
-/* The session's device workspace for n tokens, grown as needed; 0 when the
- * model runs on the CPU kernels. */
-static DGDevice dg_device_begin(DGWorkspace *owner, const DGModel *m, int n) {
+/* The session's device workspace for n tokens and kv_rows cached K/V rows,
+ * grown as needed; its base is 0 when the model runs on the CPU kernels. */
+static DGDeviceWork dg_device_begin(DGWorkspace *owner, const DGModel *m, int n, int kv_rows) {
+    DGDeviceWork work = {0, kv_rows};
     if (!m->accel)
-        return 0;
+        return work;
     DGDeviceLayout d;
-    size_t bytes = dg_device_layout(&d, 0, n, m->accel);
+    size_t bytes = dg_device_layout(&d, 0, n, kv_rows, m->accel);
     if (owner->device_bytes < bytes) {
         if (owner->device)
             m->accel->free(owner->device);
@@ -3936,7 +4123,8 @@ static DGDevice dg_device_begin(DGWorkspace *owner, const DGModel *m, int n) {
             die("accelerator out of memory for activations");
         owner->device_bytes = bytes;
     }
-    return owner->device;
+    work.base = owner->device;
+    return work;
 }
 
 /* dg_mm's checks, then the accelerator's product. */
@@ -4080,14 +4268,135 @@ static void dg_attention(DGModel *m, int l, float *x, int n, int pos0, const DGK
     jb_arena_reset(workspace, mark);
 }
 
+/* Each segment's K/V output: its cached rows, then its own useful ones. */
+static void dg_kv_output(DGKV *out, const DGKV *const *cache, const int *lens, int segments,
+                         int seq, int kn, const float *k, const float *v) {
+    for (int s = 0; s < segments; s++) {
+        int old = cache ? cache[s]->n : 0, keep = lens[s];
+        if (out[s].n != old + keep || !out[s].k || !out[s].v)
+            die("K/V output does not match planned storage");
+        if (old) {
+            memcpy(out[s].k, cache[s]->k, (size_t)old * kn * 4);
+            memcpy(out[s].v, cache[s]->v, (size_t)old * kn * 4);
+        }
+        memcpy(out[s].k + (size_t)old * kn, k + (size_t)s * seq * kn, (size_t)keep * kn * 4);
+        memcpy(out[s].v + (size_t)old * kn, v + (size_t)s * seq * kn, (size_t)keep * kn * 4);
+    }
+}
+
+/* dg_attention_segments on the accelerator, from dev->z to dev->z. The
+ * rotary tables are computed on the host, with the C library's cosf and
+ * sinf as the reference computes them. Each distinct cache's rows are
+ * uploaded for the call; K and V come back only for a K/V output. */
+static void dg_attention_accel(DGModel *m, int l, int segments, int seq, int pos0,
+                               const DGKV *const *cache, const int *lens, DGKV *out, int mode,
+                               JBArena *workspace, const DGDeviceLayout *dev) {
+    const DGAccelOps *a = m->accel;
+    size_t mark = jb_arena_mark(workspace);
+    int n = segments * seq;
+    JB_TICK(qkv_start);
+    int full = l % DG_FULL_EVERY == DG_FULL_EVERY - 1;
+    int hd = full ? DG_FULL_HEAD_DIM : DG_LOCAL_HEAD_DIM;
+    int kvh = full ? DG_FULL_KV_HEADS : DG_LOCAL_KV_HEADS;
+    int qn = DG_HEADS * hd, kn = kvh * hd;
+    int widest = DG_LOCAL_KV_HEADS * DG_LOCAL_HEAD_DIM > DG_FULL_KV_HEADS * DG_FULL_HEAD_DIM
+                     ? DG_LOCAL_KV_HEADS * DG_LOCAL_HEAD_DIM
+                     : DG_FULL_KV_HEADS * DG_FULL_HEAD_DIM;
+    DGTensor *qw = dg_layer_tensor(m, l, "self_attn.q_proj.weight");
+    DGTensor *kw = dg_layer_tensor(m, l, "self_attn.k_proj.weight");
+    DGTensor *vw = full ? NULL : dg_layer_tensor(m, l, "self_attn.v_proj.weight");
+    DGTensor *qnrm = dg_layer_tensor(m, l, "self_attn.q_norm.weight");
+    DGTensor *knrm = dg_layer_tensor(m, l, "self_attn.k_norm.weight");
+    DGTensor *ow = dg_layer_tensor(m, l, "self_attn.o_proj.weight");
+    float *table = jb_arena_alloc(workspace, (size_t)n * DG_FULL_HEAD_DIM, sizeof *table, 0);
+    int *seg_old = jb_arena_alloc(workspace, (size_t)segments, sizeof *seg_old, 0),
+        *seg_base = jb_arena_alloc(workspace, (size_t)segments, sizeof *seg_base, 0);
+    float *k = jb_arena_alloc(workspace, (size_t)n * widest, sizeof *k, 0),
+          *v = jb_arena_alloc(workspace, (size_t)n * widest, sizeof *v, 0);
+    dg_mm_accel(m, qw, dev->z, dev->q, n, qn, DG_H);
+    dg_mm_accel(m, kw, dev->z, dev->k, n, kn, DG_H);
+    if (vw)
+        dg_mm_accel(m, vw, dev->z, dev->v, n, kn, DG_H);
+    else
+        a->copy(dev->v, dev->k, (size_t)n * kn * 4);
+    JB_TO(attention_qkv, qkv_start);
+    JB_TICK(prepare_start);
+    int half = hd / 2, rotated = full ? DG_FULL_ROPE_DIM : half;
+    float inv[DG_FULL_HEAD_DIM / 2];
+    for (int i = 0; i < half; i++)
+        inv[i] = i < rotated ? powf(full ? 1000000.0f : 10000.0f, -(float)(2 * i) / hd) : 0;
+    for (int ti = 0; ti < n; ti++) {
+        int s = ti / seq, t = ti % seq, old = cache ? cache[s]->n : 0,
+            pos = (cache ? old : pos0) + t;
+        float *cv = table + (size_t)ti * DG_FULL_HEAD_DIM, *sv = cv + half;
+        for (int i = 0; i < half; i++) {
+            cv[i] = cosf(pos * inv[i]);
+            sv[i] = sinf(pos * inv[i]);
+        }
+    }
+    a->to_device(dev->rope, table, (size_t)n * DG_FULL_HEAD_DIM * 4);
+    a->rms(dev->q, dev->q, qnrm->device, 0, 0, 0, n * DG_HEADS, hd);
+    a->rms(dev->k, dev->k, knrm->device, 0, 0, 0, n * kvh, hd);
+    a->rms(dev->v, dev->v, 0, 0, 0, 0, n * kvh, hd);
+    a->rope(dev->q, dev->rope, n, DG_HEADS, hd, qn);
+    a->rope(dev->k, dev->rope, n, kvh, hd, kn);
+    JB_TO(attention_prepare, prepare_start);
+    JB_TICK(kv_start);
+    int rows = 0, max_keys = 0;
+    for (int s = 0; s < segments; s++) {
+        int shared = -1;
+        seg_old[s] = cache ? cache[s]->n : 0;
+        for (int e = 0; e < s && cache; e++)
+            if (cache[e] == cache[s]) {
+                shared = e;
+                break;
+            }
+        if (shared >= 0)
+            seg_base[s] = seg_base[shared];
+        else {
+            seg_base[s] = rows;
+            if ((size_t)(rows + seg_old[s]) * kn > (size_t)dev->kv_rows * widest)
+                die("accelerator K/V space exceeded");
+            if (seg_old[s]) {
+                a->to_device(dev->kv_k + (size_t)rows * kn * 4, cache[s]->k,
+                             (size_t)seg_old[s] * kn * 4);
+                a->to_device(dev->kv_v + (size_t)rows * kn * 4, cache[s]->v,
+                             (size_t)seg_old[s] * kn * 4);
+            }
+            rows += seg_old[s];
+        }
+        if (seg_old[s] + seq > max_keys)
+            max_keys = seg_old[s] + seq;
+    }
+    a->to_device(dev->seg_old, seg_old, (size_t)segments * sizeof *seg_old);
+    a->to_device(dev->seg_base, seg_base, (size_t)segments * sizeof *seg_base);
+    JB_TO(attention_kv, kv_start);
+    JB_TICK(core_start);
+    a->attention(dev->a, dev->q, dev->k, dev->v, dev->kv_k, dev->kv_v, dev->seg_old, dev->seg_base,
+                 n, seq, kvh, hd, mode == DG_CANVAS, full, max_keys);
+    JB_TO(attention_core, core_start);
+    JB_TICK(output_start);
+    dg_mm_accel(m, ow, dev->a, dev->z, n, DG_H, qn);
+    JB_TO(attention_output, output_start);
+    if (out) {
+        a->to_host(k, dev->k, (size_t)n * kn * 4);
+        a->to_host(v, dev->v, (size_t)n * kn * 4);
+        dg_kv_output(out, cache, lens, segments, seq, kn, k, v);
+    }
+    jb_arena_reset(workspace, mark);
+}
+
 /* Execute independent equal-stride sequences through one set of projections.
  * Attention never crosses a segment boundary.  Suffix segments may have
  * different useful lengths; padding is computed but never copied into K/V.
- * With dev, x is dev->z on the accelerator, which runs the projections;
- * the norms, rotary embedding, scores and K/V output stay on the host. */
+ * With dev, the accelerator runs it from dev->z to dev->z and x is unused. */
 static void dg_attention_segments(DGModel *m, int l, float *x, int segments, int seq, int pos0,
                                   const DGKV *const *cache, const int *lens, DGKV *out, int mode,
                                   JBArena *workspace, const DGDeviceLayout *dev) {
+    if (dev) {
+        dg_attention_accel(m, l, segments, seq, pos0, cache, lens, out, mode, workspace, dev);
+        return;
+    }
     size_t mark = jb_arena_mark(workspace);
     int n = segments * seq;
     JB_TICK(qkv_start);
@@ -4103,25 +4412,12 @@ static void dg_attention_segments(DGModel *m, int l, float *x, int segments, int
     float *q = jb_arena_alloc(workspace, (size_t)n * qn, sizeof *q, 0),
           *k = jb_arena_alloc(workspace, (size_t)n * kn, sizeof *k, 0),
           *v = jb_arena_alloc(workspace, (size_t)n * kn, sizeof *v, 0);
-    if (dev) {
-        dg_mm_accel(m, qw, dev->z, dev->q, n, qn, DG_H);
-        dg_mm_accel(m, kw, dev->z, dev->k, n, kn, DG_H);
-        if (vw)
-            dg_mm_accel(m, vw, dev->z, dev->v, n, kn, DG_H);
-        m->accel->to_host(q, dev->q, (size_t)n * qn * 4);
-        m->accel->to_host(k, dev->k, (size_t)n * kn * 4);
-        if (vw)
-            m->accel->to_host(v, dev->v, (size_t)n * kn * 4);
-        else
-            memcpy(v, k, (size_t)n * kn * 4);
-    } else {
-        dg_mm(qw, x, q, n, qn, DG_H);
-        dg_mm(kw, x, k, n, kn, DG_H);
-        if (vw)
-            dg_mm(vw, x, v, n, kn, DG_H);
-        else
-            memcpy(v, k, (size_t)n * kn * 4);
-    }
+    dg_mm(qw, x, q, n, qn, DG_H);
+    dg_mm(kw, x, k, n, kn, DG_H);
+    if (vw)
+        dg_mm(vw, x, v, n, kn, DG_H);
+    else
+        memcpy(v, k, (size_t)n * kn * 4);
     JB_TO(attention_qkv, qkv_start);
     JB_TICK(prepare_start);
     int half = hd / 2, rotated = full ? DG_FULL_ROPE_DIM : half;
@@ -4213,24 +4509,10 @@ static void dg_attention_segments(DGModel *m, int l, float *x, int segments, int
     JB_TO(attention_core, core_start);
     JB_TICK(output_start);
     DGTensor *ow = dg_layer_tensor(m, l, "self_attn.o_proj.weight");
-    if (dev) {
-        m->accel->to_device(dev->a, a, (size_t)n * qn * 4);
-        dg_mm_accel(m, ow, dev->a, dev->z, n, DG_H, qn);
-    } else
-        dg_mm(ow, a, x, n, DG_H, qn);
+    dg_mm(ow, a, x, n, DG_H, qn);
     JB_TO(attention_output, output_start);
     if (out)
-        for (int s = 0; s < segments; s++) {
-            int old = cache ? cache[s]->n : 0, keep = lens[s];
-            if (out[s].n != old + keep || !out[s].k || !out[s].v)
-                die("K/V output does not match planned storage");
-            if (old) {
-                memcpy(out[s].k, cache[s]->k, (size_t)old * kn * 4);
-                memcpy(out[s].v, cache[s]->v, (size_t)old * kn * 4);
-            }
-            memcpy(out[s].k + (size_t)old * kn, k + (size_t)s * seq * kn, (size_t)keep * kn * 4);
-            memcpy(out[s].v + (size_t)old * kn, v + (size_t)s * seq * kn, (size_t)keep * kn * 4);
-        }
+        dg_kv_output(out, cache, lens, segments, seq, kn, k, v);
     jb_arena_reset(workspace, mark);
 }
 
@@ -4526,10 +4808,10 @@ typedef struct {
 /* dg_layer on the accelerator. x crosses to the device and back once;
  * device time is attributed to the next step that waits for it. */
 static void dg_layer_accel(DGModel *m, int l, float *x, int n, const DGAttentionCall *c,
-                           JBArena *workspace, DGDevice device) {
+                           JBArena *workspace, const DGDeviceWork *work) {
     const DGAccelOps *a = m->accel;
     DGDeviceLayout d;
-    dg_device_layout(&d, device, n, a);
+    dg_device_layout(&d, work->base, n, work->kv_rows, a);
     JB_TICK(layer_start);
     DGTensor *in = dg_layer_tensor(m, l, "input_layernorm.weight"),
              *pa = dg_layer_tensor(m, l, "post_attention_layernorm.weight");
@@ -4556,7 +4838,7 @@ static void dg_layer_accel(DGModel *m, int l, float *x, int n, const DGAttention
 }
 
 static void dg_layer(DGModel *m, int l, float *x, int n, int pos0, const DGKV *cache, DGKV *out,
-                     int mode, int batch, JBArena *workspace, DGDevice device) {
+                     int mode, int batch, JBArena *workspace, const DGDeviceWork *device) {
     if (device) {
         DGAttentionCall c = {batch, 0, 0, pos0, mode, cache, NULL, NULL, out};
         dg_layer_accel(m, l, x, n, &c, workspace, device);
@@ -4603,7 +4885,7 @@ static void dg_layer(DGModel *m, int l, float *x, int n, int pos0, const DGKV *c
 
 static void dg_layer_multi(DGModel *m, int l, float *x, int segments, int seq,
                            const DGKV *const *cache, const int *lens, DGKV *out, int mode,
-                           JBArena *workspace, DGDevice device) {
+                           JBArena *workspace, const DGDeviceWork *device) {
     int n = segments * seq;
     if (device) {
         DGAttentionCall c = {0, segments, seq, 0, mode, NULL, cache, lens, out};
@@ -4669,7 +4951,8 @@ static void dg_final_norm(DGModel *m, float *x, int n) {
 static void dg_prefill(DGModel *m, const int *prompt, int np, DGKV kv[DG_L], DGWorkspace *owner) {
     JBArena *workspace =
         dg_workspace_begin(owner, dg_forward_workspace_bytes(m, np, 0, np, 1, 0, 0));
-    DGDevice device = dg_device_begin(owner, m, np);
+    DGDeviceWork work = dg_device_begin(owner, m, np, 0);
+    const DGDeviceWork *device = work.base ? &work : NULL;
     float *enc = jb_arena_alloc(workspace, (size_t)np * DG_H, sizeof *enc, 0);
     JB_TICK(embed_start);
     dg_embed(m, prompt, np, 0, enc);
@@ -4684,7 +4967,8 @@ static void dg_prefill_suffix(DGModel *m, const int *token, int n, const DGKV pr
                               DGKV kv[DG_L], DGWorkspace *owner) {
     JBArena *workspace =
         dg_workspace_begin(owner, dg_forward_workspace_bytes(m, n, prefix[0].n, n, 1, 0, 0));
-    DGDevice device = dg_device_begin(owner, m, n);
+    DGDeviceWork work = dg_device_begin(owner, m, n, prefix[0].n);
+    const DGDeviceWork *device = work.base ? &work : NULL;
     float *x = jb_arena_alloc(workspace, (size_t)n * DG_H, sizeof *x, 0);
     JB_TICK(embed_start);
     dg_embed(m, token, n, 0, x);
@@ -4699,7 +4983,8 @@ static float *dg_decode(DGModel *m, DGKV kv[DG_L], int np, const int *canvas, in
                         size_t tail, DGWorkspace *owner) {
     JBArena *workspace = dg_workspace_begin(
         owner, dg_forward_workspace_bytes(m, nc * batch, kv[0].n, nc, batch, batch > 1, tail));
-    DGDevice device = dg_device_begin(owner, m, nc * batch);
+    DGDeviceWork work = dg_device_begin(owner, m, nc * batch, kv[0].n);
+    const DGDeviceWork *device = work.base ? &work : NULL;
     float *dec = jb_arena_alloc(workspace, (size_t)nc * batch * DG_H, sizeof *dec, 0);
     JB_TICK(embed_start);
     dg_embed(m, canvas, nc * batch, 1, dec);
@@ -4717,7 +5002,8 @@ static void dg_prefill_suffix_multi(DGModel *m, const int *token, const int *len
                                     DGKV *out, DGWorkspace *owner) {
     JBArena *workspace = dg_workspace_begin(
         owner, dg_forward_workspace_bytes(m, batch * seq, prefix[0].n, seq, batch, 0, 0));
-    DGDevice device = dg_device_begin(owner, m, batch * seq);
+    DGDeviceWork work = dg_device_begin(owner, m, batch * seq, prefix[0].n);
+    const DGDeviceWork *device = work.base ? &work : NULL;
     float *x = jb_arena_alloc(workspace, (size_t)batch * seq * DG_H, sizeof *x, 0);
     JB_TICK(embed_start);
     dg_embed(m, token, batch * seq, 0, x);
@@ -4746,7 +5032,8 @@ static float *dg_decode_multi(DGModel *m, DGKV *kv, const int *doc, int segments
                 maxold = kv[(size_t)doc[s] * DG_L + l].n;
     JBArena *workspace =
         dg_workspace_begin(owner, dg_forward_workspace_bytes(m, n, maxold, seq, segments, 0, tail));
-    DGDevice device = dg_device_begin(owner, m, n);
+    DGDeviceWork work = dg_device_begin(owner, m, n, segments * maxold);
+    const DGDeviceWork *device = work.base ? &work : NULL;
     float *x = jb_arena_alloc(workspace, (size_t)n * DG_H, sizeof *x, 0);
     JB_TICK(embed_start);
     dg_embed(m, canvas, n, 1, x);
@@ -7029,14 +7316,17 @@ static void dg_test_nvfp4(uint64_t *rs) {
         if (accel) {
             /* The accelerator's quantizer and product, against the
              * reference's. */
-            DGNvMatrix nm = {wd, sd, global};
-            DGAccelMatrix *am = accel->upload(&nm, rows, cols);
             size_t xb = (size_t)tokens * cols * 4, yb = (size_t)tokens * rows * 4,
-                   sb = accel->nvfp4_scratch(tokens);
+                   sb = accel->nvfp4_scratch(tokens), wb = (size_t)rows * cols / 2,
+                   scb = (size_t)rows * cols / 16;
             DGDevice dx = accel->alloc(xb), dq = accel->alloc(xb), dy = accel->alloc(yb),
-                     ds = accel->alloc(sb), df = accel->alloc(4);
-            if (!am || !dx || !dq || !dy || !ds || !df)
+                     ds = accel->alloc(sb), df = accel->alloc(4), dw = accel->alloc(wb),
+                     dsc = accel->alloc(scb);
+            if (!dx || !dq || !dy || !ds || !df || !dw || !dsc)
                 die2("accelerator self-test failed: device memory", accel->name);
+            accel->to_device(dw, wd, wb);
+            accel->to_device(dsc, sd, scb);
+            DGAccelMatrix *am = accel->matrix(dw, dsc, global, rows, cols);
             int flag = 0, *group = xcalloc((size_t)tokens, sizeof *group);
             float *xd = xmalloc(xb);
             accel->to_device(dx, x, xb);
@@ -7057,6 +7347,8 @@ static void dg_test_nvfp4(uint64_t *rs) {
             jb_release(group);
             jb_release(xd);
             accel->release(am);
+            accel->free(dw);
+            accel->free(dsc);
             accel->free(dx);
             accel->free(dq);
             accel->free(dy);
@@ -7326,6 +7618,102 @@ static void dg_test_accel_layer(uint64_t *rs) {
         jb_release(host[i]);
 }
 
+/* The accelerator's rotary embedding and attention against the reference's
+ * loops, on a local-layer shape: two segments sharing one cache, and one
+ * without, in canvas and causal modes. Bit for bit in strict builds. */
+static void dg_test_accel_attention(uint64_t *rs) {
+    const DGAccelOps *a = dg_accel();
+    if (!a)
+        return;
+
+    enum { segments = 3, seq = 4, n = segments * seq, hd = DG_LOCAL_HEAD_DIM };
+
+    int kvh = DG_LOCAL_KV_HEADS, qn = DG_HEADS * hd, kn = kvh * hd, half = hd / 2;
+    int seg_old[segments] = {6, 6, 0}, seg_base[segments] = {0, 0, 6}, rows = 6;
+    size_t qb = (size_t)n * qn * 4, kb = (size_t)n * kn * 4, ob = (size_t)rows * kn * 4,
+           tb = (size_t)n * DG_FULL_HEAD_DIM * 4;
+    float *q = xmalloc(qb), *k = xmalloc(kb), *v = xmalloc(kb), *ko = xmalloc(ob),
+          *vo = xmalloc(ob), *table = xcalloc((size_t)n * DG_FULL_HEAD_DIM, 4), *want = xmalloc(qb),
+          *got = xmalloc(qb), *ts = xmalloc((size_t)(rows + seq) * 4);
+    for (size_t i = 0; i < (size_t)n * qn; i++)
+        q[i] = jb_rng_unit(rs);
+    for (size_t i = 0; i < (size_t)n * kn; i++) {
+        k[i] = jb_rng_unit(rs);
+        v[i] = jb_rng_unit(rs);
+    }
+    for (size_t i = 0; i < (size_t)rows * kn; i++) {
+        ko[i] = jb_rng_unit(rs);
+        vo[i] = jb_rng_unit(rs);
+    }
+    for (int t = 0; t < n; t++)
+        for (int i = 0; i < half; i++) {
+            table[(size_t)t * DG_FULL_HEAD_DIM + i] = cosf((float)(t * 7 + i));
+            table[(size_t)t * DG_FULL_HEAD_DIM + half + i] = sinf((float)(t * 7 + i));
+        }
+    DGDevice dq = a->alloc(qb), dk = a->alloc(kb), dv = a->alloc(kb), dko = a->alloc(ob),
+             dvo = a->alloc(ob), dt = a->alloc(tb), dout = a->alloc(qb),
+             dso = a->alloc(sizeof seg_old), dsb = a->alloc(sizeof seg_base);
+    if (!dq || !dk || !dv || !dko || !dvo || !dt || !dout || !dso || !dsb)
+        die2("accelerator self-test failed: device memory", a->name);
+    a->to_device(dk, k, kb);
+    a->to_device(dv, v, kb);
+    a->to_device(dko, ko, ob);
+    a->to_device(dvo, vo, ob);
+    a->to_device(dt, table, tb);
+    a->to_device(dso, seg_old, sizeof seg_old);
+    a->to_device(dsb, seg_base, sizeof seg_base);
+    /* Rotary embedding. */
+    a->to_device(dq, q, qb);
+    a->rope(dq, dt, n, DG_HEADS, hd, qn);
+    for (int t = 0; t < n; t++)
+        dg_rope(q + (size_t)t * qn, DG_HEADS, hd, table + (size_t)t * DG_FULL_HEAD_DIM,
+                table + (size_t)t * DG_FULL_HEAD_DIM + half);
+    a->to_host(got, dq, qb);
+    if (JB_STRICT_MATH && memcmp(got, q, qb))
+        die2("accelerator self-test failed: differs from the reference", "rotary embedding");
+    /* Attention, canvas then causal. */
+    for (int canvas = 1; canvas >= 0; canvas--) {
+        for (int ti = 0; ti < n; ti++)
+            for (int h = 0; h < DG_HEADS; h++) {
+                int s = ti / seq, t = ti % seq, old = seg_old[s], kh = h / (DG_HEADS / kvh);
+                int end = canvas ? old + seq : old + t + 1;
+                const float *qq = q + (size_t)ti * qn + (size_t)h * hd;
+                float mx = -FLT_MAX, den = 0, *oo = want + (size_t)ti * qn + (size_t)h * hd;
+                for (int j = 0; j < end; j++) {
+                    const float *kk = j < old ? ko + ((size_t)seg_base[s] + j) * kn
+                                              : k + ((size_t)s * seq + j - old) * kn;
+                    ts[j] = (float)dg_dot_ref(qq, kk + (size_t)kh * hd, hd);
+                    if (ts[j] > mx)
+                        mx = ts[j];
+                }
+                for (int j = 0; j < end; j++) {
+                    ts[j] = dg_expf(ts[j] - mx);
+                    den += ts[j];
+                }
+                memset(oo, 0, (size_t)hd * 4);
+                for (int j = 0; j < end; j++) {
+                    float p = ts[j] / den;
+                    const float *vv = j < old ? vo + ((size_t)seg_base[s] + j) * kn
+                                              : v + ((size_t)s * seq + j - old) * kn;
+                    for (int d = 0; d < hd; d++)
+                        oo[d] += p * vv[(size_t)kh * hd + d];
+                }
+            }
+        a->attention(dout, dq, dk, dv, dko, dvo, dso, dsb, n, seq, kvh, hd, canvas, 0, rows + seq);
+        a->to_host(got, dout, qb);
+        for (size_t i = 0; i < (size_t)n * qn; i++)
+            jb_check_close(a->name, got[i], want[i], 1e-5 * (1 + fabs(want[i])));
+        if (JB_STRICT_MATH && memcmp(got, want, qb))
+            die2("accelerator self-test failed: differs from the reference", "attention");
+    }
+    DGDevice all[] = {dq, dk, dv, dko, dvo, dt, dout, dso, dsb};
+    for (size_t i = 0; i < sizeof all / sizeof *all; i++)
+        a->free(all[i]);
+    void *host[] = {q, k, v, ko, vo, table, want, got, ts};
+    for (size_t i = 0; i < sizeof host / sizeof *host; i++)
+        jb_release(host[i]);
+}
+
 /* Distance in float units in the last place from a double reference. */
 static double jb_float_ulps(float got, double want) {
     double spacing = fabs(want) < FLT_MIN ? 0x1p-149 : ldexp(1.0, ilogb(want) - 23);
@@ -7440,6 +7828,7 @@ static void dg_kernel_selftest(void) {
     dg_test_dots(&rs);
     dg_test_portable_math();
     dg_test_accel_layer(&rs);
+    dg_test_accel_attention(&rs);
     dg_test_nonfinite_activation();
 }
 
