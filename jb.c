@@ -1044,10 +1044,11 @@ typedef struct {
      * scores against a segment's cached keys, rows seg_base[s]... of k_old
      * and v_old (seg_old[s] of them), then its own, a softmax with dg_expf,
      * and the weighted values into a, each in the reference's order.
-     * max_keys bounds any token's cached plus own keys. */
+     * max_keys bounds any token's cached plus own keys; k_old holds old_rows
+     * rows, and scratch (n + old_rows) * kvh * hd floats. */
     void (*attention)(DGDevice a, DGDevice q, DGDevice k, DGDevice v, DGDevice k_old,
                       DGDevice v_old, DGDevice seg_old, DGDevice seg_base, int n, int seq, int kvh,
-                      int hd, int canvas, int full, int max_keys);
+                      int hd, int canvas, int full, int max_keys, int old_rows, DGDevice scratch);
     /* dg_ff's tail per token t: the routed experts' rows eo[slot[t, k]],
      * weighted by weight[t, k] and summed in k order, normalized by p2,
      * added to d, normalized by post, added to x, and x scaled by scalar. */
@@ -3130,6 +3131,30 @@ static const char *const dg_cuda_source[] = {
     "    return .5f * x * (1.0f + dg_tanhf(.7978845608028654f * (x + .044715f * x * x * x)));\n"
     "}\n"
     "\n"
+    "__device__ double dg_exact_product(float a, float b) {\n"
+    "    unsigned ua = __float_as_uint(a), ub = __float_as_uint(b);\n"
+    "    unsigned ea = (ua >> 23) & 255, eb = (ub >> 23) & 255;\n"
+    "    if (ea == 255 || eb == 255)\n"
+    "        return (double)a * b;\n"
+    "    unsigned long long sign = (unsigned long long)((ua ^ ub) >> 31) << 63;\n"
+    "    unsigned ma = ua & 0x7fffffu, mb = ub & 0x7fffffu;\n"
+    "    if (ea)\n"
+    "        ma |= 0x800000u;\n"
+    "    else\n"
+    "        ea = 1;\n"
+    "    if (eb)\n"
+    "        mb |= 0x800000u;\n"
+    "    else\n"
+    "        eb = 1;\n"
+    "    unsigned long long m = (unsigned long long)ma * mb;\n"
+    "    if (!m)\n"
+    "        return __longlong_as_double((long long)sign);\n"
+    "    int lz = __clzll((long long)m);\n",
+    "    unsigned long long e = (unsigned long long)(63 - lz + (int)ea + (int)eb - 300 + 1023);\n"
+    "    unsigned long long frac = (m << (lz + 1)) >> 12;\n"
+    "    return __longlong_as_double((long long)(sign | (e << 52) | frac));\n"
+    "}\n"
+    "\n"
     "/* dg_rms_inverse from the row's squares, which are exact in double and\n"
     " * computed in parallel beforehand; only the additions are sequential. */\n"
     "__device__ float dg_rms_inverse_squares(const double *sq, int n) {\n"
@@ -3145,7 +3170,7 @@ static const char *const dg_cuda_source[] = {
     "        float *y, int rows, int cols) {\n"
     "    __shared__ float e2m1[16];\n"
     "    __shared__ uint2 ws[DG_BLOCKS][DG_ROWS + 1];\n"
-    "    __shared__ float ss[DG_BLOCKS][DG_ROWS + 1];\n",
+    "    __shared__ float ss[DG_BLOCKS][DG_ROWS + 1];\n"
     "    __shared__ float xs[DG_TOKENS][DG_BLOCKS * 16];\n"
     "    int tx = threadIdx.x, r0 = blockIdx.x * DG_ROWS, r = r0 + tx, blocks = cols / 16;\n"
     "    if (tx < 16) {\n"
@@ -3205,7 +3230,7 @@ static const char *const dg_cuda_source[] = {
     "                for (int k = 0; k < 8; k++) {\n"
     "                    unsigned v = ((k < 4 ? q.x : q.y) >> (8 * (k & 3))) & 255;\n"
     "                    float wl = e2m1[v & 15], wh = e2m1[v >> 4];\n"
-    "#pragma unroll\n"
+    "#pragma unroll\n",
     "                    for (int t = 0; t < DG_TOKENS; t++)\n"
     "                        if (t < tile.count)\n"
     "                            sum[t] += scale * (wl * xs[t][b * 16 + k * 2] +\n"
@@ -3227,7 +3252,7 @@ static const char *const dg_cuda_source[] = {
     "dg_bf16_mm(const unsigned short *w, const float *x, float *y, int tokens, int rows,\n"
     "        int cols) {\n"
     "    __shared__ unsigned ws[DG_BCOLS / 2][DG_ROWS + 1];\n"
-    "    __shared__ float xs[DG_BTOKENS][DG_BCOLS];\n",
+    "    __shared__ float xs[DG_BTOKENS][DG_BCOLS];\n"
     "    int tx = threadIdx.x, r0 = blockIdx.x * DG_ROWS, r = r0 + tx;\n"
     "    int ntiles = (tokens + DG_BTOKENS - 1) / DG_BTOKENS;\n"
     "    for (int ti = blockIdx.y; ti < ntiles; ti += gridDim.y) {\n"
@@ -3284,7 +3309,7 @@ static const char *const dg_cuda_source[] = {
     "#pragma unroll\n"
     "                for (int t = 0; t < DG_BTOKENS; t++)\n"
     "                    if (t < count) {\n"
-    "                        sum[t] += a0 * xs[t][pr * 2];\n"
+    "                        sum[t] += a0 * xs[t][pr * 2];\n",
     "                        sum[t] += a1 * xs[t][pr * 2 + 1];\n"
     "                    }\n"
     "            }\n"
@@ -3306,7 +3331,7 @@ static const char *const dg_cuda_source[] = {
     "    for (int t = blockIdx.x; t < tokens; t += gridDim.x) {\n"
     "        const float *xr = x + (size_t)t * n;\n"
     "        __syncthreads();\n"
-    "        for (int i = threadIdx.x; i < n; i += blockDim.x)\n",
+    "        for (int i = threadIdx.x; i < n; i += blockDim.x)\n"
     "            sq[i] = (double)xr[i] * xr[i];\n"
     "        __syncthreads();\n"
     "        if (threadIdx.x == 0)\n"
@@ -3377,7 +3402,7 @@ static const char *const dg_cuda_source[] = {
     "    __shared__ double sq[DG_WIDTH];\n"
     "    __shared__ float q;\n"
     "    for (int t = blockIdx.x; t < tokens; t += gridDim.x) {\n"
-    "        __syncthreads();\n"
+    "        __syncthreads();\n",
     "        for (int i = threadIdx.x; i < n; i += blockDim.x) {\n"
     "            float mo = 0;\n"
     "            for (int k = 0; k < topk; k++)\n"
@@ -3397,7 +3422,7 @@ static const char *const dg_cuda_source[] = {
     "        if (threadIdx.x == 0)\n"
     "            q = dg_rms_inverse_squares(sq, n);\n"
     "        __syncthreads();\n"
-    "        for (int i = threadIdx.x; i < n; i += blockDim.x) {\n",
+    "        for (int i = threadIdx.x; i < n; i += blockDim.x) {\n"
     "            float v = x[(size_t)t * n + i] + row[i] * q * dg_bf(post[i]);\n"
     "            x[(size_t)t * n + i] = v * scalar;\n"
     "        }\n"
@@ -3427,16 +3452,17 @@ static const char *const dg_cuda_source[] = {
     " * order, as dg_dot_ref; the maximum is order-free; exponentials use\n"
     " * dg_expf; the denominator is summed in key order on one thread; and each\n"
     " * output value sums its weighted values in key order. */\n"
-    "extern \"C\" __global__ void dg_attention(float *out, const float *q, const float *k,\n"
-    "        const float *v, const float *k_old, const float *v_old, const int *seg_old,\n"
+    "extern \"C\" __global__ void dg_attention(float *out, const float *q, const float *kt,\n"
+    "        const float *v, int keys, const float *v_old, const int *seg_old,\n"
     "        const int *seg_base, int n, int seq, int heads, int kvh, int hd, int canvas, int "
     "full,\n"
     "        int window) {\n"
     "    __shared__ float ts[DG_ROW_MAX];\n"
-    "    __shared__ double qs[DG_HEAD_MAX];\n"
+    "    __shared__ float qs[DG_HEAD_MAX];\n"
     "    __shared__ float red[DG_THREADS];\n"
     "    __shared__ float den;\n"
     "    int tx = threadIdx.x, bd = blockDim.x, qn = heads * hd, kn = kvh * hd;\n"
+    "    size_t old_rows = (size_t)keys - n;\n"
     "    for (int job = blockIdx.x; job < n * heads; job += gridDim.x) {\n"
     "        int ti = job / heads, h = job % heads, s = ti / seq, t = ti % seq, old = seg_old[s];\n"
     "        int kh = h / (heads / kvh), end = canvas ? old + seq : old + t + 1, start = 0;\n"
@@ -3452,15 +3478,15 @@ static const char *const dg_cuda_source[] = {
     "        size_t cached = (size_t)seg_base[s], own = (size_t)s * seq, head = (size_t)kh * hd;\n"
     "        __syncthreads();\n"
     "        for (int i = tx; i < hd; i += bd)\n"
-    "            qs[i] = (double)q[(size_t)ti * qn + (size_t)h * hd + i];\n"
+    "            qs[i] = q[(size_t)ti * qn + (size_t)h * hd + i];\n"
     "        __syncthreads();\n"
     "        float mx = -3.402823466e+38f;\n"
-    "        for (int j = start + tx; j < end; j += bd) {\n"
-    "            const float *kk = j < old ? k_old + (cached + j) * kn + head\n"
-    "                                      : k + (own + (j - old)) * kn + head;\n"
+    "        for (int j = start + tx; j < end; j += bd) {\n",
+    "            size_t g = j < old ? cached + j : old_rows + own + (j - old);\n"
+    "            const float *kk = kt + head * keys + g;\n"
     "            double sum = 0;\n"
     "            for (int i = 0; i < hd; i++)\n"
-    "                sum += qs[i] * kk[i];\n"
+    "                sum += dg_exact_product(qs[i], kk[(size_t)i * keys]);\n"
     "            ts[j] = (float)sum;\n"
     "            if (ts[j] > mx)\n"
     "                mx = ts[j];\n"
@@ -3478,7 +3504,7 @@ static const char *const dg_cuda_source[] = {
     "        __syncthreads();\n"
     "        if (tx == 0) {\n"
     "            float sum = 0;\n"
-    "            for (int j = start; j < end; j++)\n",
+    "            for (int j = start; j < end; j++)\n"
     "                sum += ts[j];\n"
     "            den = sum;\n"
     "        }\n"
@@ -3493,6 +3519,130 @@ static const char *const dg_cuda_source[] = {
     "                                      : v[(own + (j - old)) * kn + head + d]);\n"
     "            out[(size_t)ti * qn + (size_t)h * hd + d] = o;\n"
     "        }\n"
+    "    }\n"
+    "}\n"
+    "/* dg_mm_data_ref for column counts that are a multiple of DG_BCOLS. A block\n"
+    " * covers ROWS rows and TOKENS tokens with ROWS x TY threads: thread (x, y)\n"
+    " * owns row x and TOKENS / TY tokens, one register sum each in column order,\n"
+    " * and the block's weights are staged once for all of them. While a chunk is\n"
+    " * computed from shared memory, the next chunk's weights and activations are\n"
+    " * already loading into registers. */\n"
+    "template <int ROWS, int TOKENS, int TY>\n"
+    "__device__ void dg_bf16_body(const unsigned short *w, const float *x, float *y, int tokens,\n"
+    "        int rows, int cols) {\n"
+    "    __shared__ unsigned ws[DG_BCOLS / 2][ROWS + 1];\n"
+    "    __shared__ float xs[TOKENS][DG_BCOLS];\n"
+    "    const int NT = ROWS * TY, WV = ROWS * DG_BCOLS / 8 / NT, XV = TOKENS * DG_BCOLS / NT,\n"
+    "              TS = TOKENS / TY;\n"
+    "    int tx = threadIdx.x, ty = threadIdx.y, id = ty * ROWS + tx;\n"
+    "    int r0 = blockIdx.x * ROWS, r = r0 + tx;\n"
+    "    int ntiles = (tokens + TOKENS - 1) / TOKENS;\n"
+    "    for (int ti = blockIdx.y; ti < ntiles; ti += gridDim.y) {\n"
+    "        int t0 = ti * TOKENS, count = tokens - t0 < TOKENS ? tokens - t0 : TOKENS;\n"
+    "        float sum[TS];\n"
+    "        uint4 wv[WV];\n"
+    "        float xv[XV];\n"
+    "#pragma unroll\n"
+    "        for (int k = 0; k < TS; k++)\n"
+    "            sum[k] = 0;\n"
+    "#pragma unroll\n"
+    "        for (int j = 0; j < WV; j++) {\n"
+    "            int i = id + j * NT, row = i / (DG_BCOLS / 8), q = i % (DG_BCOLS / 8);\n"
+    "            int gr = r0 + row < rows ? r0 + row : rows - 1;\n"
+    "            wv[j] = *(const uint4 *)(w + (size_t)gr * cols + q * 8);\n"
+    "        }\n"
+    "#pragma unroll\n"
+    "        for (int j = 0; j < XV; j++) {\n"
+    "            int i = id + j * NT, t = i / DG_BCOLS, c = i % DG_BCOLS;\n"
+    "            if (t < count)\n"
+    "                xv[j] = x[(size_t)(t0 + t) * cols + c];\n"
+    "        }\n"
+    "        for (int c0 = 0; c0 < cols; c0 += DG_BCOLS) {\n"
+    "            __syncthreads();\n"
+    "#pragma unroll\n"
+    "            for (int j = 0; j < WV; j++) {\n"
+    "                int i = id + j * NT, row = i / (DG_BCOLS / 8), q = i % (DG_BCOLS / 8);\n"
+    "                ws[q * 4][row] = wv[j].x;\n"
+    "                ws[q * 4 + 1][row] = wv[j].y;\n"
+    "                ws[q * 4 + 2][row] = wv[j].z;\n",
+    "                ws[q * 4 + 3][row] = wv[j].w;\n"
+    "            }\n"
+    "#pragma unroll\n"
+    "            for (int j = 0; j < XV; j++) {\n"
+    "                int i = id + j * NT, t = i / DG_BCOLS, c = i % DG_BCOLS;\n"
+    "                if (t < count)\n"
+    "                    xs[t][c] = xv[j];\n"
+    "            }\n"
+    "            __syncthreads();\n"
+    "            int next = c0 + DG_BCOLS;\n"
+    "            if (next < cols) {\n"
+    "#pragma unroll\n"
+    "                for (int j = 0; j < WV; j++) {\n"
+    "                    int i = id + j * NT, row = i / (DG_BCOLS / 8), q = i % (DG_BCOLS / 8);\n"
+    "                    int gr = r0 + row < rows ? r0 + row : rows - 1;\n"
+    "                    wv[j] = *(const uint4 *)(w + (size_t)gr * cols + next + q * 8);\n"
+    "                }\n"
+    "#pragma unroll\n"
+    "                for (int j = 0; j < XV; j++) {\n"
+    "                    int i = id + j * NT, t = i / DG_BCOLS, c = i % DG_BCOLS;\n"
+    "                    if (t < count)\n"
+    "                        xv[j] = x[(size_t)(t0 + t) * cols + next + c];\n"
+    "                }\n"
+    "            }\n"
+    "#pragma unroll 4\n"
+    "            for (int pr = 0; pr < DG_BCOLS / 2; pr++) {\n"
+    "                unsigned p = ws[pr][tx];\n"
+    "                float a0 = __uint_as_float(p << 16), a1 = __uint_as_float(p & 0xffff0000u);\n"
+    "#pragma unroll\n"
+    "                for (int k = 0; k < TS; k++) {\n"
+    "                    int t = ty * TS + k;\n"
+    "                    if (t < count) {\n"
+    "                        sum[k] += a0 * xs[t][pr * 2];\n"
+    "                        sum[k] += a1 * xs[t][pr * 2 + 1];\n"
+    "                    }\n"
+    "                }\n"
+    "            }\n"
+    "        }\n"
+    "        if (r < rows)\n"
+    "#pragma unroll\n"
+    "            for (int k = 0; k < TS; k++) {\n"
+    "                int t = ty * TS + k;\n"
+    "                if (t < count)\n"
+    "                    y[(size_t)(t0 + t) * rows + r] = sum[k];\n"
+    "            }\n"
+    "    }\n"
+    "}\n"
+    "\n"
+    "extern \"C\" __global__ void __launch_bounds__(128) dg_bf16_mm_wide(const unsigned short *w,\n"
+    "        const float *x, float *y, int tokens, int rows, int cols) {\n"
+    "    dg_bf16_body<128, 32, 1>(w, x, y, tokens, rows, cols);\n"
+    "}\n"
+    "\n"
+    "extern \"C\" __global__ void __launch_bounds__(128) dg_bf16_mm_narrow(const unsigned short "
+    "*w,\n"
+    "        const float *x, float *y, int tokens, int rows, int cols) {\n"
+    "    dg_bf16_body<32, 32, 4>(w, x, y, tokens, rows, cols);\n"
+    "}\n"
+    "/* Keys transposed once per layer, cached rows then this call's, to\n"
+    " * kt[c * keys + g] for column c of kv width kn: the scores' threads, which\n"
+    " * own consecutive keys, then read consecutive addresses. 32 x 32 tiles\n"
+    " * through shared memory keep reads and writes coalesced. */\n"
+    "extern \"C\" __global__ void dg_transpose_keys(float *kt, const float *k_old, const float "
+    "*k,\n"
+    "        int old_rows, int keys, int kn) {\n"
+    "    __shared__ float tile[32][33];\n"
+    "    int g0 = blockIdx.x * 32, c0 = blockIdx.y * 32, tx = threadIdx.x, ty = threadIdx.y;\n"
+    "    for (int r = ty; r < 32; r += blockDim.y) {\n"
+    "        int g = g0 + r, c = c0 + tx;\n"
+    "        if (g < keys && c < kn)\n"
+    "            tile[r][tx] = g < old_rows ? k_old[(size_t)g * kn + c]\n"
+    "                                       : k[(size_t)(g - old_rows) * kn + c];\n"
+    "    }\n"
+    "    __syncthreads();\n"
+    "    for (int r = ty; r < 32; r += blockDim.y) {\n"
+    "        int c = c0 + r, g = g0 + tx;\n"
+    "        if (g < keys && c < kn)\n"
+    "            kt[(size_t)c * keys + g] = tile[tx][r];\n"
     "    }\n"
     "}\n"};
 
@@ -3524,12 +3674,16 @@ enum {
     DG_CUDA_MOE_TAIL,
     DG_CUDA_ROPE,
     DG_CUDA_ATTENTION,
+    DG_CUDA_BF16_WIDE,
+    DG_CUDA_BF16_NARROW,
+    DG_CUDA_TRANSPOSE_KEYS,
     DG_CUDA_KERNELS
 };
 
 static const char *const dg_cuda_kernel_names[DG_CUDA_KERNELS] = {
-    "dg_nvfp4_mm", "dg_bf16_mm",  "dg_rms",  "dg_gelu_mul", "dg_nvfp4_qdq",
-    "dg_gather",   "dg_moe_tail", "dg_rope", "dg_attention"};
+    "dg_nvfp4_mm",       "dg_bf16_mm",       "dg_rms",  "dg_gelu_mul",  "dg_nvfp4_qdq",
+    "dg_gather",         "dg_moe_tail",      "dg_rope", "dg_attention", "dg_bf16_mm_wide",
+    "dg_bf16_mm_narrow", "dg_transpose_keys"};
 
 /* The driver and NVRTC entry points, and the process-wide context and
  * kernels. */
@@ -3684,6 +3838,14 @@ static unsigned dg_cuda_blocks(long long work, int per_block, unsigned max) {
     return blocks < 1 ? 1 : blocks > max ? max : (unsigned)blocks;
 }
 
+static void dg_cuda_launch_2d(int kernel, unsigned grid_x, unsigned grid_y, unsigned block_x,
+                              unsigned block_y, void **args) {
+    dg_cuda_current();
+    dg_cuda_check(dg_cuda.launch(dg_cuda.kernel[kernel], grid_x, grid_y, 1, block_x, block_y, 1, 0,
+                                 NULL, args, NULL),
+                  dg_cuda_kernel_names[kernel]);
+}
+
 static void dg_cuda_launch(int kernel, unsigned grid_x, unsigned grid_y, unsigned block,
                            void **args) {
     dg_cuda_current();
@@ -3779,11 +3941,26 @@ static void dg_cuda_nvfp4_mm(const DGAccelMatrix *const *m, const int *group, in
                    dg_cuda_blocks(ntiles, 1, DG_CUDA_GRID_Y), DG_CUDA_ROWS, args);
 }
 
+/* Column counts that are a multiple of 64, which every model matrix has,
+ * take the double-buffered kernels: 128 rows by 32 tokens a block when that
+ * gives the GPU enough blocks, 32 rows by 32 tokens with four warps
+ * splitting the tokens otherwise. */
 static void dg_cuda_bf16_mm(DGDevice w, DGDevice x, DGDevice y, int tokens, int rows, int cols) {
     if (cols % 2)
         die("accelerator BF16 matrices need an even column count");
     CUdeviceptr dw = w, dx = x, dy = y;
     void *args[] = {&dw, &dx, &dy, &tokens, &rows, &cols};
+    if (cols % 64 == 0) {
+        long long wide = (long long)dg_cuda_blocks(rows, 128, 1u << 30) *
+                         dg_cuda_blocks(tokens, 32, DG_CUDA_GRID_Y);
+        if (wide >= 96)
+            dg_cuda_launch(DG_CUDA_BF16_WIDE, dg_cuda_blocks(rows, 128, 1u << 30),
+                           dg_cuda_blocks(tokens, 32, DG_CUDA_GRID_Y), 128, args);
+        else
+            dg_cuda_launch_2d(DG_CUDA_BF16_NARROW, dg_cuda_blocks(rows, 32, 1u << 30),
+                              dg_cuda_blocks(tokens, 32, DG_CUDA_GRID_Y), 32, 4, args);
+        return;
+    }
     dg_cuda_launch(DG_CUDA_BF16_MM, dg_cuda_blocks(rows, DG_CUDA_ROWS, 1u << 30),
                    dg_cuda_blocks(tokens, DG_CUDA_BF16_TOKENS, DG_CUDA_GRID_Y), DG_CUDA_ROWS, args);
 }
@@ -3836,14 +4013,19 @@ static void dg_cuda_rope(DGDevice x, DGDevice table, int tokens, int heads, int 
 
 static void dg_cuda_attention(DGDevice a, DGDevice q, DGDevice k, DGDevice v, DGDevice k_old,
                               DGDevice v_old, DGDevice seg_old, DGDevice seg_base, int n, int seq,
-                              int kvh, int hd, int canvas, int full, int max_keys) {
+                              int kvh, int hd, int canvas, int full, int max_keys, int old_rows,
+                              DGDevice scratch) {
     if (max_keys > DG_CUDA_ROW_MAX || hd > DG_FULL_HEAD_DIM)
         die("accelerator attention span is too long");
-    CUdeviceptr da = a, dq = q, dk = k, dv = v, dko = k_old, dvo = v_old, dso = seg_old,
-                dsb = seg_base;
+    int kn = kvh * hd, keys = old_rows + n;
+    CUdeviceptr dkt = scratch, dko = k_old, dk = k;
+    void *targs[] = {&dkt, &dko, &dk, &old_rows, &keys, &kn};
+    dg_cuda_launch_2d(DG_CUDA_TRANSPOSE_KEYS, dg_cuda_blocks(keys, 32, 1u << 30),
+                      dg_cuda_blocks(kn, 32, DG_CUDA_GRID_Y), 32, 8, targs);
+    CUdeviceptr da = a, dq = q, dv = v, dvo = v_old, dso = seg_old, dsb = seg_base;
     int heads = DG_HEADS, window = DG_LOCAL_WINDOW;
-    void *args[] = {&da, &dq,  &dk,    &dv,  &dko, &dvo,    &dso,  &dsb,
-                    &n,  &seq, &heads, &kvh, &hd,  &canvas, &full, &window};
+    void *args[] = {&da, &dq,  &dkt,   &dv,  &keys, &dvo,    &dso,  &dsb,
+                    &n,  &seq, &heads, &kvh, &hd,   &canvas, &full, &window};
     dg_cuda_launch(DG_CUDA_ATTENTION, dg_cuda_blocks((long long)n * heads, 1, 1u << 30), 1,
                    DG_CUDA_THREADS, args);
 }
@@ -4050,7 +4232,7 @@ static void dg_workspace_destroy(DGWorkspace *workspace) {
  * either layer kind. */
 typedef struct {
     DGDevice x, res, z, q, k, v, a, g, u, d, z2, rin, route, qz2, weight, index, slot, flag, gather,
-        eg, eh, eqh, eo, scratch, rope, seg_old, seg_base, kv_k, kv_v;
+        eg, eh, eqh, eo, scratch, rope, seg_old, seg_base, kv_k, kv_v, kt;
     /* Rows of the widest K/V width that kv_k and kv_v each hold. */
     int kv_rows;
 } DGDeviceLayout;
@@ -4100,6 +4282,7 @@ static size_t dg_device_layout(DGDeviceLayout *d, DGDevice base, int n, int kv_r
     DG_CARVE(seg_base, jb_size_mul((size_t)n, 4));
     DG_CARVE(kv_k, jb_size_mul((size_t)kv_rows, kn * 4));
     DG_CARVE(kv_v, jb_size_mul((size_t)kv_rows, kn * 4));
+    DG_CARVE(kt, jb_size_mul((size_t)n + (size_t)kv_rows, kn * 4));
 #undef DG_CARVE
     d->kv_rows = kv_rows;
     return at;
@@ -4374,7 +4557,7 @@ static void dg_attention_accel(DGModel *m, int l, int segments, int seq, int pos
     JB_TO(attention_prepare, prepare_start);
     JB_TICK(core_start);
     a->attention(dev->a, dev->q, dev->k, dev->v, dev->kv_k, dev->kv_v, dev->seg_old, dev->seg_base,
-                 n, seq, kvh, hd, mode == DG_CANVAS, full, max_keys);
+                 n, seq, kvh, hd, mode == DG_CANVAS, full, max_keys, rows, dev->kt);
     JB_TO(attention_core, core_start);
     JB_TICK(output_start);
     dg_mm_accel(m, ow, dev->a, dev->z, n, DG_H, qn);
@@ -7574,11 +7757,39 @@ static void dg_test_accel_layer(uint64_t *rs) {
         if (JB_STRICT_MATH && memcmp((gotp), (wantp), (bytes)))                                    \
             die2("accelerator self-test failed: differs from the reference", what);                \
     } while (0)
-    /* BF16 product. */
+    /* BF16 product, on a shape for each kernel. */
     dg_mm_data_ref(w, x, yref, tokens, rows, cols);
     a->bf16_mm(dw, dx, dy, tokens, rows, cols);
     a->to_host(y, dy, yb);
     DG_ACCEL_SAME("BF16 matmul", y, yref, yb);
+    {
+        enum { big_rows = 768, big_tokens = 512 };
+
+        size_t wb2 = (size_t)big_rows * cols * 2, xb2 = (size_t)big_tokens * cols * 4,
+               yb2 = (size_t)big_tokens * big_rows * 4;
+        uint8_t *w2 = xmalloc(wb2);
+        float *x2 = xmalloc(xb2), *y2 = xmalloc(yb2), *y2ref = xmalloc(yb2);
+        for (size_t i = 0; i < (size_t)big_rows * cols; i++)
+            jb_put_bf16(w2 + i * 2, jb_rng_unit(rs));
+        for (size_t i = 0; i < (size_t)big_tokens * cols; i++)
+            x2[i] = jb_rng_unit(rs);
+        DGDevice dw2 = a->alloc(wb2), dx2 = a->alloc(xb2), dy2 = a->alloc(yb2);
+        if (!dw2 || !dx2 || !dy2)
+            die2("accelerator self-test failed: device memory", a->name);
+        a->to_device(dw2, w2, wb2);
+        a->to_device(dx2, x2, xb2);
+        dg_mm_data_ref(w2, x2, y2ref, big_tokens, big_rows, cols);
+        a->bf16_mm(dw2, dx2, dy2, big_tokens, big_rows, cols);
+        a->to_host(y2, dy2, yb2);
+        DG_ACCEL_SAME("BF16 matmul, many tokens", y2, y2ref, yb2);
+        a->free(dw2);
+        a->free(dx2);
+        a->free(dy2);
+        jb_release(w2);
+        jb_release(x2);
+        jb_release(y2);
+        jb_release(y2ref);
+    }
     /* RMS with a scale and a residual, and with a factor. */
     DGTensor scale = {0}, factor = {0};
     scale.data = sc;
@@ -7687,8 +7898,9 @@ static void dg_test_accel_attention(uint64_t *rs) {
         }
     DGDevice dq = a->alloc(qb), dk = a->alloc(kb), dv = a->alloc(kb), dko = a->alloc(ob),
              dvo = a->alloc(ob), dt = a->alloc(tb), dout = a->alloc(qb),
-             dso = a->alloc(sizeof seg_old), dsb = a->alloc(sizeof seg_base);
-    if (!dq || !dk || !dv || !dko || !dvo || !dt || !dout || !dso || !dsb)
+             dso = a->alloc(sizeof seg_old), dsb = a->alloc(sizeof seg_base),
+             dkd = a->alloc((size_t)(n + rows) * kn * 4);
+    if (!dq || !dk || !dv || !dko || !dvo || !dt || !dout || !dso || !dsb || !dkd)
         die2("accelerator self-test failed: device memory", a->name);
     a->to_device(dk, k, kb);
     a->to_device(dv, v, kb);
@@ -7734,14 +7946,15 @@ static void dg_test_accel_attention(uint64_t *rs) {
                         oo[d] += p * vv[(size_t)kh * hd + d];
                 }
             }
-        a->attention(dout, dq, dk, dv, dko, dvo, dso, dsb, n, seq, kvh, hd, canvas, 0, rows + seq);
+        a->attention(dout, dq, dk, dv, dko, dvo, dso, dsb, n, seq, kvh, hd, canvas, 0, rows + seq,
+                     rows, dkd);
         a->to_host(got, dout, qb);
         for (size_t i = 0; i < (size_t)n * qn; i++)
             jb_check_close(a->name, got[i], want[i], 1e-5 * (1 + fabs(want[i])));
         if (JB_STRICT_MATH && memcmp(got, want, qb))
             die2("accelerator self-test failed: differs from the reference", "attention");
     }
-    DGDevice all[] = {dq, dk, dv, dko, dvo, dt, dout, dso, dsb};
+    DGDevice all[] = {dq, dk, dv, dko, dvo, dt, dout, dso, dsb, dkd};
     for (size_t i = 0; i < sizeof all / sizeof *all; i++)
         a->free(all[i]);
     void *host[] = {q, k, v, ko, vo, table, want, got, ts};
