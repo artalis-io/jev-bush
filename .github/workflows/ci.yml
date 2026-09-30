@@ -48,6 +48,16 @@ jobs:
           ./jb-scalar --selftest | tee scalar.json
           grep -q '"kernels":"scalar"' scalar.json
 
+      # The CUDA accelerator loads the driver and NVRTC at run time, so it
+      # builds without CUDA installed; on these GPU-less runners the
+      # selftest must fall back to the CPU kernels.
+      - name: CUDA build without a GPU
+        if: runner.os == 'Linux'
+        run: |
+          cc -O2 -std=c11 -Wall -Wextra -pedantic -Werror -DJB_CUDA jb.c -lm -ldl -lpthread -o jb-cuda
+          ./jb-cuda --selftest | tee cuda.json
+          ! grep -q accelerator cuda.json
+
       - name: Build and test
         if: runner.os == 'Windows'
         shell: pwsh

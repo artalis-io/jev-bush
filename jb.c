@@ -992,8 +992,28 @@ typedef struct {
 
 static const DGKernelOps *dg_kernels(void);
 
+/* An optional accelerator for the NVFP4 expert matrices, bit-identical to
+ * dg_nvfp4_mm_ref. Matrices are uploaded once. nvfp4_mm multiplies token i
+ * of x, in the dg_nvfp4_qdq_ref layout, by m[group[i]], so one call covers
+ * a layer's experts; all of m share rows and cols. dg_accel() returns NULL
+ * when none is built or available, and upload returns NULL when the device
+ * cannot hold a matrix. */
+typedef struct DGAccelMatrix DGAccelMatrix;
+
+typedef struct {
+    const char *name;
+    DGAccelMatrix *(*upload)(const DGNvMatrix *m, int rows, int cols);
+    void (*release)(DGAccelMatrix *m);
+    void (*nvfp4_mm)(const DGAccelMatrix *const *m, const int *group, const float *x, float *y,
+                     int tokens);
+} DGAccelOps;
+
+static const DGAccelOps *dg_accel(void);
+
 typedef struct {
     DGTensor *wg, *sg, *gg, *ag, *wu, *su, *gu, *wd, *sd, *gd, *ad;
+    /* Gate, up and down on the accelerator, when the model uses one. */
+    DGAccelMatrix *accel[3];
 } DGNvExpert;
 
 typedef struct {
@@ -1003,6 +1023,8 @@ typedef struct {
     int nshard, nvfp4;
     DGNvExpert *nvexpert;
     float nv_a13[DG_L], nv_a2[DG_L];
+    /* Set when every expert matrix is on the accelerator. */
+    const DGAccelOps *accel;
 } DGModel;
 
 enum { DG_UNKNOWN = -1, DG_BF16, DG_U8, DG_F8E4M3, DG_F32 };
@@ -1287,7 +1309,46 @@ static void dg_unmap_shards(DGModel *m) {
     memset(m->shard, 0, sizeof m->shard);
 }
 
+/* Device memory is not tracked by error frames, so a failed load releases it
+ * here, like the mapped shards. */
+static void dg_release_accel(DGModel *m) {
+    if (m->nvexpert)
+        for (int i = 0; i < DG_L * DG_EXPERTS; i++)
+            for (int k = 0; k < 3; k++)
+                if (m->nvexpert[i].accel[k]) {
+                    dg_accel()->release(m->nvexpert[i].accel[k]);
+                    m->nvexpert[i].accel[k] = NULL;
+                }
+    m->accel = NULL;
+}
+
+static DGNvMatrix dg_nvfp4_matrix(const DGTensor *w, const DGTensor *s, const DGTensor *g, int rows,
+                                  int cols);
+
+/* Uploads every expert matrix, or none: a device that cannot hold them all
+ * leaves the model on the CPU kernels. */
+static void dg_upload_experts(DGModel *m) {
+    const DGAccelOps *a = m->nvfp4 ? dg_accel() : NULL;
+    if (!a)
+        return;
+    for (int i = 0; i < DG_L * DG_EXPERTS; i++) {
+        DGNvExpert *v = &m->nvexpert[i];
+        DGNvMatrix gate = dg_nvfp4_matrix(v->wg, v->sg, v->gg, DG_MOE, DG_H),
+                   up = dg_nvfp4_matrix(v->wu, v->su, v->gu, DG_MOE, DG_H),
+                   down = dg_nvfp4_matrix(v->wd, v->sd, v->gd, DG_H, DG_MOE);
+        v->accel[0] = a->upload(&gate, DG_MOE, DG_H);
+        v->accel[1] = v->accel[0] ? a->upload(&up, DG_MOE, DG_H) : NULL;
+        v->accel[2] = v->accel[1] ? a->upload(&down, DG_H, DG_MOE) : NULL;
+        if (!v->accel[2]) {
+            dg_release_accel(m);
+            return;
+        }
+    }
+    m->accel = a;
+}
+
 static void dg_free(DGModel *m) {
+    dg_release_accel(m);
     for (size_t i = 0; i < m->nt; i++)
         jb_release(m->tensor[i].name);
     jb_release(m->tensor);
@@ -1854,21 +1915,34 @@ static void dg_nvfp4_mm(const DGTensor *w, const DGTensor *s, const DGTensor *g,
     dg_kernels()->nvfp4_mm(m.w, m.s, m.global, x, y, tokens, rows, cols);
 }
 
+/* h = gelu(g) * h over n values. */
+static void dg_gelu_gate(const float *g, float *h, int n) {
+    int i;
+#ifdef _OPENMP
+    JB_OMP();
+#pragma omp parallel for schedule(static) if (n >= 4096)
+#endif
+    for (i = 0; i < n; i++)
+        h[i] = dg_gelu(g[i]) * h[i];
+}
+
 /* The gated product as separate steps: two backend matrix products, then
  * GELU, for backends without a fused form. */
 static void dg_nvfp4_gated_each(const DGNvMatrix *gate, const DGNvMatrix *up, const float *x,
                                 float *g, float *h, int tokens, int rows, int cols) {
     dg_kernels()->nvfp4_mm(gate->w, gate->s, gate->global, x, g, tokens, rows, cols);
     dg_kernels()->nvfp4_mm(up->w, up->s, up->global, x, h, tokens, rows, cols);
-    {
-        int i;
-#ifdef _OPENMP
-        JB_OMP();
-#pragma omp parallel for schedule(static) if (tokens * rows >= 4096)
-#endif
-        for (i = 0; i < tokens * rows; i++)
-            h[i] = dg_gelu(g[i]) * h[i];
-    }
+    dg_gelu_gate(g, h, tokens * rows);
+}
+
+/* An expert's activations in the layout its matrix products expect: the
+ * reference layout for the accelerator, the CPU kernels' otherwise. */
+static void dg_nvfp4_expert_qdq(const DGModel *m, float *out, const float *in, int tokens, int cols,
+                                float base) {
+    if (m->accel)
+        dg_nvfp4_qdq_parallel(out, in, tokens, cols, base);
+    else
+        dg_nvfp4_qdq(out, in, tokens, cols, base);
 }
 
 /* gelu(gate x) * (up x) for one expert; g is scratch. */
@@ -2737,6 +2811,363 @@ static const DGKernelOps *dg_kernels(void) {
 #endif
 }
 
+/* CUDA accelerator for the NVFP4 expert matrices. The driver API and NVRTC
+ * are loaded at run time and the kernel is compiled from the source below on
+ * first use, so builds need neither CUDA headers nor nvcc. Without a driver,
+ * NVRTC or a device, dg_accel() returns NULL and the CPU kernels run; so does
+ * JB_CUDA=0 in the environment. NVRTC compiles with --fmad=false, and each
+ * thread sums one row's products in the reference's order, so results match
+ * dg_nvfp4_mm_ref bit for bit, which the selftest checks. */
+#if defined(JB_CUDA)
+#if defined(_WIN32)
+#error "JB_CUDA loads CUDA with dlopen, which Windows lacks"
+#endif
+#include <dlfcn.h>
+#include <pthread.h>
+
+typedef int CUresult;
+typedef int CUdevice;
+typedef struct CUctx_st *CUcontext;
+typedef struct CUmod_st *CUmodule;
+typedef struct CUfunc_st *CUfunction;
+typedef unsigned long long CUdeviceptr;
+typedef int nvrtcResult;
+typedef struct _nvrtcProgram *nvrtcProgram;
+
+enum {
+    DG_CU_CC_MAJOR = 75,
+    DG_CU_CC_MINOR = 76,
+    DG_CUDA_ROWS = 32,
+    DG_CUDA_TOKENS = 8,
+    DG_CUDA_GRID_Y = 65535
+};
+
+/* dg_nvfp4_mm_ref, tiled: a block computes 32 rows for one tile of up to 8
+ * tokens that share a matrix, staging 16 weight blocks of those rows, their
+ * scales and the tokens' activations in shared memory at a time. Each
+ * thread still sums one row and token in the reference's order. The E2M1
+ * table keeps -0.0, as the reference's sign flip produces it. */
+static const char dg_cuda_source[] =
+    "struct dg_matrix {\n"
+    "    const unsigned char *w, *s;\n"
+    "    float global, pad;\n"
+    "};\n"
+    "\n"
+    "struct dg_tile {\n"
+    "    int start, count, group;\n"
+    "};\n"
+    "\n"
+    "#define DG_ROWS 32\n"
+    "#define DG_TOKENS 8\n"
+    "#define DG_BLOCKS 16\n"
+    "\n"
+    "__device__ float dg_f8e4m3(unsigned u) {\n"
+    "    unsigned e = (u >> 3) & 15, m = u & 7;\n"
+    "    float x = e ? __uint_as_float(((e + 120) << 23) | (m << 20)) : (float)m * 1.953125e-3f;\n"
+    "    return u >> 7 ? -x : x;\n"
+    "}\n"
+    "\n"
+    "extern \"C\" __global__ void __launch_bounds__(DG_ROWS * DG_TOKENS)\n"
+    "dg_nvfp4_mm(const dg_matrix *m, const dg_tile *tiles, int ntiles, const float *x,\n"
+    "        float *y, int rows, int cols) {\n"
+    "    __shared__ float e2m1[16];\n"
+    "    __shared__ unsigned char ws[DG_BLOCKS * 8][DG_ROWS];\n"
+    "    __shared__ float ss[DG_BLOCKS][DG_ROWS];\n"
+    "    __shared__ float xs[DG_TOKENS][DG_BLOCKS * 16];\n"
+    "    int tx = threadIdx.x, ty = threadIdx.y, id = ty * DG_ROWS + tx;\n"
+    "    int r0 = blockIdx.x * DG_ROWS, r = r0 + tx, blocks = cols / 16;\n"
+    "    if (id < 16) {\n"
+    "        const float mag[8] = {0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f};\n"
+    "        e2m1[id] = id & 8 ? -mag[id & 7] : mag[id & 7];\n"
+    "    }\n"
+    "    for (int ti = blockIdx.y; ti < ntiles; ti += gridDim.y) {\n"
+    "        dg_tile tile = tiles[ti];\n"
+    "        dg_matrix mt = m[tile.group];\n"
+    "        float sum = 0;\n"
+    "        for (int b0 = 0; b0 < blocks; b0 += DG_BLOCKS) {\n"
+    "            int nb = blocks - b0 < DG_BLOCKS ? blocks - b0 : DG_BLOCKS;\n"
+    "            __syncthreads();\n"
+    "            for (int i = id; i < DG_ROWS * nb; i += DG_ROWS * DG_TOKENS) {\n"
+    "                int row = i / nb, b = i % nb, gr = r0 + row < rows ? r0 + row : rows - 1;\n"
+    "                const unsigned char *src = mt.w + (size_t)gr * (cols / 2) + (size_t)(b0 + b) "
+    "* 8;\n"
+    "                for (int k = 0; k < 8; k++)\n"
+    "                    ws[b * 8 + k][row] = src[k];\n"
+    "                ss[b][row] = dg_f8e4m3(mt.s[(size_t)gr * blocks + b0 + b]) * mt.global;\n"
+    "            }\n"
+    "            for (int i = id; i < DG_TOKENS * nb * 16; i += DG_ROWS * DG_TOKENS) {\n"
+    "                int t = i / (nb * 16), c = i % (nb * 16);\n"
+    "                if (t < tile.count)\n"
+    "                    xs[t][c] = x[(size_t)(tile.start + t) * cols + (size_t)b0 * 16 + c];\n"
+    "            }\n"
+    "            __syncthreads();\n"
+    "            if (ty < tile.count)\n"
+    "                for (int b = 0; b < nb; b++) {\n"
+    "                    float scale = ss[b][tx];\n"
+    "                    for (int k = 0; k < 8; k++) {\n"
+    "                        unsigned v = ws[b * 8 + k][tx];\n"
+    "                        sum += scale * (e2m1[v & 15] * xs[ty][b * 16 + k * 2] +\n"
+    "                                        e2m1[v >> 4] * xs[ty][b * 16 + k * 2 + 1]);\n"
+    "                    }\n"
+    "                }\n"
+    "        }\n"
+    "        if (ty < tile.count && r < rows)\n"
+    "            y[(size_t)(tile.start + ty) * rows + r] = sum;\n"
+    "    }\n"
+    "}\n";
+
+/* The kernel's struct dg_tile: tokens start..start + count - 1 use matrix
+ * group. */
+typedef struct {
+    int start, count, group;
+} DGCudaTile;
+
+/* The kernel's struct dg_matrix. */
+typedef struct {
+    CUdeviceptr w, s;
+    float global, pad;
+} DGCudaMatrix;
+
+struct DGAccelMatrix {
+    CUdeviceptr w, s;
+    float global;
+    int rows, cols;
+};
+
+/* One process-wide device context, used under the lock by whichever thread
+ * calls; in and y are staging buffers that grow to the largest call. */
+static struct {
+    CUresult (*init)(unsigned);
+    CUresult (*device_get)(CUdevice *, int);
+    CUresult (*device_attribute)(int *, int, CUdevice);
+    CUresult (*primary_retain)(CUcontext *, CUdevice);
+    CUresult (*ctx_set)(CUcontext);
+    CUresult (*module_load)(CUmodule *, const void *);
+    CUresult (*function_get)(CUfunction *, CUmodule, const char *);
+    CUresult (*alloc)(CUdeviceptr *, size_t);
+    CUresult (*free)(CUdeviceptr);
+    CUresult (*htod)(CUdeviceptr, const void *, size_t);
+    CUresult (*dtoh)(void *, CUdeviceptr, size_t);
+    CUresult (*launch)(CUfunction, unsigned, unsigned, unsigned, unsigned, unsigned, unsigned,
+                       unsigned, void *, void **, void **);
+    nvrtcResult (*create)(nvrtcProgram *, const char *, const char *, int, const char *const *,
+                          const char *const *);
+    nvrtcResult (*compile)(nvrtcProgram, int, const char *const *);
+    nvrtcResult (*ptx_size)(nvrtcProgram, size_t *);
+    nvrtcResult (*ptx)(nvrtcProgram, char *);
+    nvrtcResult (*log_size)(nvrtcProgram, size_t *);
+    nvrtcResult (*log)(nvrtcProgram, char *);
+    nvrtcResult (*destroy)(nvrtcProgram *);
+    CUcontext ctx;
+    CUfunction mm;
+    CUdeviceptr in, y;
+    size_t in_bytes, y_bytes;
+    pthread_mutex_t lock;
+    const char *failure;
+    int ready;
+} dg_cuda = {.lock = PTHREAD_MUTEX_INITIALIZER};
+
+/* dlsym returns an object pointer; copy it into the function pointer. */
+static int dg_cuda_symbol(void *lib, const char *name, void *slot) {
+    void *p = lib ? dlsym(lib, name) : NULL;
+    memcpy(slot, &p, sizeof p);
+    return p != NULL;
+}
+
+/* Compiles and loads the kernel. Runs under pthread_once, which no error
+ * frame may unwind through, so it records a failure for dg_accel() to report
+ * and allocates with plain malloc. */
+static void dg_cuda_compile(int major, int minor) {
+    char arch[48];
+    snprintf(arch, sizeof arch, "--gpu-architecture=compute_%d%d", major, minor);
+    const char *options[] = {arch, "--fmad=false"};
+    nvrtcProgram prog;
+    if (dg_cuda.create(&prog, dg_cuda_source, "jb_nvfp4.cu", 0, NULL, NULL)) {
+        dg_cuda.failure = "nvrtcCreateProgram";
+        return;
+    }
+    size_t size = 0;
+    char *ptx = NULL;
+    CUmodule module;
+    if (dg_cuda.compile(prog, 2, options) || dg_cuda.ptx_size(prog, &size) ||
+        !(ptx = malloc(size)) || dg_cuda.ptx(prog, ptx)) {
+        size_t n = 0;
+        char *log = NULL;
+        if (!dg_cuda.log_size(prog, &n) && n > 1 && (log = malloc(n)) && !dg_cuda.log(prog, log))
+            fprintf(stderr, "%s\n", log);
+        free(log);
+        dg_cuda.failure = "compiling the NVFP4 kernel";
+    } else if (dg_cuda.module_load(&module, ptx) ||
+               dg_cuda.function_get(&dg_cuda.mm, module, "dg_nvfp4_mm"))
+        dg_cuda.failure = "loading the NVFP4 kernel";
+    else
+        dg_cuda.ready = 1;
+    free(ptx);
+    dg_cuda.destroy(&prog);
+}
+
+static void dg_cuda_open(void) {
+    static const char *const nvrtc[] = {"libnvrtc.so", "libnvrtc.so.13", "libnvrtc.so.12"};
+    const char *env = getenv("JB_CUDA");
+    if (env && !strcmp(env, "0"))
+        return;
+    void *cu = dlopen("libcuda.so.1", RTLD_NOW | RTLD_LOCAL), *rtc = NULL;
+    for (size_t i = 0; i < sizeof nvrtc / sizeof *nvrtc && !rtc; i++)
+        rtc = dlopen(nvrtc[i], RTLD_NOW | RTLD_LOCAL);
+    int loaded = dg_cuda_symbol(cu, "cuInit", &dg_cuda.init) &
+                 dg_cuda_symbol(cu, "cuDeviceGet", &dg_cuda.device_get) &
+                 dg_cuda_symbol(cu, "cuDeviceGetAttribute", &dg_cuda.device_attribute) &
+                 dg_cuda_symbol(cu, "cuDevicePrimaryCtxRetain", &dg_cuda.primary_retain) &
+                 dg_cuda_symbol(cu, "cuCtxSetCurrent", &dg_cuda.ctx_set) &
+                 dg_cuda_symbol(cu, "cuModuleLoadData", &dg_cuda.module_load) &
+                 dg_cuda_symbol(cu, "cuModuleGetFunction", &dg_cuda.function_get) &
+                 dg_cuda_symbol(cu, "cuMemAlloc_v2", &dg_cuda.alloc) &
+                 dg_cuda_symbol(cu, "cuMemFree_v2", &dg_cuda.free) &
+                 dg_cuda_symbol(cu, "cuMemcpyHtoD_v2", &dg_cuda.htod) &
+                 dg_cuda_symbol(cu, "cuMemcpyDtoH_v2", &dg_cuda.dtoh) &
+                 dg_cuda_symbol(cu, "cuLaunchKernel", &dg_cuda.launch) &
+                 dg_cuda_symbol(rtc, "nvrtcCreateProgram", &dg_cuda.create) &
+                 dg_cuda_symbol(rtc, "nvrtcCompileProgram", &dg_cuda.compile) &
+                 dg_cuda_symbol(rtc, "nvrtcGetPTXSize", &dg_cuda.ptx_size) &
+                 dg_cuda_symbol(rtc, "nvrtcGetPTX", &dg_cuda.ptx) &
+                 dg_cuda_symbol(rtc, "nvrtcGetProgramLogSize", &dg_cuda.log_size) &
+                 dg_cuda_symbol(rtc, "nvrtcGetProgramLog", &dg_cuda.log) &
+                 dg_cuda_symbol(rtc, "nvrtcDestroyProgram", &dg_cuda.destroy);
+    CUdevice device;
+    int major, minor;
+    if (!loaded || dg_cuda.init(0) || dg_cuda.device_get(&device, 0) ||
+        dg_cuda.device_attribute(&major, DG_CU_CC_MAJOR, device) ||
+        dg_cuda.device_attribute(&minor, DG_CU_CC_MINOR, device) ||
+        dg_cuda.primary_retain(&dg_cuda.ctx, device) || dg_cuda.ctx_set(dg_cuda.ctx))
+        return;
+    dg_cuda_compile(major, minor);
+}
+
+static void dg_cuda_release(DGAccelMatrix *a) {
+    pthread_mutex_lock(&dg_cuda.lock);
+    if (!dg_cuda.ctx_set(dg_cuda.ctx)) {
+        if (a->w)
+            dg_cuda.free(a->w);
+        if (a->s)
+            dg_cuda.free(a->s);
+    }
+    pthread_mutex_unlock(&dg_cuda.lock);
+    jb_release(a);
+}
+
+static DGAccelMatrix *dg_cuda_upload(const DGNvMatrix *m, int rows, int cols) {
+    DGAccelMatrix *a = xcalloc(1, sizeof *a);
+    size_t wb = (size_t)rows * cols / 2, sb = (size_t)rows * cols / 16;
+    a->global = m->global;
+    a->rows = rows;
+    a->cols = cols;
+    pthread_mutex_lock(&dg_cuda.lock);
+    int ok = !dg_cuda.ctx_set(dg_cuda.ctx);
+    if (ok && dg_cuda.alloc(&a->w, wb))
+        a->w = 0, ok = 0;
+    if (ok && dg_cuda.alloc(&a->s, sb))
+        a->s = 0, ok = 0;
+    ok = ok && !dg_cuda.htod(a->w, m->w, wb) && !dg_cuda.htod(a->s, m->s, sb);
+    pthread_mutex_unlock(&dg_cuda.lock);
+    if (!ok) {
+        dg_cuda_release(a);
+        return NULL;
+    }
+    return a;
+}
+
+/* Grows a staging buffer to need bytes; the caller holds the lock. */
+static int dg_cuda_reserve(CUdeviceptr *p, size_t *have, size_t need) {
+    if (need <= *have)
+        return 1;
+    if (*p)
+        dg_cuda.free(*p);
+    *have = 0;
+    if (dg_cuda.alloc(p, need)) {
+        *p = 0;
+        return 0;
+    }
+    *have = need;
+    return 1;
+}
+
+/* Splits tokens into tiles of up to DG_CUDA_TOKENS consecutive tokens that
+ * share a matrix, stages the matrix table, the tiles and x in one device
+ * buffer, each part 16-byte aligned, and runs one block per 32 rows and
+ * tile. */
+static void dg_cuda_mm(const DGAccelMatrix *const *m, const int *group, const float *x, float *y,
+                       int tokens) {
+    if (tokens <= 0)
+        return;
+    int count = 0, ntiles = 0, rows = m[group[0]]->rows, cols = m[group[0]]->cols;
+    for (int t = 0; t < tokens; t++) {
+        if (!m[group[t]])
+            die("token routed to a matrix not on the accelerator");
+        if (group[t] >= count)
+            count = group[t] + 1;
+    }
+    DGCudaMatrix *table = xcalloc((size_t)count, sizeof *table);
+    DGCudaTile *tiles = xmalloc((size_t)tokens * sizeof *tiles);
+    for (int i = 0; i < count; i++)
+        if (m[i]) {
+            if (m[i]->rows != rows || m[i]->cols != cols)
+                die("accelerator matrices differ in shape");
+            table[i].w = m[i]->w;
+            table[i].s = m[i]->s;
+            table[i].global = m[i]->global;
+        }
+    for (int t = 0; t < tokens;) {
+        int n = 1;
+        while (t + n < tokens && n < DG_CUDA_TOKENS && group[t + n] == group[t])
+            n++;
+        tiles[ntiles++] = (DGCudaTile){t, n, group[t]};
+        t += n;
+    }
+    size_t tb = ((size_t)count * sizeof *table + 15) & ~(size_t)15,
+           lb = ((size_t)ntiles * sizeof *tiles + 15) & ~(size_t)15, xb = (size_t)tokens * cols * 4,
+           yb = (size_t)tokens * rows * 4;
+    const char *failed = NULL;
+    pthread_mutex_lock(&dg_cuda.lock);
+    if (dg_cuda.ctx_set(dg_cuda.ctx))
+        failed = "cuCtxSetCurrent";
+    else if (!dg_cuda_reserve(&dg_cuda.in, &dg_cuda.in_bytes, tb + lb + xb) ||
+             !dg_cuda_reserve(&dg_cuda.y, &dg_cuda.y_bytes, yb))
+        failed = "cuMemAlloc";
+    else if (dg_cuda.htod(dg_cuda.in, table, (size_t)count * sizeof *table) ||
+             dg_cuda.htod(dg_cuda.in + tb, tiles, (size_t)ntiles * sizeof *tiles) ||
+             dg_cuda.htod(dg_cuda.in + tb + lb, x, xb))
+        failed = "cuMemcpyHtoD";
+    else {
+        CUdeviceptr dt = dg_cuda.in, dl = dg_cuda.in + tb, dx = dg_cuda.in + tb + lb;
+        void *args[] = {&dt, &dl, &ntiles, &dx, &dg_cuda.y, &rows, &cols};
+        unsigned grid_y = ntiles < DG_CUDA_GRID_Y ? (unsigned)ntiles : DG_CUDA_GRID_Y;
+        if (dg_cuda.launch(dg_cuda.mm, (unsigned)((rows + DG_CUDA_ROWS - 1) / DG_CUDA_ROWS), grid_y,
+                           1, DG_CUDA_ROWS, DG_CUDA_TOKENS, 1, 0, NULL, args, NULL))
+            failed = "cuLaunchKernel";
+        else if (dg_cuda.dtoh(y, dg_cuda.y, yb))
+            failed = "cuMemcpyDtoH";
+    }
+    pthread_mutex_unlock(&dg_cuda.lock);
+    jb_release(table);
+    jb_release(tiles);
+    if (failed)
+        die2("CUDA call failed", failed);
+}
+
+static const DGAccelOps *dg_accel(void) {
+    static pthread_once_t once = PTHREAD_ONCE_INIT;
+    static const DGAccelOps cuda = {"cuda", dg_cuda_upload, dg_cuda_release, dg_cuda_mm};
+    pthread_once(&once, dg_cuda_open);
+    if (dg_cuda.failure)
+        die2("CUDA accelerator failed", dg_cuda.failure);
+    return dg_cuda.ready ? &cuda : NULL;
+}
+#else
+static const DGAccelOps *dg_accel(void) {
+    return NULL;
+}
+#endif
+
 static DGTensor *dg_layer_tensor(DGModel *m, int l, const char *tail) {
     char n[192];
     snprintf(n, sizeof n, "model.decoder.layers.%d.%s", l, tail);
@@ -2808,8 +3239,22 @@ static size_t dg_ff_workspace_bytes(const DGModel *m, int n) {
     DG_PLAN_INT((size_t)n * 2);          /* token/slot owner */
     if (m->nvfp4)
         DG_PLAN_FLOAT((size_t)n * DG_MOE); /* quantized hidden */
-    DG_PLAN_FLOAT(DG_H);                   /* MoE sum */
-    DG_PLAN_FLOAT(DG_H);                   /* FF sum */
+    /* dg_experts_accel's rows, one per routed token, are released before the
+     * MoE and FF sums, which they outweigh; the peak includes one or the
+     * other. */
+    if (m->accel) {
+        size_t total = (size_t)n * DG_TOPK;
+        DG_PLAN_INT(total * 2);        /* token/slot owner */
+        DG_PLAN_INT(total);            /* expert of each row */
+        DG_PLAN_FLOAT(total * DG_H);   /* gathered inputs */
+        DG_PLAN_FLOAT(total * DG_MOE); /* gate */
+        DG_PLAN_FLOAT(total * DG_MOE); /* hidden */
+        DG_PLAN_FLOAT(total * DG_MOE); /* quantized hidden */
+        DG_PLAN_FLOAT(total * DG_H);   /* expert outputs */
+    } else {
+        DG_PLAN_FLOAT(DG_H); /* MoE sum */
+        DG_PLAN_FLOAT(DG_H); /* FF sum */
+    }
 #undef DG_PLAN_INT
 #undef DG_PLAN_FLOAT
     return used;
@@ -3117,6 +3562,58 @@ static void dg_attention_segments(DGModel *m, int l, float *x, int segments, int
     jb_arena_reset(workspace, mark);
 }
 
+/* A layer's experts on the accelerator: routed tokens gathered by expert,
+ * one grouped product each for gate, up and down, with GELU and activation
+ * quantization on the CPU, whose tanhf the reference uses. Each value is the
+ * one the per-expert loop computes. qz is the quantized input. */
+static void dg_experts_accel(const DGModel *m, int l, const int *top, const float *tw,
+                             const float *qz, float *contrib, int n, JBArena *workspace) {
+    size_t mark = jb_arena_mark(workspace), total = (size_t)n * DG_TOPK;
+    int *owner = jb_arena_alloc(workspace, total * 2, sizeof *owner, 0),
+        *group = jb_arena_alloc(workspace, total, sizeof *group, 0);
+    float *gather = jb_arena_alloc(workspace, total * DG_H, sizeof *gather, 0),
+          *g = jb_arena_alloc(workspace, total * DG_MOE, sizeof *g, 0),
+          *h = jb_arena_alloc(workspace, total * DG_MOE, sizeof *h, 0),
+          *qh = jb_arena_alloc(workspace, total * DG_MOE, sizeof *qh, 0),
+          *eo = jb_arena_alloc(workspace, total * DG_H, sizeof *eo, 0);
+    const DGAccelMatrix *gate[DG_EXPERTS], *up[DG_EXPERTS], *down[DG_EXPERTS];
+    int rows = 0;
+    for (int e = 0; e < DG_EXPERTS; e++) {
+        const DGNvExpert *v = &m->nvexpert[l * DG_EXPERTS + e];
+        gate[e] = v->accel[0];
+        up[e] = v->accel[1];
+        down[e] = v->accel[2];
+        for (int t = 0; t < n; t++)
+            for (int k = 0; k < DG_TOPK; k++)
+                if (top[(size_t)t * DG_TOPK + k] == e) {
+                    owner[rows * 2] = t;
+                    owner[rows * 2 + 1] = k;
+                    group[rows] = e;
+                    memcpy(gather + (size_t)rows * DG_H, qz + (size_t)t * DG_H, DG_H * 4);
+                    rows++;
+                }
+    }
+    JB_TICK(gated_start);
+    m->accel->nvfp4_mm(gate, group, gather, g, rows);
+    m->accel->nvfp4_mm(up, group, gather, h, rows);
+    dg_gelu_gate(g, h, rows * DG_MOE);
+    JB_TO(moe_gated, gated_start);
+    JB_TICK(hidden_qdq_start);
+    dg_nvfp4_qdq_parallel(qh, h, rows, DG_MOE, m->nv_a2[l]);
+    JB_TO(moe_hidden_qdq, hidden_qdq_start);
+    JB_TICK(down_start);
+    m->accel->nvfp4_mm(down, group, qh, eo, rows);
+    JB_TO(moe_down, down_start);
+    for (int q = 0; q < rows; q++) {
+        int t = owner[q * 2], k = owner[q * 2 + 1];
+        float wt = tw[(size_t)t * DG_TOPK + k], *dst = contrib + ((size_t)t * DG_TOPK + k) * DG_H,
+              *src = eo + (size_t)q * DG_H;
+        for (int i = 0; i < DG_H; i++)
+            dst[i] = wt * src[i];
+    }
+    jb_arena_reset(workspace, mark);
+}
+
 static void dg_ff(DGModel *m, int l, float *x, int n, JBArena *workspace) {
     size_t mark = jb_arena_mark(workspace);
     JB_TICK(ff_start);
@@ -3238,10 +3735,12 @@ static void dg_ff(DGModel *m, int l, float *x, int n, JBArena *workspace) {
     int *owner = jb_arena_alloc(workspace, (size_t)n * 2, sizeof *owner, 0);
     if (qz2) {
         JB_TICK(input_qdq_start);
-        dg_nvfp4_qdq(qz2, z2, n, DG_H, m->nv_a13[l]);
+        dg_nvfp4_expert_qdq(m, qz2, z2, n, DG_H, m->nv_a13[l]);
         JB_TO(moe_input_qdq, input_qdq_start);
     }
-    for (int e = 0; e < DG_EXPERTS; e++) {
+    if (m->accel)
+        dg_experts_accel(m, l, top, tw, qz2, contrib, n, workspace);
+    for (int e = 0; e < DG_EXPERTS && !m->accel; e++) {
         int ne = 0;
         for (int t = 0; t < n; t++)
             for (int k = 0; k < DG_TOPK; k++)
@@ -4913,14 +5412,18 @@ jb_status jb_model_load(const char *model_directory, jb_model **out_model) {
     JBErrorFrame frame;
     jb_frame_enter(&frame, JB_ERROR_MODEL);
     if (setjmp(frame.jump)) {
-        /* Memory is released with the frame; mapped shards are not memory. */
-        if (model)
+        /* Memory is released with the frame; mapped shards and accelerator
+         * memory are not host memory. */
+        if (model) {
+            dg_release_accel(&model->model);
             dg_unmap_shards(&model->model);
+        }
         return jb_frame_fail(&frame);
     }
     model = xcalloc(1, sizeof *model);
     dg_load(&model->model, model_directory);
     dgt_load(&model->tokenizer, model_directory);
+    dg_upload_experts(&model->model);
     jb_frame_leave(&frame);
     *out_model = model;
     jb_error_message[0] = 0;
@@ -5757,6 +6260,23 @@ static void dg_test_nvfp4(uint64_t *rs) {
             jb_check_close("NVFP4 matmul (ref)", y[i], want[i], 1e-4 * mag[i]);
         float *yref = xmalloc((size_t)tokens * rows * 4);
         memcpy(yref, y, (size_t)tokens * rows * 4);
+        const DGAccelOps *accel = dg_accel();
+        if (accel) {
+            DGNvMatrix nm = {wd, sd, global};
+            DGAccelMatrix *am = accel->upload(&nm, rows, cols);
+            if (!am)
+                die2("accelerator self-test failed: upload", accel->name);
+            jb_poison(y, (size_t)tokens * rows);
+            const DGAccelMatrix *list[1] = {am};
+            int *group = xcalloc((size_t)tokens, sizeof *group);
+            accel->nvfp4_mm(list, group, xq, y, tokens);
+            jb_release(group);
+            accel->release(am);
+            for (int i = 0; i < tokens * rows; i++)
+                jb_check_close(accel->name, y[i], want[i], 1e-4 * mag[i]);
+            if (JB_STRICT_MATH && memcmp(y, yref, (size_t)tokens * rows * 4))
+                die2("accelerator self-test failed: differs from the reference", accel->name);
+        }
         /* The production path: QDQ into the selected kernel's layout, then
          * the validated tensor entry point. */
         dg_nvfp4_qdq(xs, x, tokens, cols, base);
@@ -6284,7 +6804,11 @@ static int selftest(void) {
     jb_session_free(public_session);
     dg_kernel_selftest();
     dg_test_locale_numbers();
-    printf("{\"selftest\":\"ok\",\"kernels\":\"%s\"}\n", dg_kernels()->name);
+    if (dg_accel())
+        printf("{\"selftest\":\"ok\",\"kernels\":\"%s\",\"accelerator\":\"%s\"}\n",
+               dg_kernels()->name, dg_accel()->name);
+    else
+        printf("{\"selftest\":\"ok\",\"kernels\":\"%s\"}\n", dg_kernels()->name);
     return 0;
 }
 
