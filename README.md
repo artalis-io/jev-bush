@@ -110,22 +110,29 @@ reference's accumulation order, so strict NEON builds are bit-identical to the
 reference kernels, which the self-test checks. Attention dots put one key in
 each double lane, which keeps each key's sequential double sum in order.
 
-On Linux, `-DJB_CUDA` adds an optional CUDA accelerator for the NVFP4 expert
-matrices. It needs neither `nvcc` nor CUDA headers: the driver and NVRTC are
-loaded at run time and the kernel is compiled from source on first use.
+On Linux, `-DJB_CUDA` adds an optional CUDA accelerator for the transformer
+layers of the NVFP4 checkpoint. It needs neither `nvcc` nor CUDA headers: the
+driver and NVRTC are loaded at run time and the kernels are compiled from
+source on first use.
 
 ```sh
 cc -O3 -march=native -std=c11 -Wall -Wextra -pedantic -fopenmp -DJB_CUDA \
   jb.c -lm -ldl -lpthread -o jb
 ```
 
-Expert weights are uploaded when the model loads, and each layer's experts run
-as one grouped product for gate, up and down; GELU, activation quantization
-and everything else stay on the CPU kernels. The GPU kernel compiles with
-`--fmad=false` and sums each output in the reference's order, so results are
-bit-identical to the reference, which the self-test checks and reports as
+The expert matrices and the layers' BF16 tensors are uploaded when the model
+loads. Each layer then runs on the GPU from its input norm to its layer
+scalar: the BF16 projections, the dense feed-forward layer, the norms, GELU,
+activation quantization and the experts, grouped by expert. Two steps stay on
+the CPU: attention's middle (Q/K norms, rotary embedding, scores, softmax and
+value sums, and the K/V output) and the router's top-k and softmax. The
+kernels compile with `--fmad=false` and IEEE division and square root, and
+compute every value in the reference's order, using the same portable `expf`
+and `tanhf`, so results are bit-identical to the reference. The self-test
+checks each GPU operation against the reference's bits and reports
 `"accelerator":"cuda"`. Without a driver, NVRTC or a device, or with
-`JB_CUDA=0` in the environment, the build runs on the CPU kernels alone.
+`JB_CUDA=0` in the environment, or when the device cannot hold the weights,
+the build runs on the CPU kernels alone.
 
 ### C library API
 
