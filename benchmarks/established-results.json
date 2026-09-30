@@ -221,6 +221,16 @@
           "gpu_busy_seconds_two_rows": {"before": 2.07, "after": 1.72},
           "rms_launch_us": {"before": 318, "after": 141}
         },
+        "matrix_products_and_attention_scores": {
+          "conditions": "runs back to back",
+          "strict_seconds": 45.4,
+          "previous_seconds_same_conditions": 52.4,
+          "strict_identical_answer_objects": 200,
+          "gpu_seconds_eight_rows": {
+            "before": {"busy": 4.84, "attention": 1.34, "bf16": 1.53, "nvfp4": 1.33},
+            "after": {"busy": 4.08, "attention": 0.83, "bf16": 1.27, "nvfp4": 1.33}
+          }
+        },
         "strict_identical_answer_objects_register_tiles": 200,
         "strict_neon_seconds_same_code": 275,
         "strict_reference_seconds": 3353,
