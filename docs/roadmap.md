@@ -543,6 +543,38 @@ The 40 parity rows take 51.5 s, against 60.9 s before, back to back on a
 quiet machine: 64x the reference, byte-identical on all 200 answers. The
 BF16 and NVFP4 products are now 60% of GPU time.
 
+### Matrix products and attention scores
+
+Over all 40 rows, not two, attention was the largest GPU cost: each row's
+suffix prefill runs 250 to 670 tokens against 400 to 900 keys, and the exact
+scores are FP64-bound. Three changes, each checked by kernel time on eight
+rows rather than by end-to-end time on a shared machine:
+
+- Scores read each layer's keys transposed once into a [kv head, dimension,
+  key] scratch, so a warp's threads, which own consecutive keys, read
+  consecutive addresses; and each product `(double)q * k`, exact because two
+  24-bit significands fit in 48 bits, is built with integer operations,
+  leaving only the addition on GB10's FP64 pipe. Attention fell from 1.34 to
+  0.83 s over eight rows. Double keys, with an FP64 multiply, reached only
+  0.97 s. A standalone test matched the integer product to the FP64 multiply
+  on 16.7 million random pairs and every edge case, including zeros,
+  subnormals, infinities and NaNs.
+- BF16 products with a multiple of 64 columns, which every model matrix has,
+  prefetch the next chunk into registers while computing the current one,
+  and choose between 128 rows by 32 tokens a block and, when that leaves the
+  GPU short of blocks, 32 rows by 32 tokens with four warps splitting the
+  tokens, so weights are still read once. 32-row blocks of 8 tokens, tried
+  first, re-read the weights for every tile and were slower. BF16 fell from
+  1.53 to 1.27 s.
+- Prefetching in the NVFP4 kernel made it slower, 1.33 to 2.40 s; with
+  sixteen weight pairs, scales and activations held per thread it likely
+  lost occupancy. Integer products for the RMS and MoE-tail squares changed
+  nothing: those are bound by their serial additions.
+
+GPU time over eight rows fell from 4.84 to 4.08 s, and the 40 parity rows
+from 52.4 to 45.4 s back to back: 73x the reference, byte-identical on all
+200 answers. The NVFP4 expert products, at 1.33 s, are now the largest cost.
+
 ## 7. Make benchmark comparisons auditable
 
 Before publishing a faster number:
