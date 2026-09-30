@@ -1892,12 +1892,6 @@ static void dg_nvfp4_mm_ref(const uint8_t *wd, const uint8_t *sd, float global, 
     }
 }
 
-static float dg_float_bits(uint32_t u) {
-    float x;
-    memcpy(&x, &u, sizeof x);
-    return x;
-}
-
 /* expf and tanhf. Strict builds use these, from IEEE additions,
  * multiplications and divisions in a fixed order and nothing else: no libm
  * and no fused multiply-add, so every strict build, whatever its C library,
@@ -1905,6 +1899,11 @@ static float dg_float_bits(uint32_t u) {
  * may reassociate the range reduction and flushes subnormals, so fast-math
  * builds, which make no claim to identical bits, keep the C library's. */
 #if JB_STRICT_MATH
+static float dg_float_bits(uint32_t u) {
+    float x;
+    memcpy(&x, &u, sizeof x);
+    return x;
+}
 
 /* Rounds x log2(e) half away from zero to n, reduces x by n ln 2 in two
  * parts, the first exact for |n| <= 150, and scales a minimax polynomial by
@@ -6496,7 +6495,10 @@ static void dg_test_portable_math(void) {
     for (uint32_t u = 0; u < 0xffffffffu - 4093; u += 4093) {
         if (((u >> 23) & 255) == 255)
             continue;
-        float x = dg_float_bits(u), e = dg_expf(x), t = dg_tanhf(x);
+        float x, e, t;
+        memcpy(&x, &u, sizeof x);
+        e = dg_expf(x);
+        t = dg_tanhf(x);
         uint32_t be, bt;
         memcpy(&be, &e, sizeof be);
         memcpy(&bt, &t, sizeof bt);
