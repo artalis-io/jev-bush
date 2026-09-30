@@ -120,12 +120,13 @@ cc -O3 -march=native -std=c11 -Wall -Wextra -pedantic -fopenmp -DJB_CUDA \
   jb.c -lm -ldl -lpthread -o jb
 ```
 
-The expert matrices and the layers' BF16 tensors are uploaded when the model
-loads. Each layer then runs on the GPU from its input norm to its layer
-scalar: the BF16 projections, the dense feed-forward layer, the norms, GELU,
-activation quantization and the experts, grouped by expert. Two steps stay on
-the CPU: attention's middle (Q/K norms, rotary embedding, scores, softmax and
-value sums, and the K/V output) and the router's top-k and softmax. The
+The expert matrices and the layers' BF16 tensors are placed in one device
+allocation when the model loads. Each layer then runs on the GPU from its
+input norm to its layer scalar: the projections, Q/K norms, rotary embedding,
+attention scores, softmax and value sums, the dense feed-forward layer, the
+norms, GELU, activation quantization and the experts, grouped by expert. The
+CPU still computes the rotary tables and the router's top-k and softmax, and
+keeps the K/V cache, whose rows go up for each attention call. The
 kernels compile with `--fmad=false` and IEEE division and square root, and
 compute every value in the reference's order, using the same portable `expf`
 and `tanhf`, so results are bit-identical to the reference. The self-test

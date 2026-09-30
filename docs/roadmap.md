@@ -493,6 +493,32 @@ fitting more tokens per SM did not help, and more tokens made it slower. Over
 eight rows the host's share is now attention's middle, about 7 s of 13;
 running it on the GPU, with the K/V cache in device memory, is phase 2.
 
+### CUDA attention, phase 2
+
+Attention now runs on the GPU too: Q/K/V head norms with the RMS kernel,
+rotary embedding from tables the host computes with the C library's `cosf`
+and `sinf`, and one block per token and head for the rest. Each thread
+scores one key with a double sum in index order, as `dg_dot_ref`; a tree
+finds the maximum, which order cannot change; `dg_expf` runs per key; one
+thread sums the denominator in key order; and each thread sums one output
+value over the keys in order. The K/V cache stays on the host, and each
+call uploads its distinct caches' rows, once per layer; K and V come back
+only for a K/V output. A self-test checks the rotary embedding and
+attention against the reference's loops bit for bit, with segments sharing
+a cache and one without, in canvas and causal modes.
+
+Profiling the first version found model load dominating a short run: the
+upload made 23,576 device allocations, which took 12.9 s, and freeing them
+another 3.6 s. Every weight now goes into one allocation, placed in two
+passes, and one row with model load went from 23 to 11.5 s.
+
+With other jobs on the machine, phase 1 took 111 s for the 40 parity rows
+and phase 2 72 to 81 s, back to back, both byte-identical on all 200
+answers. Over eight profiled rows host-side time fell from 16.0 to 10.0 s.
+What remains per layer is synchronization: the router's logits come down,
+and each attention call uploads the cached rows. A device-resident K/V cache
+and the router on the device are the next steps.
+
 ## 7. Make benchmark comparisons auditable
 
 Before publishing a faster number:

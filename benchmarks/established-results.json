@@ -205,6 +205,14 @@
             "bf16_mm": 0.54, "nvfp4_mm": 0.50, "rms": 0.26, "moe_tail": 0.09
           }
         },
+        "attention_phase_2": {
+          "conditions": "other jobs on the machine, runs back to back",
+          "strict_seconds": [72, 81],
+          "phase_1_seconds_same_conditions": 111,
+          "strict_identical_answer_objects": 200,
+          "host_seconds_eight_profiled_rows": {"phase_1": 16.0, "phase_2": 10.0},
+          "one_row_with_model_load_seconds": {"per_weight_allocations": 23.0, "one_allocation": 11.5}
+        },
         "strict_identical_answer_objects_register_tiles": 200,
         "strict_neon_seconds_same_code": 275,
         "strict_reference_seconds": 3353,
