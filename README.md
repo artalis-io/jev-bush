@@ -103,8 +103,25 @@ On little-endian AArch64 (Apple Silicon, Graviton, NVIDIA Grace and GB10) the
 portable build selects the NEON tier automatically. It covers NVFP4 and BF16
 matrices and RMS normalization; each vector lane computes one output row in the
 reference's accumulation order, so strict NEON builds are bit-identical to the
-reference kernels, which the self-test checks. Attention dots keep the
-reference, whose sequential double sum has no reordering-free vector form.
+reference kernels, which the self-test checks. Attention dots put one key in
+each double lane, which keeps each key's sequential double sum in order.
+
+On Linux, `-DJB_CUDA` adds an optional CUDA accelerator for the NVFP4 expert
+matrices. It needs neither `nvcc` nor CUDA headers: the driver and NVRTC are
+loaded at run time and the kernel is compiled from source on first use.
+
+```sh
+cc -O3 -march=native -std=c11 -Wall -Wextra -pedantic -fopenmp -DJB_CUDA \
+  jb.c -lm -ldl -lpthread -o jb
+```
+
+Expert weights are uploaded when the model loads, and each layer's experts run
+as one grouped product for gate, up and down; GELU, activation quantization
+and everything else stay on the CPU kernels. The GPU kernel compiles with
+`--fmad=false` and sums each output in the reference's order, so results are
+bit-identical to the reference, which the self-test checks and reports as
+`"accelerator":"cuda"`. Without a driver, NVRTC or a device, or with
+`JB_CUDA=0` in the environment, the build runs on the CPU kernels alone.
 
 ### C library API
 
