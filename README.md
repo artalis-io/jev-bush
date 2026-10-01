@@ -556,11 +556,13 @@ The trusted reference is OpenJev commit `91d5005` with patched vLLM commit
 | Jev Bush NVFP4, fast-math, one read | 66.80% | 1.5777 | 0.3272 | 0.2454 | 0.4441 |
 | Jev Bush NVFP4, strict, portable `expf`/`tanhf`, automatic reads | 65.95% | 1.4296 | 0.3168 | 0.2442 | 0.4366 |
 | Jev Bush NVFP4, fast-math CUDA, tensor cores, automatic reads | 66.70% | 1.4398 | 0.3164 | 0.2409 | 0.4353 |
+| Jev Bush NVFP4, fast-math CUDA, tensor cores, one read | 66.65% | 1.5191 | 0.3261 | 0.2484 | 0.4359 |
 
 The strict portable row is the current strict build, whose output is the same
 on every platform, and the last row the fast CUDA build with prefix reuse on a
 DGX Spark. Both ran the requests as published, without `samples`, so OpenJev's
-entropy rule chose four reads for 366 of the 400 rows; earlier versions of
+entropy rule chose four reads for 366 of the 400 rows; the row after them is the
+same fast CUDA build with `samples: 1`; earlier versions of
 this table mislabeled them as one read. The Jev Bush rows above them are
 recorded as one read a row, with the C library's `expf` and `tanhf` at earlier
 commits. On the same code and machine, switching to the
@@ -600,8 +602,11 @@ transformer execution dominates. The strict build scored better log loss and
 Brier, while fast-math improved accuracy, ECE, and throughput. Resident memory
 is about 14.8 GB per process.
 
-OpenJev on an RTX PRO 6000 Blackwell averaged 54.2 ms per one-read row. That
-GPU comparison is context, not a target: Jev Bush is an educational
+OpenJev on an RTX PRO 6000 Blackwell averaged 54.2 ms per one-read row. On a
+DGX Spark, the fast CUDA build averages 268 ms per one-read row, one request at
+a time and model load excluded; the RTX PRO 6000 has about 6.5 times GB10's
+memory bandwidth, which bounds most of Jev Bush's decoding. That GPU
+comparison is context, not a target: Jev Bush is an educational
 implementation whose optional CUDA path is bit-identical to the CPU reference
 in strict builds, and whose fast-math CUDA build trades that for speed as the
 CPU's fast-math build does.

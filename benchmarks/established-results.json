@@ -136,6 +136,22 @@
         "neon_fast": {"argmax_agreement": 0.98, "mean_total_variation": 0.0264},
         "neon_fast_seconds": {"without": 456, "with": 234}
       }
+    },
+    {
+      "engine": "jev-bush",
+      "checkpoint": "NVFP4",
+      "read_policy": "one",
+      "read_policy_note": "requests with samples: 1",
+      "math": "fast",
+      "hardware": "NVIDIA DGX Spark, NEON with the CUDA accelerator's fast kernels, fast-math prefix reuse",
+      "accuracy": 0.6665,
+      "label_log_loss": 1.5191,
+      "brier": 0.3261,
+      "ece": 0.2484,
+      "score_mae": 0.4359,
+      "mean_ms_per_row": 268.0,
+      "timing_note": "sum of each row's own timing over 400 rows, one request at a time, model load excluded; 115 s wall including load",
+      "seconds_by_phase": {"prefill": 72.4, "decode": 29.9, "candidates": 5.0}
     }
   ],
   "agreement": {
