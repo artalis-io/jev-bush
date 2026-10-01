@@ -62,10 +62,10 @@ evaluated as `usage.prefill_tokens`.
 
 Strict arithmetic defines canonical Jev Bush semantics: reproducible output
 must not depend on batching or temporary-buffer shape. It does not depend on
-the platform either: strict builds compute `expf` and `tanhf` with their own
-portable implementations instead of the C library's, so every strict build and
-the CUDA accelerator produce the same bits, which the self-test checks with a
-recorded hash.
+the platform either: strict builds compute `expf`, `tanhf` and the router's
+double `exp` with their own portable implementations instead of the C
+library's, so every strict build and the CUDA accelerator produce the same
+bits, which the self-test checks with recorded hashes.
 
 Linux, approximate highest-throughput experiment:
 
@@ -125,11 +125,13 @@ allocation when the model loads. Each layer then runs on the GPU from its
 input norm to its layer scalar: the projections, Q/K norms, rotary embedding,
 attention scores, softmax and value sums, the dense feed-forward layer, the
 norms, GELU, activation quantization and the experts, grouped by expert. The
-CPU still computes the rotary tables and the router's top-k and softmax, and
-keeps the K/V cache, whose rows go up for each attention call. The
+router's top-k and softmax and the grouping of routed tokens by expert run on
+the GPU too, so routing no longer round-trips through the host. The CPU computes the rotary
+tables and keeps the K/V cache: each attention call uploads its cached rows,
+and a prefill's new rows come back once, after the last layer. The
 kernels compile with `--fmad=false` and IEEE division and square root, and
-compute every value in the reference's order, using the same portable `expf`
-and `tanhf`, so results are bit-identical to the reference. The self-test
+compute every value in the reference's order, using the same portable `expf`,
+`tanhf` and `exp`, so results are bit-identical to the reference. The self-test
 checks each GPU operation against the reference's bits and reports
 `"accelerator":"cuda"`. Without a driver, NVRTC or a device, or with
 `JB_CUDA=0` in the environment, or when the device cannot hold the weights,
