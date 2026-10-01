@@ -31,7 +31,7 @@ jobs:
       - name: Build and test
         if: runner.os != 'Windows'
         run: |
-          cc -O2 -std=c11 -Wall -Wextra -pedantic jb.c -lm -o jb
+          cc -O2 -std=c11 -Wall -Wextra -pedantic -Wshadow -Wformat=2 jb.c -lm -o jb
           ./jb --selftest | tee selftest.json
 
       # ARM runners select the NEON backend, whose strict selftest also checks
@@ -41,10 +41,10 @@ jobs:
         if: runner.arch == 'ARM64'
         run: |
           grep -q '"kernels":"neon"' selftest.json
-          cc -O2 -std=c11 -Wall -Wextra -pedantic -Werror -ffast-math jb.c -lm -o jb-fast
+          cc -O2 -std=c11 -Wall -Wextra -pedantic -Wshadow -Wformat=2 -Werror -ffast-math jb.c -lm -o jb-fast
           ./jb-fast --selftest | tee fast.json
           grep -q '"kernels":"neon"' fast.json
-          cc -O2 -std=c11 -Wall -Wextra -pedantic -Werror -DJB_SCALAR jb.c -lm -o jb-scalar
+          cc -O2 -std=c11 -Wall -Wextra -pedantic -Wshadow -Wformat=2 -Werror -DJB_SCALAR jb.c -lm -o jb-scalar
           ./jb-scalar --selftest | tee scalar.json
           grep -q '"kernels":"scalar"' scalar.json
 
@@ -54,7 +54,7 @@ jobs:
       - name: CUDA build without a GPU
         if: runner.os == 'Linux'
         run: |
-          cc -O2 -std=c11 -Wall -Wextra -pedantic -Werror -DJB_CUDA jb.c -lm -ldl -lpthread -o jb-cuda
+          cc -O2 -std=c11 -Wall -Wextra -pedantic -Wshadow -Wformat=2 -Werror -DJB_CUDA jb.c -lm -ldl -lpthread -o jb-cuda
           ./jb-cuda --selftest | tee cuda.json
           ! grep -q accelerator cuda.json
 
@@ -107,7 +107,7 @@ jobs:
 
       - name: Build and test
         run: |
-          gcc -O2 -std=c11 -Wall -Wextra -pedantic -Werror jb.c -lm -o jb
+          gcc -O2 -std=c11 -Wall -Wextra -pedantic -Wshadow -Wformat=2 -Werror jb.c -lm -o jb
           ./jb --selftest
           rc=0
           ./jb missing-model decide examples/request.json 2>err.txt || rc=$?
@@ -117,7 +117,7 @@ jobs:
 
       - name: Library error path
         run: |
-          gcc -O2 -std=c11 -Wall -Wextra -pedantic -Werror -DJB_NO_MAIN -I. \
+          gcc -O2 -std=c11 -Wall -Wextra -pedantic -Wshadow -Wformat=2 -Werror -DJB_NO_MAIN -I. \
             examples/library.c jb.c -lm -o library
           rc=0
           ./library missing-model 2>err.txt || rc=$?
@@ -153,7 +153,7 @@ jobs:
 
       - name: Build
         run: |
-          gcc -O2 -march=skylake-avx512 -std=c11 -Wall -Wextra -pedantic -Werror ${{ matrix.flags }} \
+          gcc -O2 -march=skylake-avx512 -std=c11 -Wall -Wextra -pedantic -Wshadow -Wformat=2 -Werror ${{ matrix.flags }} \
             jb.c -lm -o jb-avx512
 
       # The selftest reports the kernels it tested; fail on a scalar fallback.
@@ -181,7 +181,7 @@ jobs:
 
       - name: Build
         run: |
-          gcc -O2 -mavx2 -mfma -mno-avx512f -std=c11 -Wall -Wextra -pedantic -Werror \
+          gcc -O2 -mavx2 -mfma -mno-avx512f -std=c11 -Wall -Wextra -pedantic -Wshadow -Wformat=2 -Werror \
             ${{ matrix.flags }} -fopenmp jb.c -lm -o jb-avx2
 
       - name: Selftest
@@ -206,7 +206,7 @@ jobs:
 
       - name: Build
         run: |
-          clang -O1 -g -std=c11 -Wall -Wextra -pedantic -Werror ${{ matrix.flags }} \
+          clang -O1 -g -std=c11 -Wall -Wextra -pedantic -Wshadow -Wformat=2 -Werror ${{ matrix.flags }} \
             -fsanitize=address,undefined -fno-sanitize-recover=all \
             -fno-omit-frame-pointer jb.c -lm -o jb-asan
 
@@ -230,7 +230,7 @@ jobs:
         env:
           ASAN_OPTIONS: detect_leaks=1
         run: |
-          clang -O1 -g -std=c11 -Wall -Wextra -pedantic -Werror ${{ matrix.flags }} \
+          clang -O1 -g -std=c11 -Wall -Wextra -pedantic -Wshadow -Wformat=2 -Werror ${{ matrix.flags }} \
             -fsanitize=address,undefined -fno-sanitize-recover=all \
             -fno-omit-frame-pointer -DJB_NO_MAIN -I. examples/library.c jb.c -lm \
             -o library-asan
@@ -250,7 +250,7 @@ jobs:
 
       - name: Build hardened binary
         run: |
-          cc -O2 -std=c11 -Wall -Wextra -pedantic -Werror \
+          cc -O2 -std=c11 -Wall -Wextra -pedantic -Wshadow -Wformat=2 -Werror \
             -fstack-protector-strong -D_FORTIFY_SOURCE=3 -fPIE -pie \
             -Wl,-z,relro,-z,now,-z,noexecstack jb.c -lm -o jb-hardened
           ./jb-hardened --selftest
