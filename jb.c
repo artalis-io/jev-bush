@@ -1028,7 +1028,8 @@ typedef struct DGAccelMatrix DGAccelMatrix;
 /* An optional accelerator for the transformer layers, bit-identical to the
  * reference in strict builds and about as close as fast math in fast ones.
  * The caller places weights in device memory (alloc, to_device) and runs
- * each step of a layer on device addresses, in the order it issues them; to_host waits for the steps before it. dg_accel() returns NULL when
+ * each step of a layer on device addresses, in the order it issues them;
+ * to_host waits for the steps before it. dg_accel() returns NULL when
  * none is built or available; alloc returns 0 when the device is out of
  * memory. free, host_free and release never fail: they run on cleanup
  * paths, including a failed call's and ones without an error frame, and a
@@ -1129,6 +1130,9 @@ typedef struct {
      * memory already placed belongs to. */
     const DGAccelOps *accel;
     DGDevice weights;
+    /* The tied embedding on the accelerator in its own allocation, or 0:
+     * optional, so a device without room for it keeps the layers. */
+    DGDevice embedding;
     /* Each layer's gate, up and down matrices as device tables, inside
      * weights. */
     DGDevice expert_table[DG_L][3];
@@ -1437,7 +1441,9 @@ static void dg_release_accel(DGModel *m) {
         m->tensor[i].device = 0;
     if (m->weights)
         a->free(m->weights);
-    m->weights = 0;
+    if (m->embedding)
+        a->free(m->embedding);
+    m->weights = m->embedding = 0;
     m->accel = NULL;
 }
 
@@ -1516,11 +1522,6 @@ static void dg_upload_model(DGModel *m) {
                         t->device = p;
                 }
         }
-        /* The tied embedding, for the vocabulary logits of automatic reads. */
-        DGTensor *emb = dg_tensor(m, "model.decoder.embed_tokens.weight");
-        DGDevice ep = dg_place(a, m->weights, &at, emb->data, (size_t)emb->bytes);
-        if (pass)
-            emb->device = ep;
         for (int l = 0; l < DG_L; l++)
             for (int k = 0; k < 3; k++) {
                 at = jb_align_up(at, 256);
@@ -1537,6 +1538,13 @@ static void dg_upload_model(DGModel *m) {
             m->accel = NULL;
             return;
         }
+    }
+    /* The tied embedding, for the vocabulary logits of automatic reads, if
+     * the device has room for it; otherwise the CPU computes them. */
+    DGTensor *emb = dg_tensor(m, "model.decoder.embed_tokens.weight");
+    if ((m->embedding = a->alloc((size_t)emb->bytes))) {
+        a->to_device(m->embedding, emb->data, (size_t)emb->bytes);
+        emb->device = m->embedding;
     }
 }
 
@@ -4047,7 +4055,8 @@ static const char *const dg_cuda_source[] = {
     "    asm volatile(\"mma.sync.aligned.m16n8k8.row.col.f32.tf32.tf32.f32 \"\n"
     "                 \"{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\"\n"
     "                 : \"+f\"(c[0]), \"+f\"(c[1]), \"+f\"(c[2]), \"+f\"(c[3])\n"
-    "                 : \"r\"(a[0]), \"r\"(a[1]), \"r\"(a[2]), \"r\"(a[3]), \"r\"(b0), \"r\"(b1));\n"
+    "                 : \"r\"(a[0]), \"r\"(a[1]), \"r\"(a[2]), \"r\"(a[3]), \"r\"(b0),\n"
+    "                         \"r\"(b1));\n"
     "}\n"
     "\n"
     "/* The split product of a 16 x 8 tile with elements x[0..3] in fragment\n"
@@ -4089,7 +4098,8 @@ static const char *const dg_cuda_source[] = {
     "template <int HD>\n"
     "__device__ void dg_attention_fast_body(float *out, const float *q, const float *k,\n"
     "        const float *v, const float *k_old, const float *v_old, const int *seg_old,\n"
-    "        const int *seg_base, int seq, int heads, int kvh, int canvas, int full, int window) {\n"
+    "        const int *seg_base, int seq, int heads, int kvh, int canvas, int full,\n"
+    "                int window) {\n"
     "    __shared__ float pt[16][33];\n",
     "    __shared__ float m_run[16], l_run[16], rescale[16];\n"
     "    const int qn = heads * HD, kn = kvh * HD, DW = HD / 4, NT = DW / 8;\n"
@@ -4129,7 +4139,8 @@ static const char *const dg_cuda_source[] = {
     "        }\n"
     "        __syncthreads();\n"
     "        for (int e = 0; e < 4; e++) {\n"
-    "            int row = g + (e >> 1) * 8, col = warp * 8 + 2 * c + (e & 1), t = t0 + row, j = k0 + col;\n"
+    "            int row = g + (e >> 1) * 8, col = warp * 8 + 2 * c + (e & 1), t = t0 + row,\n"
+    "                    j = k0 + col;\n"
     "            int a, b;\n"
     "            dg_key_range(t, seq, old, canvas, full, window, &a, &b);\n"
     "            pt[row][col] = t < seq && j >= a && j < b ? sc[e] : DG_NEG_INF;\n"
@@ -4165,17 +4176,17 @@ static const char *const dg_cuda_source[] = {
     "        for (int i = 0; i < NT; i++) {\n"
     "            o[i][0] *= fa;\n"
     "            o[i][1] *= fa;\n"
-    "            o[i][2] *= fb;\n"
-    "            o[i][3] *= fb;\n",
+    "            o[i][2] *= fb;\n",
+    "            o[i][3] *= fb;\n"
     "        }\n"
     "        for (int ks = 0; ks < 32; ks += 8) {\n"
     "            float p[4] = {pt[g][ks + c], pt[g + 8][ks + c], pt[g][ks + c + 4],\n"
     "                          pt[g + 8][ks + c + 4]};\n"
     "            int j0 = k0 + ks + c, j1 = j0 + 4;\n"
     "            const float *v0 = j0 >= kmax ? 0 : (j0 < old ? vc + (size_t)j0 * kn\n"
-    "                                                             : vq + (size_t)(j0 - old) * kn),\n"
+    "                                                     : vq + (size_t)(j0 - old) * kn),\n"
     "                        *v1 = j1 >= kmax ? 0 : (j1 < old ? vc + (size_t)j1 * kn\n"
-    "                                                             : vq + (size_t)(j1 - old) * kn);\n"
+    "                                                     : vq + (size_t)(j1 - old) * kn);\n"
     "            for (int i = 0; i < NT; i++) {\n"
     "                int d = warp * DW + i * 8 + g;\n"
     "                dg_mma_split(o[i], p, v0 ? v0[d] : 0.0f, v1 ? v1[d] : 0.0f);\n"
@@ -4199,7 +4210,8 @@ static const char *const dg_cuda_source[] = {
     "}\n"
     "\n"
     "extern \"C\" __global__ void __launch_bounds__(128) dg_attention_fast_local(float *out,\n"
-    "        const float *q, const float *k, const float *v, const float *k_old, const float *v_old,\n"
+    "        const float *q, const float *k, const float *v, const float *k_old,\n"
+    "                const float *v_old,\n"
     "        const int *seg_old, const int *seg_base, int seq, int heads, int kvh, int canvas,\n"
     "        int full, int window) {\n"
     "    dg_attention_fast_body<DG_LOCAL_HD>(out, q, k, v, k_old, v_old, seg_old, seg_base, seq,\n"
@@ -4207,7 +4219,8 @@ static const char *const dg_cuda_source[] = {
     "}\n"
     "\n"
     "extern \"C\" __global__ void __launch_bounds__(128) dg_attention_fast_full(float *out,\n"
-    "        const float *q, const float *k, const float *v, const float *k_old, const float *v_old,\n"
+    "        const float *q, const float *k, const float *v, const float *k_old,\n"
+    "                const float *v_old,\n"
     "        const int *seg_old, const int *seg_base, int seq, int heads, int kvh, int canvas,\n"
     "        int full, int window) {\n"
     "    dg_attention_fast_body<DG_HEAD_MAX>(out, q, k, v, k_old, v_old, seg_old, seg_base, seq,\n"
@@ -4229,7 +4242,8 @@ static const char *const dg_cuda_source[] = {
     "    asm volatile(\"mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 \"\n"
     "                 \"{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\"\n"
     "                 : \"+f\"(c[0]), \"+f\"(c[1]), \"+f\"(c[2]), \"+f\"(c[3])\n"
-    "                 : \"r\"(a[0]), \"r\"(a[1]), \"r\"(a[2]), \"r\"(a[3]), \"r\"(b0), \"r\"(b1));\n"
+    "                 : \"r\"(a[0]), \"r\"(a[1]), \"r\"(a[2]), \"r\"(a[3]), \"r\"(b0),\n"
+    "                         \"r\"(b1));\n"
     "}\n"
     "\n"
     "/* dg_bf16_mm on tensor cores, for column counts that are a multiple of 32.\n"
@@ -4237,9 +4251,10 @@ static const char *const dg_cuda_source[] = {
     " * its bits, so every product is exact and only the FP32 sums round. A\n"
     " * block of eight warps covers 128 rows and 64 tokens, 32 columns at a\n"
     " * time through shared memory; each warp computes 32 rows by 32 tokens. */\n"
-    "extern \"C\" __global__ void __launch_bounds__(256) dg_bf16_mm_fast(const unsigned short *w,\n"
+    "extern \"C\" __global__ void __launch_bounds__(256)\n"
+    "dg_bf16_mm_fast(const unsigned short *w,\n",
     "        const float *x, float *y, int tokens, int rows, int cols) {\n"
-    "    __shared__ unsigned ws[128][20];\n",
+    "    __shared__ unsigned ws[128][20];\n"
     "    __shared__ unsigned xs[3][64][20];\n"
     "    int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, g = lane >> 2, c = lane & 3;\n"
     "    int wr = (warp & 3) * 32, wt = (warp >> 2) * 32, r0 = blockIdx.x * 128;\n"
@@ -4271,7 +4286,8 @@ static const char *const dg_cuda_source[] = {
     "                int tok = tid >> 2, part = tid & 3, gt = t0 + tok;\n"
     "                float4 f0 = make_float4(0, 0, 0, 0), f1 = f0;\n"
     "                if (gt < tokens) {\n"
-    "                    const float4 *p = (const float4 *)(x + (size_t)gt * cols + k0) + part * 2;\n"
+    "                    const float4 *p =\n"
+    "                        (const float4 *)(x + (size_t)gt * cols + k0) + part * 2;\n"
     "                    f0 = p[0];\n"
     "                    f1 = p[1];\n"
     "                }\n"
@@ -4319,8 +4335,8 @@ static const char *const dg_cuda_source[] = {
     "#endif\n"
     "\n"
     "#if DG_FAST\n"
-    "/* dg_bf16_mm_fast for few blocks' worth of rows and tokens, as in decoding,\n"
-    " * for column counts that are a multiple of 64: a block covers 32 rows and\n",
+    "/* dg_bf16_mm_fast for few blocks' worth of rows and tokens, as in decoding,\n",
+    " * for column counts that are a multiple of 64: a block covers 32 rows and\n"
     " * 64 tokens, and its four pairs of warps each take 16 of every 64 columns,\n"
     " * so four times as many warps stream the weights. The pairs' partial sums\n"
     " * are added in shared memory at the end, always in the same order. */\n"
@@ -4388,8 +4404,9 @@ static const char *const dg_cuda_source[] = {
     "            for (int i = 0; i < 2; i++)\n"
     "                for (int j = 0; j < 4; j++)\n"
     "                    for (int e = 0; e < 4; e++) {\n"
-    "                        int r = i * 16 + g + (e >> 1) * 8, t = wt + j * 8 + 2 * c + (e & 1);\n"
-    "                        red[((gk - 1) * 32 + r) * 64 + t] = acc[i][j][e];\n",
+    "                        int r = i * 16 + g + (e >> 1) * 8,\n",
+    "                            t = wt + j * 8 + 2 * c + (e & 1);\n"
+    "                        red[((gk - 1) * 32 + r) * 64 + t] = acc[i][j][e];\n"
     "                    }\n"
     "        __syncthreads();\n"
     "        if (gk == 0)\n"
@@ -4416,7 +4433,8 @@ static const char *const dg_cuda_source[] = {
     " * cores, whose E2M1 and E4M3 products are exact; only the FP32 sums round. */\n"
     "\n"
     "/* A packed row's bytes: the nibbles, the scale codes and the global scale,\n"
-    " * padded to 16 bytes so rows can be read 16 bytes at a time. */\n"
+    " * padded to 16 bytes so rows can be read 16 bytes at a time; the host's\n"
+    " * dg_cuda_nvfp4_row must compute the same. */\n"
     "__device__ size_t dg_fp4_stride(int cols) {\n"
     "    return ((size_t)cols / 2 + (size_t)cols / 16 + 4 + 15) & ~(size_t)15;\n"
     "}\n"
@@ -4476,12 +4494,12 @@ static const char *const dg_cuda_source[] = {
     "        unsigned code = dg_f8e4m3_code((amax / 6) / base);\n"
     "        float s = dg_f8e4m3(code) * base;\n"
     "        unsigned w0 = 0, w1 = 0;\n"
-    "        if (s != 0)\n"
+    "        if (s != 0)\n",
     "            for (int k = 0; k < 16; k++) {\n"
     "                unsigned v = dg_e2m1_code(x[k] / s) << (4 * (k & 7));\n"
     "                if (k < 8)\n"
     "                    w0 |= v;\n"
-    "                else\n",
+    "                else\n"
     "                    w1 |= v;\n"
     "            }\n"
     "        else\n"
@@ -4546,32 +4564,33 @@ static const char *const dg_cuda_source[] = {
     "             * pieces a thread, and their scales, two words a thread; and\n"
     "             * each slot's 128 bytes and 16 bytes of scales, nine 16-byte\n"
     "             * pieces a slot. */\n"
-    "#define DG_FP4_LOAD(kc)                                                                       \\\n"
-    "    do {                                                                                      \\\n"
-    "        int bytes_ = (cols - (kc)) / 2 < 128 ? (cols - (kc)) / 2 : 128;                       \\\n",
-    "        for (int j_ = 0; j_ < 4; j_++) {                                                      \\\n"
-    "            int u_ = tid + 128 * j_, row_ = u_ >> 3, q_ = u_ & 7;                             \\\n"
-    "            int gr_ = r0 + row_ < rows ? r0 + row_ : rows - 1;                                \\\n"
-    "            if (q_ * 16 < bytes_)                                                             \\\n"
-    "                wv[j_] = *(const uint4 *)(mt.w + (size_t)gr_ * wb + (kc) / 2 + q_ * 16);      \\\n"
-    "        }                                                                                     \\\n"
-    "        for (int j_ = 0; j_ < 2; j_++) {                                                      \\\n"
-    "            int v_ = tid + 128 * j_, row_ = v_ >> 2, q_ = v_ & 3;                             \\\n"
-    "            int gr_ = r0 + row_ < rows ? r0 + row_ : rows - 1;                                \\\n"
-    "            if (q_ * 64 < cols - (kc))                                                        \\\n"
-    "                sv[j_] = *(const unsigned *)(mt.s + (size_t)gr_ * sb + (kc) / 16 + q_ * 4);   \\\n"
-    "        }                                                                                     \\\n"
-    "        for (int j_ = 0; j_ < XV; j_++) {                                                     \\\n"
-    "            int u_ = tid + 128 * j_, s_ = u_ / 9, q_ = u_ % 9;                                \\\n"
-    "            xv[j_] = make_uint4(0, 0, 0, 0);                                                  \\\n"
-    "            if (s_ < SLOTS && slot_row[s_] >= 0) {                                            \\\n"
-    "                const unsigned char *r_ = x + (size_t)slot_row[s_] * stride;                  \\\n"
-    "                if (q_ < 8 && q_ * 16 < bytes_)                                               \\\n"
-    "                    xv[j_] = *(const uint4 *)(r_ + (kc) / 2 + q_ * 16);                       \\\n"
-    "                else if (q_ == 8)                                                             \\\n"
-    "                    xv[j_] = *(const uint4 *)(r_ + wb + (kc) / 16);                           \\\n"
-    "            }                                                                                 \\\n"
-    "        }                                                                                     \\\n"
+    "#define DG_FP4_LOAD(kc) \\\n"
+    "    do { \\\n"
+    "        int bytes_ = (cols - (kc)) / 2 < 128 ? (cols - (kc)) / 2 : 128; \\\n",
+    "        for (int j_ = 0; j_ < 4; j_++) { \\\n"
+    "            int u_ = tid + 128 * j_, row_ = u_ >> 3, q_ = u_ & 7; \\\n"
+    "            int gr_ = r0 + row_ < rows ? r0 + row_ : rows - 1; \\\n"
+    "            if (q_ * 16 < bytes_) \\\n"
+    "                wv[j_] = *(const uint4 *)(mt.w + (size_t)gr_ * wb + (kc) / 2 + q_ * 16); \\\n"
+    "        } \\\n"
+    "        for (int j_ = 0; j_ < 2; j_++) { \\\n"
+    "            int v_ = tid + 128 * j_, row_ = v_ >> 2, q_ = v_ & 3; \\\n"
+    "            int gr_ = r0 + row_ < rows ? r0 + row_ : rows - 1; \\\n"
+    "            if (q_ * 64 < cols - (kc)) \\\n"
+    "                sv[j_] = *(const unsigned *)(mt.s + (size_t)gr_ * sb + \\\n"
+    "                                             (kc) / 16 + q_ * 4); \\\n"
+    "        } \\\n"
+    "        for (int j_ = 0; j_ < XV; j_++) { \\\n"
+    "            int u_ = tid + 128 * j_, s_ = u_ / 9, q_ = u_ % 9; \\\n"
+    "            xv[j_] = make_uint4(0, 0, 0, 0); \\\n"
+    "            if (s_ < SLOTS && slot_row[s_] >= 0) { \\\n"
+    "                const unsigned char *r_ = x + (size_t)slot_row[s_] * stride; \\\n"
+    "                if (q_ < 8 && q_ * 16 < bytes_) \\\n"
+    "                    xv[j_] = *(const uint4 *)(r_ + (kc) / 2 + q_ * 16); \\\n"
+    "                else if (q_ == 8) \\\n"
+    "                    xv[j_] = *(const uint4 *)(r_ + wb + (kc) / 16); \\\n"
+    "            } \\\n"
+    "        } \\\n"
     "    } while (0)\n"
     "            DG_FP4_LOAD(0);\n"
     "            for (int kc = 0, buf = 0; kc < cols; kc += 256, buf ^= 1) {\n"
@@ -4594,24 +4613,29 @@ static const char *const dg_cuda_source[] = {
     "                int steps = (cols - kc) / 64 < 4 ? (cols - kc) / 64 : 4;\n"
     "                for (int s = 0; s < steps; s++) {\n"
     "                    unsigned a0 = wsh[buf][rw][s * 8 + c], a1 = wsh[buf][rw + 8][s * 8 + c],\n"
-    "                             a2 = wsh[buf][rw][s * 8 + 4 + c], a3 = wsh[buf][rw + 8][s * 8 + 4 + c];\n"
+    "                             a2 = wsh[buf][rw][s * 8 + 4 + c],\n"
+    "                                     a3 = wsh[buf][rw + 8][s * 8 + 4 + c];\n"
     "                    unsigned sav = ssh[buf][c == 0 ? rw : rw + 8][s];\n"
     "#pragma unroll\n"
     "                    for (int i = 0; i < DG_FP4_RUN; i++)\n"
-    "                        if (i < run) {\n",
+    "                        if (i < run) {\n"
     "                            const unsigned *xs = xsh[buf][i * 8 + g];\n"
-    "                            asm(\"mma.sync.aligned.m16n8k64.row.col.kind::mxf4nvf4.block_scale\"\n"
+    "                            asm(\"mma.sync.aligned.m16n8k64.row.col.kind::mxf4nvf4\"\n"
+    "                                \".block_scale\"\n"
     "                                \".scale_vec::4X.f32.e2m1.e2m1.f32.ue4m3 {%0,%1,%2,%3}, \"\n"
-    "                                \"{%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3}, %10, {0, 0}, %11, {0, 0};\"\n"
-    "                                : \"+f\"(d[i][0]), \"+f\"(d[i][1]), \"+f\"(d[i][2]), \"+f\"(d[i][3])\n"
-    "                                : \"r\"(a0), \"r\"(a1), \"r\"(a2), \"r\"(a3), \"r\"(xs[s * 8 + c]),\n"
+    "                                \"{%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3}, \"\n"
+    "                                \"%10, {0, 0}, %11, {0, 0};\"\n"
+    "                                : \"+f\"(d[i][0]), \"+f\"(d[i][1]), \"+f\"(d[i][2]),\n"
+    "                                        \"+f\"(d[i][3])\n"
+    "                                : \"r\"(a0), \"r\"(a1), \"r\"(a2), \"r\"(a3),\n"
+    "                                        \"r\"(xs[s * 8 + c]),\n"
     "                                  \"r\"(xs[s * 8 + 4 + c]), \"r\"(sav), \"r\"(xs[32 + s]));\n"
     "                        }\n"
     "                }\n"
     "            }\n"
     "#undef DG_FP4_LOAD\n"
     "#pragma unroll\n"
-    "            for (int i = 0; i < DG_FP4_RUN; i++)\n"
+    "            for (int i = 0; i < DG_FP4_RUN; i++)\n",
     "                if (i < run)\n"
     "                    for (int e = 0; e < 4; e++) {\n"
     "                        int row = e < 2 ? ra : rb, r = slot_row[i * 8 + 2 * c + (e & 1)];\n"
@@ -4677,7 +4701,8 @@ static const char *const dg_cuda_kernel_names[DG_CUDA_KERNELS] = {
     "dg_nvfp4_mm",       "dg_bf16_mm",        "dg_rms",   "dg_gelu_mul",  "dg_nvfp4_qdq",
     "dg_gather",         "dg_moe_tail",       "dg_rope",  "dg_attention", "dg_bf16_mm_wide",
     "dg_bf16_mm_narrow", "dg_transpose_keys", "dg_route", "dg_group", "dg_attention_fast_local",
-    "dg_attention_fast_full", "dg_bf16_mm_fast", "dg_bf16_mm_fast_small", "dg_nvfp4_pack", "dg_nvfp4_mm_fp4"};
+    "dg_attention_fast_full", "dg_bf16_mm_fast", "dg_bf16_mm_fast_small", "dg_nvfp4_pack",
+    "dg_nvfp4_mm_fp4"};
 
 /* The driver and NVRTC entry points, and the process-wide context and
  * kernels. */
@@ -5122,10 +5147,13 @@ static void dg_cuda_nvfp4_qdq(DGDevice out, DGDevice in, int tokens, int cols, f
 }
 
 /* A packed row: E2M1 nibbles, E4M3 block-scale codes, and the global
- * scale as a float, padded to 16 bytes as dg_fp4_stride pads it. */
+ * scale as a float, padded to 16 bytes. This must match dg_fp4_stride in
+ * the kernel source, which computes the same. */
 static size_t dg_cuda_nvfp4_row(int cols) {
-    return dg_cuda_packed(cols) ? (((size_t)cols / 2 + (size_t)cols / 16 + 4 + 15) & ~(size_t)15) / 4
-                                : (size_t)cols;
+    if (!dg_cuda_packed(cols))
+        return (size_t)cols;
+    size_t bytes = (size_t)cols / 2 + (size_t)cols / 16 + 4;
+    return ((bytes + 15) & ~(size_t)15) / 4;
 }
 
 static void dg_cuda_gather(DGDevice dst, DGDevice src, DGDevice index, int rows, int cols) {
@@ -5510,7 +5538,8 @@ static DGDeviceWork dg_device_begin(DGWorkspace *owner, const DGModel *m, int n,
 }
 
 /* The session's device scratch, at least bytes, from the accelerator its
- * forward passes use; grown as needed. */
+ * forward passes use; grown as needed, and 0 when the device is out of
+ * memory, for callers that can do the work on the CPU instead. */
 static DGDevice dg_device_scratch(DGWorkspace *owner, size_t bytes) {
     if (owner->scratch_bytes < bytes) {
         if (owner->scratch)
@@ -5518,7 +5547,7 @@ static DGDevice dg_device_scratch(DGWorkspace *owner, size_t bytes) {
         owner->scratch_bytes = 0;
         owner->scratch = owner->accel->alloc(bytes);
         if (!owner->scratch)
-            die("accelerator out of memory for scratch");
+            return 0;
         owner->scratch_bytes = bytes;
     }
     return owner->scratch;
@@ -7426,13 +7455,13 @@ static void dg_job_prepare(DGJob *g, DGTokenizer *tok, const char *j, size_t len
     }
     if ((uint64_t)g->width * g->groups > JB_MAX_CTX)
         die("batched answer canvases exceed DiffusionGemma context");
+    g->max_reads = g->requested ? g->requested : 4;
     /* Room for as many reads' canvases as one decode takes. */
-    int per_read = g->width * g->groups, max_reads = g->requested ? g->requested : 4;
-    int batch_reads = JB_MAX_CTX / per_read < max_reads ? JB_MAX_CTX / per_read : max_reads;
+    int per_read = g->width * g->groups;
+    int batch_reads = JB_MAX_CTX / per_read < g->max_reads ? JB_MAX_CTX / per_read : g->max_reads;
     g->canvas = xcalloc((size_t)per_read * (size_t)batch_reads, sizeof *g->canvas);
     for (int x = 0; x < g->nq; x++)
         memset(g->w[x].prob, 0, (size_t)g->w[x].nc * sizeof *g->w[x].prob);
-    g->max_reads = g->requested ? g->requested : 4;
     g->active = 1;
     jb_release(zero);
 }
@@ -7524,16 +7553,16 @@ static void dg_job_score(DGTensor *emb, DGJob *g, const float *h, int segment0, 
                    DG_H * sizeof *answer_h);
             label_n[x] = g->w[x].nc;
         }
-        if (owner->accel && emb->device) {
-            /* The same product on the accelerator, which holds the
-             * embedding: bit for bit in strict builds. */
-            const DGAccelOps *a = owner->accel;
-            size_t hb = (size_t)g->nq * DG_H * sizeof *answer_h,
-                   lb = (size_t)g->nq * DG_VOCAB * sizeof *logits;
-            DGDevice d = dg_device_scratch(owner, jb_size_add(hb, lb));
-            a->to_device(d, answer_h, hb);
-            a->bf16_mm(emb->device, d, d + hb, g->nq, DG_VOCAB, DG_H);
-            a->to_host(logits, d + hb, lb);
+        /* The same product on the accelerator when it holds the embedding
+         * and has room: bit for bit in strict builds. */
+        size_t hb = (size_t)g->nq * DG_H * sizeof *answer_h,
+               lb = (size_t)g->nq * DG_VOCAB * sizeof *logits;
+        DGDevice d =
+            owner->accel && emb->device ? dg_device_scratch(owner, jb_size_add(hb, lb)) : 0;
+        if (d) {
+            owner->accel->to_device(d, answer_h, hb);
+            owner->accel->bf16_mm(emb->device, d, d + hb, g->nq, DG_VOCAB, DG_H);
+            owner->accel->to_host(logits, d + hb, lb);
         } else
             dg_mm_data(emb->data, answer_h, logits, g->nq, DG_VOCAB, DG_H);
         entropy = dg_slot_logits_entropy(g->nq, g->ids, label_n, score, logits, terms);
@@ -9206,7 +9235,8 @@ static void dg_test_accel_attention_shape(const DGAccelOps *a, uint64_t *rs, int
     enum { segments = 3, seq = 4, n = segments * seq };
 
     int hd = full ? DG_FULL_HEAD_DIM : DG_LOCAL_HEAD_DIM;
-    int kvh = full ? DG_FULL_KV_HEADS : DG_LOCAL_KV_HEADS, qn = DG_HEADS * hd, kn = kvh * hd, half = hd / 2;
+    int kvh = full ? DG_FULL_KV_HEADS : DG_LOCAL_KV_HEADS, qn = DG_HEADS * hd, kn = kvh * hd,
+        half = hd / 2;
     int seg_old[segments] = {6, 6, 0}, seg_base[segments] = {0, 0, 6}, rows = 6;
     size_t qb = (size_t)n * qn * 4, kb = (size_t)n * kn * 4, ob = (size_t)rows * kn * 4,
            tb = (size_t)n * DG_FULL_HEAD_DIM * 4;
