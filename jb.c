@@ -7948,14 +7948,6 @@ void jb_session_free(jb_session *session) {
     jb_release(session);
 }
 
-static DGPrefixCache *jb_session_prefix(jb_session *session) {
-#ifdef __FAST_MATH__
-    (void)session;
-    return NULL;
-#else
-    return &session->prefix;
-#endif
-}
 
 static jb_status jb_session_decide_json_call(jb_session *session, const char *request_json,
                                              size_t request_length, char **out_json,
@@ -7980,7 +7972,7 @@ static jb_status jb_session_decide_json_call(jb_session *session, const char *re
         return jb_frame_fail(&frame);
     }
     dg_systemone(&session->model->model, &session->model->tokenizer, request_json, request_length,
-                 jb_session_prefix(session), &session->workspace, out_json, out_length);
+                 &session->prefix, &session->workspace, out_json, out_length);
     jb_frame_leave(&frame);
     jb_error_message[0] = 0;
     return JB_OK;
@@ -8020,11 +8012,11 @@ static jb_status jb_session_decide_json_batch_call(jb_session *session,
     int batched = request_count > 1 &&
                   dg_system_batch(&session->model->model, &session->model->tokenizer,
                                   request_json, request_lengths, (int)request_count,
-                                  jb_session_prefix(session), &session->workspace, output, length);
+                                  &session->prefix, &session->workspace, output, length);
     if (!batched)
         for (size_t i = 0; i < request_count; i++)
             dg_systemone(&session->model->model, &session->model->tokenizer, request_json[i],
-                         request_lengths[i], jb_session_prefix(session), &session->workspace,
+                         request_lengths[i], &session->prefix, &session->workspace,
                          &output[i], &length[i]);
     jb_frame_leave(&frame);
     *out_json = output;
