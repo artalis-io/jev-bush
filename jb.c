@@ -1026,9 +1026,9 @@ typedef uint64_t DGDevice;
 typedef struct DGAccelMatrix DGAccelMatrix;
 
 /* An optional accelerator for the transformer layers, bit-identical to the
- * reference in strict builds; in fast builds, as close as fast math. The caller places weights in device memory (alloc, to_device)
- * and runs each step of a layer on device addresses, in the order it issues
- * them; to_host waits for the steps before it. dg_accel() returns NULL when
+ * reference in strict builds and about as close as fast math in fast ones.
+ * The caller places weights in device memory (alloc, to_device) and runs
+ * each step of a layer on device addresses, in the order it issues them; to_host waits for the steps before it. dg_accel() returns NULL when
  * none is built or available; alloc returns 0 when the device is out of
  * memory. free, host_free and release never fail: they run on cleanup
  * paths, including a failed call's and ones without an error frame, and a
@@ -1051,8 +1051,8 @@ typedef struct {
     /* Scratch nvfp4_mm needs for this many tokens. */
     size_t (*nvfp4_scratch)(int tokens);
     /* Row t of y = m[group[t]] times row t of x, as dg_nvfp4_mm_ref computes
-     * it, with x in the dg_nvfp4_qdq_ref layout; all of m share rows and
-     * cols, and group is host memory. */
+     * it, with x as nvfp4_qdq writes it; all of m share rows and cols, and
+     * group is host memory. */
     void (*nvfp4_mm)(const DGAccelMatrix *const *m, const int *group, int tokens, DGDevice x,
                      DGDevice y, DGDevice scratch);
     /* y = w x for a row-major BF16 w, as dg_mm_data_ref computes it. */
@@ -1065,8 +1065,10 @@ typedef struct {
     /* out = dg_gelu(g) * u over n values; out may be g or u. */
     void (*gelu_mul)(DGDevice out, DGDevice g, DGDevice u, size_t n);
     /* dg_nvfp4_qdq_ref, setting the device int *flag on a non-finite input
-     * instead of failing. */
+     * instead of failing. Rows are written as nvfp4_row(cols) 4-byte words
+     * each: the reference's floats, or a packed form the products read. */
     void (*nvfp4_qdq)(DGDevice out, DGDevice in, int tokens, int cols, float base, DGDevice flag);
+    size_t (*nvfp4_row)(int cols);
     /* Row i of dst = row index[i] of src, index being device ints. */
     void (*gather)(DGDevice dst, DGDevice src, DGDevice index, int rows, int cols);
     void (*copy)(DGDevice dst, DGDevice src, size_t bytes);
@@ -4261,6 +4263,138 @@ static const char *const dg_cuda_source[] = {
     "    }\n"
     "}\n"
     "#endif\n"
+    "\n"
+    "#if DG_FP4\n"
+    "/* Fast builds on GPUs with block-scaled FP4 tensor cores (compute\n"
+    " * capability 12.x): NVFP4 activations stay packed, as each row's E2M1\n"
+    " * nibbles (low nibble first), then its E4M3 block-scale codes, then its\n"
+    " * global scale as a float, and the expert products run on the FP4 tensor\n"
+    " * cores, whose E2M1 and E4M3 products are exact; only the FP32 sums round. */\n"
+    "\n"
+    "/* The E4M3 code whose value dg_f8e4m3_round(x) returns. */\n"
+    "__device__ unsigned dg_f8e4m3_code(float x) {\n"
+    "    if (!(x > 0))\n"
+    "        return 0;\n"
+    "    if (x >= 448)\n"
+    "        return 126;\n"
+    "    int lo = 0, hi = 126;\n"
+    "    while (lo + 1 < hi) {\n"
+    "        int m = (lo + hi) / 2;\n"
+    "        if (dg_f8e4m3((unsigned)m) < x)\n"
+    "            lo = m;\n"
+    "        else\n"
+    "            hi = m;\n"
+    "    }\n"
+    "    float a = dg_f8e4m3((unsigned)lo), b = dg_f8e4m3((unsigned)hi), da = x - a, db = b - x;\n"
+    "    return da < db || (da == db && !(lo & 1)) ? (unsigned)lo : (unsigned)hi;\n"
+    "}\n"
+    "\n"
+    "/* The E2M1 code whose value dg_e2m1_round(x) returns. */\n"
+    "__device__ unsigned dg_e2m1_code(float x) {\n",
+    "    const float q[8] = {0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f};\n"
+    "    float a = fabsf(x);\n"
+    "    int best = 0;\n"
+    "    for (int i = 1; i < 8; i++) {\n"
+    "        float d = fabsf(a - q[i]), old = fabsf(a - q[best]);\n"
+    "        if (d < old || (d == old && !(i & 1)))\n"
+    "            best = i;\n"
+    "    }\n"
+    "    return (signbit(x) ? 8u : 0u) | (unsigned)best;\n"
+    "}\n"
+    "\n"
+    "/* dg_nvfp4_qdq into the packed form: the same block scales and values. */\n"
+    "extern \"C\" __global__ void dg_nvfp4_pack(unsigned char *out, const float *in, int tokens,\n"
+    "        int cols, float base, int *flag) {\n"
+    "    long long nb = cols / 16, blocks = (long long)tokens * nb;\n"
+    "    size_t stride = (size_t)cols / 2 + (size_t)cols / 16 + 4;\n"
+    "    for (long long z = blockIdx.x * (long long)blockDim.x + threadIdx.x; z < blocks;\n"
+    "         z += (long long)gridDim.x * blockDim.x) {\n"
+    "        long long t = z / nb, b = z % nb;\n"
+    "        const float *x = in + t * cols + b * 16;\n"
+    "        unsigned char *row = out + (size_t)t * stride;\n"
+    "        float amax = 0;\n"
+    "        int bad = 0;\n"
+    "        for (int k = 0; k < 16; k++) {\n"
+    "            bad |= !dg_finitef(x[k]);\n"
+    "            if (fabsf(x[k]) > amax)\n"
+    "                amax = fabsf(x[k]);\n"
+    "        }\n"
+    "        if (bad) {\n"
+    "            atomicOr(flag, 1);\n"
+    "            continue;\n"
+    "        }\n"
+    "        unsigned code = dg_f8e4m3_code((amax / 6) / base);\n"
+    "        float s = dg_f8e4m3(code) * base;\n"
+    "        unsigned w0 = 0, w1 = 0;\n"
+    "        if (s != 0)\n"
+    "            for (int k = 0; k < 16; k++) {\n"
+    "                unsigned v = dg_e2m1_code(x[k] / s) << (4 * (k & 7));\n"
+    "                if (k < 8)\n"
+    "                    w0 |= v;\n"
+    "                else\n"
+    "                    w1 |= v;\n"
+    "            }\n"
+    "        else\n"
+    "            code = 0;\n"
+    "        *(unsigned *)(row + b * 8) = w0;\n"
+    "        *(unsigned *)(row + b * 8 + 4) = w1;\n"
+    "        row[cols / 2 + b] = (unsigned char)code;\n"
+    "        if (b == 0)\n"
+    "            *(float *)(row + cols / 2 + cols / 16) = base;\n"
+    "    }\n"
+    "}\n"
+    "\n"
+    "/* dg_nvfp4_mm on FP4 tensor cores, from packed activations. A warp\n"
+    " * computes 16 rows for one tile of up to 8 tokens, 64 columns per MMA;\n"
+    " * a block's four warps cover 64 rows. With scale selector 0, lanes 4i and\n"
+    " * 4i + 1 supply rows i and i + 8 of the weights' block scales, lane 4i\n"
+    " * token i's, each as four bytes for the four 16-column blocks. */\n"
+    "extern \"C\" __global__ void __launch_bounds__(128) dg_nvfp4_mm_fp4(const dg_matrix *m,\n"
+    "        const dg_tile *tiles, const int *count, const unsigned char *x, float *y, int rows,\n"
+    "        int cols) {\n"
+    "    int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, g = lane >> 2, c = lane & 3;\n"
+    "    size_t wb = (size_t)cols / 2, sb = (size_t)cols / 16, stride = wb + sb + 4;\n"
+    "    int ntiles = *count;\n"
+    "    for (int ti = blockIdx.y; ti < ntiles; ti += gridDim.y) {\n"
+    "        dg_tile tile = tiles[ti];\n"
+    "        dg_matrix mt = m[tile.group];\n"
+    "        int ra = blockIdx.x * 64 + warp * 16 + g, rb = ra + 8;\n"
+    "        int la = ra < rows ? ra : rows - 1, lb = rb < rows ? rb : rows - 1;\n"
+    "        int tok = tile.start + (g < tile.count ? g : 0);\n"
+    "        const unsigned char *wa = mt.w + (size_t)la * wb, *wbr = mt.w + (size_t)lb * wb,\n"
+    "                            *sa = mt.s + (size_t)(c == 0 ? la : lb) * sb,\n"
+    "                            *xr = x + (size_t)tok * stride;\n"
+    "        float d[4] = {0, 0, 0, 0};\n"
+    "        for (int k0 = 0; k0 < cols; k0 += 64) {\n"
+    "            int off = k0 / 2 + c * 4;\n"
+    "            unsigned a0 = *(const unsigned *)(wa + off), a1 = *(const unsigned *)(wbr + off),\n"
+    "                     a2 = *(const unsigned *)(wa + off + 16),\n",
+    "                     a3 = *(const unsigned *)(wbr + off + 16);\n"
+    "            unsigned b0 = 0, b1 = 0;\n"
+    "            if (g < tile.count) {\n"
+    "                b0 = *(const unsigned *)(xr + off);\n"
+    "                b1 = *(const unsigned *)(xr + off + 16);\n"
+    "            }\n"
+    "            unsigned sav = *(const unsigned *)(sa + k0 / 16),\n"
+    "                     sbv = *(const unsigned *)(xr + wb + k0 / 16);\n"
+    "            asm volatile(\n"
+    "                \"mma.sync.aligned.m16n8k64.row.col.kind::mxf4nvf4.block_scale.scale_vec::4X\"\n"
+    "                \".f32.e2m1.e2m1.f32.ue4m3 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, \"\n"
+    "                \"{%0,%1,%2,%3}, %10, {0, 0}, %11, {0, 0};\"\n"
+    "                : \"+f\"(d[0]), \"+f\"(d[1]), \"+f\"(d[2]), \"+f\"(d[3])\n"
+    "                : \"r\"(a0), \"r\"(a1), \"r\"(a2), \"r\"(a3), \"r\"(b0), \"r\"(b1), \"r\"(sav), \"r\"(sbv));\n"
+    "        }\n"
+    "        for (int e = 0; e < 4; e++) {\n"
+    "            int row = e < 2 ? ra : rb, t = 2 * c + (e & 1);\n"
+    "            if (row < rows && t < tile.count) {\n"
+    "                const unsigned char *tr = x + (size_t)(tile.start + t) * stride;\n"
+    "                float base = *(const float *)(tr + wb + sb);\n"
+    "                y[(size_t)(tile.start + t) * rows + row] = d[e] * mt.global * base;\n"
+    "            }\n"
+    "        }\n"
+    "    }\n"
+    "}\n"
+    "#endif\n"
 };
 
 /* The kernel's struct dg_tile: tokens start..start + count - 1 use matrix
@@ -4300,6 +4434,9 @@ enum {
     DG_CUDA_ATTENTION_FAST_LOCAL,
     DG_CUDA_ATTENTION_FAST_FULL,
     DG_CUDA_BF16_FAST,
+    /* Fast builds with FP4 tensor cores only, from here on. */
+    DG_CUDA_NVFP4_PACK,
+    DG_CUDA_NVFP4_MM_FP4,
     DG_CUDA_KERNELS
 };
 
@@ -4307,7 +4444,7 @@ static const char *const dg_cuda_kernel_names[DG_CUDA_KERNELS] = {
     "dg_nvfp4_mm",       "dg_bf16_mm",        "dg_rms",   "dg_gelu_mul",  "dg_nvfp4_qdq",
     "dg_gather",         "dg_moe_tail",       "dg_rope",  "dg_attention", "dg_bf16_mm_wide",
     "dg_bf16_mm_narrow", "dg_transpose_keys", "dg_route", "dg_group", "dg_attention_fast_local",
-    "dg_attention_fast_full", "dg_bf16_mm_fast"};
+    "dg_attention_fast_full", "dg_bf16_mm_fast", "dg_nvfp4_pack", "dg_nvfp4_mm_fp4"};
 
 /* The driver and NVRTC entry points, and the process-wide context and
  * kernels. */
@@ -4344,8 +4481,10 @@ static struct {
     char compile_log[4096];
     int ready;
     /* The fast kernels replace exact ones: in fast builds on a GPU with
-     * BF16 tensor cores (compute capability 8.0 or later). */
-    int fast;
+     * BF16 tensor cores (compute capability 8.0 or later). The FP4 ones
+     * also need block-scaled FP4 tensor cores (12.x) and an NVRTC that
+     * compiles for them. */
+    int fast, fp4;
 } dg_cuda;
 
 /* dlsym returns an object pointer; copy it into the function pointer. */
@@ -4360,11 +4499,13 @@ static int dg_cuda_symbol(void *lib, const char *name, void *slot) {
  * dg_accel_failure() and allocates with plain malloc. */
 static void dg_cuda_compile(int major, int minor) {
     char arch[48], tile_rows[32], tile_tokens[32], bf16_tokens[32], row_max[32], head_max[32],
-        local_hd[32], threads[32], width[32], experts[32], topk[32], fast[32];
-    dg_cuda.fast = !JB_STRICT_MATH && major >= 8;
+        local_hd[32], threads[32], width[32], experts[32], topk[32], fast[32], fp4[32];
     snprintf(fast, sizeof fast, "-DDG_FAST=%d", dg_cuda.fast);
+    snprintf(fp4, sizeof fp4, "-DDG_FP4=%d", dg_cuda.fp4);
     snprintf(local_hd, sizeof local_hd, "-DDG_LOCAL_HD=%d", DG_LOCAL_HEAD_DIM);
-    snprintf(arch, sizeof arch, "--gpu-architecture=compute_%d%d", major, minor);
+    /* The FP4 instructions need the architecture-specific target. */
+    snprintf(arch, sizeof arch, "--gpu-architecture=compute_%d%d%s", major, minor,
+             dg_cuda.fp4 ? "a" : "");
     snprintf(tile_rows, sizeof tile_rows, "-DDG_ROWS=%d", DG_CUDA_ROWS);
     snprintf(tile_tokens, sizeof tile_tokens, "-DDG_TOKENS=%d", DG_CUDA_TOKENS);
     snprintf(bf16_tokens, sizeof bf16_tokens, "-DDG_BTOKENS=%d", DG_CUDA_BF16_TOKENS);
@@ -4389,7 +4530,8 @@ static void dg_cuda_compile(int major, int minor) {
                              width,
                              experts,
                              topk,
-                             fast};
+                             fast,
+                             fp4};
     /* The source is split into pieces short enough for ISO C string
      * literals. */
     size_t length = 1;
@@ -4429,7 +4571,9 @@ static void dg_cuda_compile(int major, int minor) {
         dg_cuda.failure = "loading the kernels";
     else {
         dg_cuda.ready = 1;
-        int kernels = dg_cuda.fast ? DG_CUDA_KERNELS : DG_CUDA_ATTENTION_FAST_LOCAL;
+        int kernels = dg_cuda.fp4    ? DG_CUDA_KERNELS
+                      : dg_cuda.fast ? DG_CUDA_NVFP4_PACK
+                                     : DG_CUDA_ATTENTION_FAST_LOCAL;
         for (int i = 0; i < kernels; i++)
             if (dg_cuda.function_get(&dg_cuda.kernel[i], module, dg_cuda_kernel_names[i])) {
                 dg_cuda.failure = "loading the kernels";
@@ -4477,7 +4621,16 @@ static void dg_cuda_open(void) {
         dg_cuda.device_attribute(&minor, DG_CU_CC_MINOR, device) ||
         dg_cuda.primary_retain(&dg_cuda.ctx, device) || dg_cuda.ctx_set(dg_cuda.ctx))
         return;
+    dg_cuda.fast = !JB_STRICT_MATH && major >= 8;
+    dg_cuda.fp4 = dg_cuda.fast && major == 12;
     dg_cuda_compile(major, minor);
+    if (!dg_cuda.ready && dg_cuda.fp4) {
+        /* An NVRTC too old for the FP4 target: the other fast kernels. */
+        dg_cuda.fp4 = 0;
+        dg_cuda.failure = NULL;
+        dg_cuda.compile_log[0] = 0;
+        dg_cuda_compile(major, minor);
+    }
 }
 
 static void dg_cuda_check(CUresult r, const char *what) {
@@ -4597,6 +4750,22 @@ static void dg_cuda_group(DGDevice top, int tokens, DGDevice index, DGDevice slo
     dg_cuda_launch(DG_CUDA_GROUP, 1, 1, DG_EXPERTS, args);
 }
 
+/* Whether NVFP4 rows of cols values are packed for the FP4 tensor cores,
+ * which take 64 columns at a time; every model matrix's count is a
+ * multiple of 64. */
+static int dg_cuda_packed(int cols) {
+    return dg_cuda.fp4 && cols % 64 == 0;
+}
+
+/* The NVFP4 product over tiles of tokens: 128 rows a block on the exact
+ * kernel, 64 on the FP4 tensor cores. */
+static void dg_cuda_nvfp4_launch(int rows, int cols, long long tiles, void **args) {
+    int packed = dg_cuda_packed(cols), per_block = packed ? 64 : DG_CUDA_ROWS;
+    dg_cuda_launch(packed ? DG_CUDA_NVFP4_MM_FP4 : DG_CUDA_NVFP4_MM,
+                   dg_cuda_blocks(rows, per_block, 1u << 30), dg_cuda_blocks(tiles, 1, DG_CUDA_GRID_Y),
+                   128, args);
+}
+
 /* The grouped product from the device's own tiles; the grid covers the
  * most tiles rows routed rows can make, and blocks past *ntiles exit. */
 static void dg_cuda_nvfp4_grouped(DGDevice table, DGDevice tiles, DGDevice ntiles, int routed,
@@ -4604,9 +4773,7 @@ static void dg_cuda_nvfp4_grouped(DGDevice table, DGDevice tiles, DGDevice ntile
     CUdeviceptr dt = table, dl = tiles, dn = ntiles, dx = x, dy = y;
     long long bound = routed / DG_CUDA_TOKENS + DG_EXPERTS;
     void *args[] = {&dt, &dl, &dn, &dx, &dy, &rows, &cols};
-    dg_cuda_launch(DG_CUDA_NVFP4_MM, dg_cuda_blocks(rows, DG_CUDA_ROWS, 1u << 30),
-                   dg_cuda_blocks(bound < routed ? bound : routed, 1, DG_CUDA_GRID_Y), DG_CUDA_ROWS,
-                   args);
+    dg_cuda_nvfp4_launch(rows, cols, bound < routed ? bound : routed, args);
 }
 
 /* Splits tokens into tiles of up to DG_CUDA_TOKENS consecutive tokens that
@@ -4650,8 +4817,7 @@ static void dg_cuda_nvfp4_mm(const DGAccelMatrix *const *m, const int *group, in
     jb_release(table);
     jb_release(tiles);
     void *args[] = {&dt, &dl, &dn, &dx, &dy, &rows, &cols};
-    dg_cuda_launch(DG_CUDA_NVFP4_MM, dg_cuda_blocks(rows, DG_CUDA_ROWS, 1u << 30),
-                   dg_cuda_blocks(ntiles, 1, DG_CUDA_GRID_Y), DG_CUDA_ROWS, args);
+    dg_cuda_nvfp4_launch(rows, cols, ntiles, args);
 }
 
 /* Column counts that are a multiple of 64, which every model matrix has,
@@ -4704,9 +4870,15 @@ static void dg_cuda_nvfp4_qdq(DGDevice out, DGDevice in, int tokens, int cols, f
                               DGDevice flag) {
     CUdeviceptr dout = out, din = in, dflag = flag;
     void *args[] = {&dout, &din, &tokens, &cols, &base, &dflag};
-    dg_cuda_launch(DG_CUDA_NVFP4_QDQ,
+    dg_cuda_launch(dg_cuda_packed(cols) ? DG_CUDA_NVFP4_PACK : DG_CUDA_NVFP4_QDQ,
                    dg_cuda_blocks((long long)tokens * (cols / 16), DG_CUDA_THREADS, 1u << 20), 1,
                    DG_CUDA_THREADS, args);
+}
+
+/* A packed row: E2M1 nibbles, E4M3 block-scale codes, and the global
+ * scale as a float. */
+static size_t dg_cuda_nvfp4_row(int cols) {
+    return dg_cuda_packed(cols) ? ((size_t)cols / 2 + (size_t)cols / 16 + 4) / 4 : (size_t)cols;
 }
 
 static void dg_cuda_gather(DGDevice dst, DGDevice src, DGDevice index, int rows, int cols) {
@@ -4788,6 +4960,7 @@ static const DGAccelOps *dg_accel(void) {
                                     dg_cuda_rms,
                                     dg_cuda_gelu_mul,
                                     dg_cuda_nvfp4_qdq,
+                                    dg_cuda_nvfp4_row,
                                     dg_cuda_gather,
                                     dg_cuda_copy,
                                     dg_cuda_rope,
@@ -5714,7 +5887,7 @@ static void dg_ff_accel(DGModel *m, int l, int n, const DGDeviceLayout *d, JBAre
     a->route(d->route, re->device, n, d->top, d->weight, d->flag);
     dg_nvfp4_qdq_accel(m, d->qz2, d->z2, n, DG_H, m->nv_a13[l], d->flag);
     a->group(d->top, n, d->index, d->slot, d->tiles, d->ntiles);
-    a->gather(d->gather, d->qz2, d->index, routed, DG_H);
+    a->gather(d->gather, d->qz2, d->index, routed, (int)a->nvfp4_row(DG_H));
     a->nvfp4_grouped(m->expert_table[l][0], d->tiles, d->ntiles, routed, d->gather, d->eg, DG_MOE,
                      DG_H);
     a->nvfp4_grouped(m->expert_table[l][1], d->tiles, d->ntiles, routed, d->gather, d->eh, DG_MOE,
@@ -8293,6 +8466,31 @@ static void dg_test_mm(uint64_t *rs) {
     }
 }
 
+/* An accelerator's quantized rows, row bytes each, as the reference's
+ * floats: the floats themselves, or packed E2M1 nibbles, E4M3 codes and a
+ * float global scale, decoded as the reference computes each value. */
+static void dg_test_nvfp4_unpack(float *out, const uint8_t *in, int tokens, int cols,
+                                 size_t row) {
+    static const float mag[8] = {0, .5f, 1, 1.5f, 2, 3, 4, 6};
+    if (row == (size_t)cols * 4) {
+        memcpy(out, in, (size_t)tokens * row);
+        return;
+    }
+    for (int t = 0; t < tokens; t++) {
+        const uint8_t *r = in + (size_t)t * row;
+        float base;
+        memcpy(&base, r + cols / 2 + cols / 16, 4);
+        for (int b = 0; b < cols / 16; b++) {
+            /* The block's scale first, as the reference computes it. */
+            float scale = dg_f8e4m3(r[cols / 2 + b]) * base;
+            for (int c = b * 16; c < b * 16 + 16; c++) {
+                unsigned nib = c & 1 ? r[c / 2] >> 4 : r[c / 2] & 15u;
+                out[(size_t)t * cols + c] = (nib & 8 ? -mag[nib & 7] : mag[nib & 7]) * scale;
+            }
+        }
+    }
+}
+
 static void dg_test_nvfp4(uint64_t *rs) {
     static const int shape[][3] = {{2, 32, 1}, {4, 64, 9}, {8, 704, 17}, {2, 2816, 3}, {6, 64, 2}};
     static const float mag4[8] = {0, .5f, 1, 1.5f, 2, 3, 4, 6};
@@ -8352,7 +8550,11 @@ static void dg_test_nvfp4(uint64_t *rs) {
             accel->to_device(dx, x, xb);
             accel->to_device(df, &flag, sizeof flag);
             accel->nvfp4_qdq(dq, dx, tokens, cols, base, df);
-            accel->to_host(xd, dq, xb);
+            size_t row = accel->nvfp4_row(cols) * 4;
+            uint8_t *packed = xmalloc((size_t)tokens * row);
+            accel->to_host(packed, dq, (size_t)tokens * row);
+            dg_test_nvfp4_unpack(xd, packed, tokens, cols, row);
+            jb_release(packed);
             accel->to_host(&flag, df, sizeof flag);
             if (flag || memcmp(xd, xq, xb))
                 die2("accelerator self-test failed: NVFP4 quantizer", accel->name);
