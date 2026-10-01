@@ -418,6 +418,17 @@ batch. Output records the actual `microbatch` size. Strict microbatched
 results are byte-identical to sequential ones; fast-math ones may differ as
 cached ones do.
 
+On a DGX Spark, the fast CUDA build runs the full benchmark about 1.4 times
+faster with `JB_MICROBATCH=4` or `8`, because the weights stream once for
+several requests: 82 s instead of 115 s for one read a row, 120 s instead of
+163 s with automatic reads. Each request then waits for its batch, so this
+raises throughput, not single-request latency. Larger batches mostly fall
+back to sequential runs under the 4 GiB K/V bound; at 16 only 80 of the 400
+rows ran batched. Fast answers depend on the batch: 3 to 5% of argmaxes
+change, and in all four batched runs accuracy and log loss came out slightly
+worse (by up to 0.6 points and 0.02). Benchmark numbers in this README are
+unbatched.
+
 [`examples/request.json`](examples/request.json) is a small request spanning
 all three decision types. Its response has the structure shown in
 [`examples/response-shape.json`](examples/response-shape.json); probabilities

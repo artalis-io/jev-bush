@@ -759,6 +759,31 @@ entry, which removed most of what remained. Strict output is byte-identical,
 on the GPU and on NEON alone. Over the full benchmark the fast CUDA build
 takes 163 s instead of 181 s, its candidate scoring 14 s instead of 32 s.
 
+### Microbatching on the GPU
+
+`JB_MICROBATCH` runs consecutive requests that share a schema through one
+forward pass, streaming the weights once for all of them. The fast CUDA
+build, full benchmark, DGX Spark:
+
+| reads | batch | seconds | rows batched | accuracy | log loss | argmax vs unbatched |
+|---|---:|---:|---:|---:|---:|---:|
+| one | 1 | 115 | 0 | 66.65% | 1.5191 | |
+| one | 4 | 83 | 384 | 66.05% | 1.5361 | 94.9% |
+| one | 8 | 82 | 344 | 66.15% | 1.5405 | 96.1% |
+| one | 16 | 108 | 80 | 66.40% | 1.5309 | 99.1% |
+| automatic | 1 | 163 | 0 | 66.70% | 1.4398 | |
+| automatic | 4 | 129 | 384 | 66.60% | 1.4510 | 97.0% |
+| automatic | 8 | 120 | 344 | 66.40% | 1.4596 | 97.35% |
+| automatic | 16 | 152 | 80 | 66.55% | 1.4396 | 99.25% |
+
+Batches of 16 mostly exceed the 4 GiB bound on copied prefix K/V and run
+sequentially. The fast kernels sum in an order that depends on how many
+tokens they get, and NVFP4 activation rounding amplifies the difference, so
+fast answers depend on the batch; the slightly worse scores of every batched
+run may be noise, as the runs overlap heavily, but they all point the same
+way. Strict CUDA with a batch of 4 stays byte-identical on the 40 parity
+rows, and gains no time there, as the exact kernels are bound by arithmetic.
+
 ## 7. Make benchmark comparisons auditable
 
 Before publishing a faster number:
