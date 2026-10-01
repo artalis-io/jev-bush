@@ -3323,6 +3323,33 @@ static const char *const dg_cuda_source[] = {
     "    return 1.0f / sqrtf((float)(ss / n) + 1e-6f);\n"
     "}\n"
     "\n"
+    "/* The inverse RMS of a staged row's squares into *q, called by every thread\n"
+    " * of the block. Strict builds sum on one thread in order; fast builds\n"
+    " * split the sum over the block's threads, still in double. Callers\n"
+    " * synchronize before reading *q. */\n"
+    "__device__ void dg_rms_inverse_block(const double *sq, int n, float *q) {\n"
+    "#if DG_FAST\n"
+    "    __shared__ double part[32];\n"
+    "    double s = 0;\n"
+    "    for (int i = threadIdx.x; i < n; i += blockDim.x)\n"
+    "        s += sq[i];\n"
+    "    for (int off = 16; off > 0; off >>= 1)\n"
+    "        s += __shfl_down_sync(0xffffffffu, s, off);\n"
+    "    if ((threadIdx.x & 31) == 0)\n"
+    "        part[threadIdx.x >> 5] = s;\n"
+    "    __syncthreads();\n"
+    "    if (threadIdx.x == 0) {\n"
+    "        double t = 0;\n"
+    "        for (int w = 0; w < (int)(blockDim.x + 31) / 32; w++)\n"
+    "            t += part[w];\n"
+    "        *q = 1.0f / sqrtf((float)(t / n) + 1e-6f);\n"
+    "    }\n"
+    "#else\n"
+    "    if (threadIdx.x == 0)\n"
+    "        *q = dg_rms_inverse_squares(sq, n);\n"
+    "#endif\n"
+    "}\n"
+    "\n"
     "\n"
     "/* One staged chunk's contribution to S token sums of a thread's row, in the\n"
     " * reference's order. Slots past the tile's count read stale activations and\n"
@@ -3362,7 +3389,7 @@ static const char *const dg_cuda_source[] = {
     "    __shared__ float xs[DG_TOKENS][DG_BLOCKS * 16];\n"
     "    int tx = threadIdx.x, r0 = blockIdx.x * DG_ROWS, r = r0 + tx, blocks = cols / 16;\n"
     "    int ntiles = *count;\n"
-    "    if (tx < 16) {\n"
+    "    if (tx < 16) {\n",
     "        const float mag[8] = {0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f};\n"
     "        e2m1[tx] = tx & 8 ? -mag[tx & 7] : mag[tx & 7];\n"
     "    }\n"
@@ -3383,7 +3410,7 @@ static const char *const dg_cuda_source[] = {
     "            for (int j = 0; j < DG_BLOCKS; j++) {\n"
     "                int i = tx + j * DG_ROWS, row = i / DG_BLOCKS, b = i % DG_BLOCKS;\n"
     "                int gr = r0 + row < rows ? r0 + row : rows - 1;\n"
-    "                if (b < nb) {\n",
+    "                if (b < nb) {\n"
     "                    wv[j] = *(const uint2 *)(mt.w + (size_t)gr * (cols / 2) + (size_t)(b0 + "
     "b) * 8);\n"
     "                    sv[j] = mt.s[(size_t)gr * blocks + b0 + b];\n"
@@ -3443,7 +3470,7 @@ static const char *const dg_cuda_source[] = {
     "        int t0 = ti * DG_BTOKENS, count = tokens - t0 < DG_BTOKENS ? tokens - t0 : "
     "DG_BTOKENS;\n"
     "        float sum[DG_BTOKENS];\n"
-    "#pragma unroll\n"
+    "#pragma unroll\n",
     "        for (int t = 0; t < DG_BTOKENS; t++)\n"
     "            sum[t] = 0;\n"
     "        for (int c0 = 0; c0 < cols; c0 += DG_BCOLS) {\n"
@@ -3463,7 +3490,7 @@ static const char *const dg_cuda_source[] = {
     "                    int i = tx + j * DG_ROWS, row = i / (DG_BCOLS / 8), q = i % (DG_BCOLS / "
     "8);\n"
     "                    ws[q * 4][row] = wv[j].x;\n"
-    "                    ws[q * 4 + 1][row] = wv[j].y;\n",
+    "                    ws[q * 4 + 1][row] = wv[j].y;\n"
     "                    ws[q * 4 + 2][row] = wv[j].z;\n"
     "                    ws[q * 4 + 3][row] = wv[j].w;\n"
     "                }\n"
@@ -3518,14 +3545,13 @@ static const char *const dg_cuda_source[] = {
     "        for (int i = threadIdx.x; i < n; i += blockDim.x)\n"
     "            sq[i] = (double)xr[i] * xr[i];\n"
     "        __syncthreads();\n"
-    "        if (threadIdx.x == 0)\n"
-    "            q = dg_rms_inverse_squares(sq, n);\n"
+    "        dg_rms_inverse_block(sq, n, &q);\n"
     "        __syncthreads();\n"
     "        for (int i = threadIdx.x; i < n; i += blockDim.x) {\n"
     "            float v = xr[i] * q;\n"
     "            if (scale)\n"
     "                v = v * dg_bf(scale[i]);\n"
-    "            if (factor)\n"
+    "            if (factor)\n",
     "                v = v * (dg_bf(factor[i]) / divisor);\n"
     "            if (add)\n"
     "                v = v + add[(size_t)t * n + i];\n"
@@ -3548,7 +3574,7 @@ static const char *const dg_cuda_source[] = {
     "    for (long long z = blockIdx.x * (long long)blockDim.x + threadIdx.x; z < blocks;\n"
     "         z += (long long)gridDim.x * blockDim.x) {\n"
     "        long long t = z / nb, b = z % nb;\n"
-    "        const float *x = in + t * cols + b * 16;\n",
+    "        const float *x = in + t * cols + b * 16;\n"
     "        float *y = out + t * cols + b * 16, amax = 0;\n"
     "        int bad = 0;\n"
     "        for (int k = 0; k < 16; k++) {\n"
@@ -3595,16 +3621,14 @@ static const char *const dg_cuda_source[] = {
     "            sq[i] = (double)mo * mo;\n"
     "        }\n"
     "        __syncthreads();\n"
-    "        if (threadIdx.x == 0)\n"
-    "            q = dg_rms_inverse_squares(sq, n);\n"
+    "        dg_rms_inverse_block(sq, n, &q);\n"
     "        __syncthreads();\n"
     "        for (int i = threadIdx.x; i < n; i += blockDim.x) {\n"
     "            row[i] = d[(size_t)t * n + i] + row[i] * q * dg_bf(p2[i]);\n"
     "            sq[i] = (double)row[i] * row[i];\n"
     "        }\n"
     "        __syncthreads();\n"
-    "        if (threadIdx.x == 0)\n"
-    "            q = dg_rms_inverse_squares(sq, n);\n"
+    "        dg_rms_inverse_block(sq, n, &q);\n"
     "        __syncthreads();\n"
     "        for (int i = threadIdx.x; i < n; i += blockDim.x) {\n"
     "            float v = x[(size_t)t * n + i] + row[i] * q * dg_bf(post[i]);\n"
@@ -3617,7 +3641,7 @@ static const char *const dg_cuda_source[] = {
     "extern \"C\" __global__ void dg_rope(float *x, const float *table, int tokens, int heads, int "
     "hd,\n"
     "        int stride, int pitch) {\n"
-    "    int half = hd / 2;\n"
+    "    int half = hd / 2;\n",
     "    long long total = (long long)tokens * heads * half;\n"
     "    for (long long z = blockIdx.x * (long long)blockDim.x + threadIdx.x; z < total;\n"
     "         z += (long long)gridDim.x * blockDim.x) {\n"
@@ -3635,7 +3659,7 @@ static const char *const dg_cuda_source[] = {
     "/* One block per token and head: each key's score is a double sum in index\n"
     " * order, as dg_dot_ref; the maximum is order-free; exponentials use\n"
     " * dg_expf; the denominator is summed in key order on one thread; and each\n"
-    " * output value sums its weighted values in key order. */\n",
+    " * output value sums its weighted values in key order. */\n"
     "extern \"C\" __global__ void dg_attention(float *out, const float *q, const float *kt,\n"
     "        const float *v, int keys, const float *v_old, const int *seg_old,\n"
     "        const int *seg_base, int n, int seq, int heads, int kvh, int hd, int canvas, int "
@@ -3699,7 +3723,7 @@ static const char *const dg_cuda_source[] = {
     "        for (int d = tx; d < hd; d += bd) {\n"
     "            float o = 0;\n"
     "            for (int j = start; j < end; j++)\n"
-    "                o += ts[j] * (j < old ? v_old[(cached + j) * kn + head + d]\n"
+    "                o += ts[j] * (j < old ? v_old[(cached + j) * kn + head + d]\n",
     "                                      : v[(own + (j - old)) * kn + head + d]);\n"
     "            out[(size_t)ti * qn + (size_t)h * hd + d] = o;\n"
     "        }\n"
@@ -3715,7 +3739,7 @@ static const char *const dg_cuda_source[] = {
     "__device__ void dg_bf16_body(const unsigned short *w, const float *x, float *y, int tokens,\n"
     "        int rows, int cols) {\n"
     "    __shared__ unsigned ws[DG_BCOLS / 2][ROWS + 1];\n"
-    "    __shared__ float xs[TOKENS][DG_BCOLS];\n",
+    "    __shared__ float xs[TOKENS][DG_BCOLS];\n"
     "    const int NT = ROWS * TY, WV = ROWS * DG_BCOLS / 8 / NT, XV = TOKENS * DG_BCOLS / NT,\n"
     "              TS = TOKENS / TY;\n"
     "    int tx = threadIdx.x, ty = threadIdx.y, id = ty * ROWS + tx;\n"
@@ -3778,7 +3802,7 @@ static const char *const dg_cuda_source[] = {
     "                unsigned p = ws[pr][tx];\n"
     "                float a0 = __uint_as_float(p << 16), a1 = __uint_as_float(p & 0xffff0000u);\n"
     "#pragma unroll\n"
-    "                for (int k = 0; k < TS; k++) {\n"
+    "                for (int k = 0; k < TS; k++) {\n",
     "                    int t = ty * TS + k;\n"
     "                    if (t < count) {\n"
     "                        sum[k] += a0 * xs[t][pr * 2];\n"
@@ -3803,7 +3827,7 @@ static const char *const dg_cuda_source[] = {
     "}\n"
     "\n"
     "extern \"C\" __global__ void __launch_bounds__(128) dg_bf16_mm_narrow(const unsigned short "
-    "*w,\n",
+    "*w,\n"
     "        const float *x, float *y, int tokens, int rows, int cols) {\n"
     "    dg_bf16_body<32, 32, 4>(w, x, y, tokens, rows, cols);\n"
     "}\n"
@@ -3863,7 +3887,7 @@ static const char *const dg_cuda_source[] = {
     "    } else if (hx < 0x3e300000u)\n"
     "        return 1.0 + x;\n"
     "    double t = x * x, c = x - t * (p1 + t * (p2 + t * (p3 + t * (p4 + t * p5)))), y;\n"
-    "    if (k == 0)\n"
+    "    if (k == 0)\n",
     "        return 1.0 - ((x * c) / (c - 2.0) - x);\n"
     "    y = 1.0 - ((lo - (x * c) / (2.0 - c)) - hi);\n"
     "    unsigned long long yb = (unsigned long long)__double_as_longlong(y);\n"
@@ -3881,7 +3905,7 @@ static const char *const dg_cuda_source[] = {
     "extern \"C\" __global__ void dg_route(const float *logits, const unsigned short *scale, int "
     "tokens,\n"
     "        int *top, float *weight, int *flag) {\n"
-    "    __shared__ double ex[DG_EXPERTS_N];\n",
+    "    __shared__ double ex[DG_EXPERTS_N];\n"
     "    __shared__ float mxs;\n"
     "    for (int t = blockIdx.x; t < tokens; t += gridDim.x) {\n"
     "        const float *rt = logits + (size_t)t * DG_EXPERTS_N;\n"
@@ -3956,7 +3980,7 @@ static const char *const dg_cuda_source[] = {
     "        *ntiles = n;\n"
     "    }\n"
     "    __syncthreads();\n"
-    "    int row = rowoff[e];\n"
+    "    int row = rowoff[e];\n",
     "    for (int t = 0; t < tokens; t++)\n"
     "        for (int k = 0; k < DG_TOPK_N; k++)\n"
     "            if (top[(size_t)t * DG_TOPK_N + k] == e) {\n"
@@ -3977,7 +4001,7 @@ static const char *const dg_cuda_source[] = {
     "/* Fast builds only: tensor-core kernels that give up the reference's\n"
     " * bits, as -ffast-math does on the CPU. Each FP32 operand is split into a\n"
     " * TF32 high part and a TF32 low part, and a product takes three MMAs (high\n"
-    " * by high, high by low, low by high), which keeps it about as accurate as\n",
+    " * by high, high by low, low by high), which keeps it about as accurate as\n"
     " * an FP32 product; sums accumulate in FP32. */\n"
     "#define DG_NEG_INF __int_as_float(0xff800000)\n"
     "\n"
@@ -4036,7 +4060,7 @@ static const char *const dg_cuda_source[] = {
     "__device__ void dg_attention_fast_body(float *out, const float *q, const float *k,\n"
     "        const float *v, const float *k_old, const float *v_old, const int *seg_old,\n"
     "        const int *seg_base, int seq, int heads, int kvh, int canvas, int full, int window) {\n"
-    "    __shared__ float pt[16][33];\n"
+    "    __shared__ float pt[16][33];\n",
     "    __shared__ float m_run[16], l_run[16], rescale[16];\n"
     "    const int qn = heads * HD, kn = kvh * HD, DW = HD / 4, NT = DW / 8;\n"
     "    int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, g = lane >> 2, c = lane & 3;\n"
@@ -4050,7 +4074,7 @@ static const char *const dg_cuda_source[] = {
     "    for (int i = 0; i < 16 && t0 + i < seq; i++) {\n"
     "        int a, b;\n"
     "        dg_key_range(t0 + i, seq, old, canvas, full, window, &a, &b);\n"
-    "        kmin = a < kmin ? a : kmin;\n",
+    "        kmin = a < kmin ? a : kmin;\n"
     "        kmax = b > kmax ? b : kmax;\n"
     "    }\n"
     "    if (tid < 16) {\n"
@@ -4112,7 +4136,7 @@ static const char *const dg_cuda_source[] = {
     "            o[i][0] *= fa;\n"
     "            o[i][1] *= fa;\n"
     "            o[i][2] *= fb;\n"
-    "            o[i][3] *= fb;\n"
+    "            o[i][3] *= fb;\n",
     "        }\n"
     "        for (int ks = 0; ks < 32; ks += 8) {\n"
     "            float p[4] = {pt[g][ks + c], pt[g + 8][ks + c], pt[g][ks + c + 4],\n"
@@ -4129,7 +4153,7 @@ static const char *const dg_cuda_source[] = {
     "        }\n"
     "    }\n"
     "    float la = l_run[g], lb = l_run[g + 8];\n"
-    "    for (int i = 0; i < NT; i++) {\n",
+    "    for (int i = 0; i < NT; i++) {\n"
     "        int d = warp * DW + i * 8 + 2 * c;\n"
     "        if (qa) {\n"
     "            float *oa = out + ((size_t)s * seq + ta) * qn + (size_t)h * HD + d;\n"
@@ -4185,7 +4209,7 @@ static const char *const dg_cuda_source[] = {
     " * time through shared memory; each warp computes 32 rows by 32 tokens. */\n"
     "extern \"C\" __global__ void __launch_bounds__(256) dg_bf16_mm_fast(const unsigned short *w,\n"
     "        const float *x, float *y, int tokens, int rows, int cols) {\n"
-    "    __shared__ unsigned ws[128][20];\n"
+    "    __shared__ unsigned ws[128][20];\n",
     "    __shared__ unsigned xs[3][64][20];\n"
     "    int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, g = lane >> 2, c = lane & 3;\n"
     "    int wr = (warp & 3) * 32, wt = (warp >> 2) * 32, r0 = blockIdx.x * 128;\n"
@@ -4202,7 +4226,7 @@ static const char *const dg_cuda_source[] = {
     "                    const uint4 *p = (const uint4 *)(w + (size_t)gr * cols + k0) + half * 2;\n"
     "                    v0 = p[0];\n"
     "                    v1 = p[1];\n"
-    "                }\n",
+    "                }\n"
     "                unsigned *d = &ws[row][half * 8];\n"
     "                d[0] = v0.x;\n"
     "                d[1] = v0.y;\n"
@@ -4267,7 +4291,7 @@ static const char *const dg_cuda_source[] = {
     "#if DG_FP4\n"
     "/* Fast builds on GPUs with block-scaled FP4 tensor cores (compute\n"
     " * capability 12.x): NVFP4 activations stay packed, as each row's E2M1\n"
-    " * nibbles (low nibble first), then its E4M3 block-scale codes, then its\n"
+    " * nibbles (low nibble first), then its E4M3 block-scale codes, then its\n",
     " * global scale as a float, and the expert products run on the FP4 tensor\n"
     " * cores, whose E2M1 and E4M3 products are exact; only the FP32 sums round. */\n"
     "\n"
@@ -4290,7 +4314,7 @@ static const char *const dg_cuda_source[] = {
     "}\n"
     "\n"
     "/* The E2M1 code whose value dg_e2m1_round(x) returns. */\n"
-    "__device__ unsigned dg_e2m1_code(float x) {\n",
+    "__device__ unsigned dg_e2m1_code(float x) {\n"
     "    const float q[8] = {0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f};\n"
     "    float a = fabsf(x);\n"
     "    int best = 0;\n"
@@ -4355,7 +4379,7 @@ static const char *const dg_cuda_source[] = {
     "    int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, g = lane >> 2, c = lane & 3;\n"
     "    size_t wb = (size_t)cols / 2, sb = (size_t)cols / 16, stride = wb + sb + 4;\n"
     "    int ntiles = *count;\n"
-    "    for (int ti = blockIdx.y; ti < ntiles; ti += gridDim.y) {\n"
+    "    for (int ti = blockIdx.y; ti < ntiles; ti += gridDim.y) {\n",
     "        dg_tile tile = tiles[ti];\n"
     "        dg_matrix mt = m[tile.group];\n"
     "        int ra = blockIdx.x * 64 + warp * 16 + g, rb = ra + 8;\n"
@@ -4368,7 +4392,7 @@ static const char *const dg_cuda_source[] = {
     "        for (int k0 = 0; k0 < cols; k0 += 64) {\n"
     "            int off = k0 / 2 + c * 4;\n"
     "            unsigned a0 = *(const unsigned *)(wa + off), a1 = *(const unsigned *)(wbr + off),\n"
-    "                     a2 = *(const unsigned *)(wa + off + 16),\n",
+    "                     a2 = *(const unsigned *)(wa + off + 16),\n"
     "                     a3 = *(const unsigned *)(wbr + off + 16);\n"
     "            unsigned b0 = 0, b1 = 0;\n"
     "            if (g < tile.count) {\n"
@@ -4392,6 +4416,96 @@ static const char *const dg_cuda_source[] = {
     "                y[(size_t)(tile.start + t) * rows + row] = d[e] * mt.global * base;\n"
     "            }\n"
     "        }\n"
+    "    }\n"
+    "}\n"
+    "#endif\n"
+    "\n"
+    "#if DG_FAST\n"
+    "/* dg_bf16_mm_fast for few blocks' worth of rows and tokens, as in decoding,\n"
+    " * for column counts that are a multiple of 64: a block covers 32 rows and\n"
+    " * 64 tokens, and its four pairs of warps each take 16 of every 64 columns,\n"
+    " * so four times as many warps stream the weights. The pairs' partial sums\n"
+    " * are added in shared memory at the end, always in the same order. */\n"
+    "extern \"C\" __global__ void __launch_bounds__(256) dg_bf16_mm_fast_small(\n"
+    "        const unsigned short *w, const float *x, float *y, int tokens, int rows, int cols) {\n"
+    "    /* Staged weights, [group][row][pair], then staged activations,\n"
+    "     * [group][part][token][pair], each row padded to 12 words; afterwards\n"
+    "     * three groups' partial sums, [group - 1][row][token]. */\n"
+    "    __shared__ unsigned smem[4 * 32 * 12 + 4 * 3 * 64 * 12];\n"
+    "    unsigned *ws = smem, *xs = smem + 4 * 32 * 12;\n"
+    "    float *red = (float *)xs;\n"
+    "    int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, g = lane >> 2, c = lane & 3;\n"
+    "    int gk = warp >> 1, wt = (warp & 1) * 32, gi = tid & 63, gt = tid >> 6;\n"
+    "    int r0 = blockIdx.x * 32;\n"
+    "    for (int t0 = blockIdx.y * 64; t0 < tokens; t0 += gridDim.y * 64) {\n"
+    "        float acc[2][4][4];\n"
+    "        for (int i = 0; i < 2; i++)\n"
+    "            for (int j = 0; j < 4; j++)\n"
+    "                acc[i][j][0] = acc[i][j][1] = acc[i][j][2] = acc[i][j][3] = 0;\n"
+    "        for (int k0 = 0; k0 < cols; k0 += 64) {\n"
+    "            int kc = k0 + gt * 16;\n"
+    "            {\n",
+    "                int row = gi >> 1, half = gi & 1, gr = r0 + row;\n"
+    "                uint4 v = make_uint4(0, 0, 0, 0);\n"
+    "                if (gr < rows)\n"
+    "                    v = *(const uint4 *)(w + (size_t)gr * cols + kc + half * 8);\n"
+    "                unsigned *d = ws + (gt * 32 + row) * 12 + half * 4;\n"
+    "                d[0] = v.x;\n"
+    "                d[1] = v.y;\n"
+    "                d[2] = v.z;\n"
+    "                d[3] = v.w;\n"
+    "            }\n"
+    "            for (int j = 0; j < 4; j++) {\n"
+    "                int u = gi + 64 * j, tok = u >> 2, q4 = u & 3, tt = t0 + tok;\n"
+    "                float4 f = make_float4(0, 0, 0, 0);\n"
+    "                if (tt < tokens)\n"
+    "                    f = *(const float4 *)(x + (size_t)tt * cols + kc + q4 * 4);\n"
+    "                float a[2] = {f.x, f.z}, b[2] = {f.y, f.w};\n"
+    "                for (int p = 0; p < 2; p++)\n"
+    "                    for (int s = 0; s < 3; s++) {\n"
+    "                        unsigned v = dg_bf16_pair(a[p], b[p]);\n"
+    "                        xs[((gt * 3 + s) * 64 + tok) * 12 + q4 * 2 + p] = v;\n"
+    "                        a[p] -= __uint_as_float(v << 16);\n"
+    "                        b[p] -= __uint_as_float(v & 0xffff0000u);\n"
+    "                    }\n"
+    "            }\n"
+    "            __syncthreads();\n"
+    "            unsigned af[2][4];\n"
+    "            for (int i = 0; i < 2; i++) {\n"
+    "                const unsigned *wr = ws + (gk * 32 + i * 16 + g) * 12;\n"
+    "                af[i][0] = wr[c];\n"
+    "                af[i][1] = wr[8 * 12 + c];\n"
+    "                af[i][2] = wr[c + 4];\n"
+    "                af[i][3] = wr[8 * 12 + c + 4];\n"
+    "            }\n"
+    "            for (int s = 0; s < 3; s++)\n"
+    "                for (int j = 0; j < 4; j++) {\n"
+    "                    const unsigned *xr = xs + ((gk * 3 + s) * 64 + wt + j * 8 + g) * 12;\n"
+    "                    dg_mma_bf16(acc[0][j], af[0], xr[c], xr[c + 4]);\n"
+    "                    dg_mma_bf16(acc[1][j], af[1], xr[c], xr[c + 4]);\n"
+    "                }\n"
+    "            __syncthreads();\n"
+    "        }\n"
+    "        if (gk > 0)\n"
+    "            for (int i = 0; i < 2; i++)\n"
+    "                for (int j = 0; j < 4; j++)\n"
+    "                    for (int e = 0; e < 4; e++) {\n"
+    "                        int r = i * 16 + g + (e >> 1) * 8, t = wt + j * 8 + 2 * c + (e & 1);\n"
+    "                        red[((gk - 1) * 32 + r) * 64 + t] = acc[i][j][e];\n"
+    "                    }\n"
+    "        __syncthreads();\n"
+    "        if (gk == 0)\n"
+    "            for (int i = 0; i < 2; i++)\n"
+    "                for (int j = 0; j < 4; j++)\n"
+    "                    for (int e = 0; e < 4; e++) {\n"
+    "                        int r = i * 16 + g + (e >> 1) * 8, t = wt + j * 8 + 2 * c + (e & 1);\n"
+    "                        float v = acc[i][j][e];\n"
+    "                        for (int q = 0; q < 3; q++)\n"
+    "                            v += red[(q * 32 + r) * 64 + t];\n"
+    "                        if (r0 + r < rows && t0 + t < tokens)\n"
+    "                            y[(size_t)(t0 + t) * rows + r0 + r] = v;\n"
+    "                    }\n"
+    "        __syncthreads();\n"
     "    }\n"
     "}\n"
     "#endif\n"
@@ -4434,6 +4548,7 @@ enum {
     DG_CUDA_ATTENTION_FAST_LOCAL,
     DG_CUDA_ATTENTION_FAST_FULL,
     DG_CUDA_BF16_FAST,
+    DG_CUDA_BF16_FAST_SMALL,
     /* Fast builds with FP4 tensor cores only, from here on. */
     DG_CUDA_NVFP4_PACK,
     DG_CUDA_NVFP4_MM_FP4,
@@ -4444,7 +4559,7 @@ static const char *const dg_cuda_kernel_names[DG_CUDA_KERNELS] = {
     "dg_nvfp4_mm",       "dg_bf16_mm",        "dg_rms",   "dg_gelu_mul",  "dg_nvfp4_qdq",
     "dg_gather",         "dg_moe_tail",       "dg_rope",  "dg_attention", "dg_bf16_mm_wide",
     "dg_bf16_mm_narrow", "dg_transpose_keys", "dg_route", "dg_group", "dg_attention_fast_local",
-    "dg_attention_fast_full", "dg_bf16_mm_fast", "dg_nvfp4_pack", "dg_nvfp4_mm_fp4"};
+    "dg_attention_fast_full", "dg_bf16_mm_fast", "dg_bf16_mm_fast_small", "dg_nvfp4_pack", "dg_nvfp4_mm_fp4"};
 
 /* The driver and NVRTC entry points, and the process-wide context and
  * kernels. */
@@ -4830,8 +4945,16 @@ static void dg_cuda_bf16_mm(DGDevice w, DGDevice x, DGDevice y, int tokens, int 
     CUdeviceptr dw = w, dx = x, dy = y;
     void *args[] = {&dw, &dx, &dy, &tokens, &rows, &cols};
     if (dg_cuda.fast && cols % 32 == 0) {
-        dg_cuda_launch(DG_CUDA_BF16_FAST, dg_cuda_blocks(rows, 128, 1u << 30),
-                       dg_cuda_blocks(tokens, 64, DG_CUDA_GRID_Y), 256, args);
+        /* 128 rows by 64 tokens a block, or 32 rows with the columns split
+         * four ways when that would leave the GPU short of blocks. */
+        long long wide = (long long)dg_cuda_blocks(rows, 128, 1u << 30) *
+                         dg_cuda_blocks(tokens, 64, DG_CUDA_GRID_Y);
+        if (wide < 96 && cols % 64 == 0)
+            dg_cuda_launch(DG_CUDA_BF16_FAST_SMALL, dg_cuda_blocks(rows, 32, 1u << 30),
+                           dg_cuda_blocks(tokens, 64, DG_CUDA_GRID_Y), 256, args);
+        else
+            dg_cuda_launch(DG_CUDA_BF16_FAST, dg_cuda_blocks(rows, 128, 1u << 30),
+                           dg_cuda_blocks(tokens, 64, DG_CUDA_GRID_Y), 256, args);
         return;
     }
     if (cols % 64 == 0) {
@@ -8801,6 +8924,36 @@ static void dg_test_accel_layer(uint64_t *rs) {
         jb_release(y2);
         jb_release(y2ref);
     }
+    {
+        /* Many rows and few columns: enough blocks for the wide kernels. */
+        enum { many_rows = 12288, few_cols = 64, few_tokens = 3 };
+
+        size_t wb3 = (size_t)many_rows * few_cols * 2, xb3 = (size_t)few_tokens * few_cols * 4,
+               yb3 = (size_t)few_tokens * many_rows * 4;
+        uint8_t *w3 = xmalloc(wb3);
+        float *x3 = xmalloc(xb3), *y3 = xmalloc(yb3), *y3ref = xmalloc(yb3);
+        for (size_t i = 0; i < (size_t)many_rows * few_cols; i++)
+            jb_put_bf16(w3 + i * 2, jb_rng_unit(rs));
+        for (size_t i = 0; i < (size_t)few_tokens * few_cols; i++)
+            x3[i] = jb_rng_unit(rs);
+        DGDevice dw3 = a->alloc(wb3), dx3 = a->alloc(xb3), dy3 = a->alloc(yb3);
+        if (!dw3 || !dx3 || !dy3)
+            die2("accelerator self-test failed: device memory", a->name);
+        a->to_device(dw3, w3, wb3);
+        a->to_device(dx3, x3, xb3);
+        dg_mm_data_ref(w3, x3, y3ref, few_tokens, many_rows, few_cols);
+        a->bf16_mm(dw3, dx3, dy3, few_tokens, many_rows, few_cols);
+        a->to_host(y3, dy3, yb3);
+        DG_ACCEL_SAME("BF16 matmul, many rows", y3, y3ref, yb3);
+        DG_ACCEL_CLOSE(y3, y3ref, (size_t)few_tokens * many_rows);
+        a->free(dw3);
+        a->free(dx3);
+        a->free(dy3);
+        jb_release(w3);
+        jb_release(x3);
+        jb_release(y3);
+        jb_release(y3ref);
+    }
     /* RMS with a scale and a residual, and with a factor. */
     DGTensor scale = {0}, factor = {0};
     scale.data = sc;
@@ -8815,6 +8968,7 @@ static void dg_test_accel_layer(uint64_t *rs) {
     a->rms(dz, dx, dsc, 0, 0, dadd, tokens, cols);
     a->to_host(got, dz, xb);
     DG_ACCEL_SAME("RMS norm with residual", got, want, xb);
+    DG_ACCEL_CLOSE(got, want, (size_t)tokens * cols);
     for (int t = 0; t < tokens; t++) {
         float *r = want + (size_t)t * cols;
         dg_rms_ref(r, x + (size_t)t * cols, NULL, cols);
@@ -8824,6 +8978,7 @@ static void dg_test_accel_layer(uint64_t *rs) {
     a->rms(dz, dx, 0, dfac, div, 0, tokens, cols);
     a->to_host(got, dz, xb);
     DG_ACCEL_SAME("RMS norm with factor", got, want, xb);
+    DG_ACCEL_CLOSE(got, want, (size_t)tokens * cols);
     /* GELU times up, in place. */
     for (size_t i = 0; i < (size_t)tokens * cols; i++)
         want[i] = dg_gelu(x[i]) * add[i];
@@ -8865,6 +9020,7 @@ static void dg_test_accel_layer(uint64_t *rs) {
     a->moe_tail(dz, deo, dslot, dwt, dadd, dp2, dsc, layer_scalar, tokens);
     a->to_host(got, dz, xb);
     DG_ACCEL_SAME("MoE tail", got, want, xb);
+    DG_ACCEL_CLOSE(got, want, (size_t)tokens * cols);
 #undef DG_ACCEL_SAME
 #undef DG_ACCEL_CLOSE
     DGDevice all[] = {dw, dsc, dfac, dp2, dx, dadd, dy, dz, dg, deo, dindex, dslot, dwt};
