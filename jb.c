@@ -7378,7 +7378,10 @@ static void dg_job_prepare(DGJob *g, DGTokenizer *tok, const char *j, size_t len
     }
     if ((uint64_t)g->width * g->groups > JB_MAX_CTX)
         die("batched answer canvases exceed DiffusionGemma context");
-    g->canvas = xcalloc((size_t)g->width * g->groups, sizeof *g->canvas);
+    /* Room for as many reads' canvases as one decode takes. */
+    int per_read = g->width * g->groups, max_reads = g->requested ? g->requested : 4;
+    int batch_reads = JB_MAX_CTX / per_read < max_reads ? JB_MAX_CTX / per_read : max_reads;
+    g->canvas = xcalloc((size_t)per_read * (size_t)batch_reads, sizeof *g->canvas);
     for (int x = 0; x < g->nq; x++)
         memset(g->w[x].prob, 0, (size_t)g->w[x].nc * sizeof *g->w[x].prob);
     g->max_reads = g->requested ? g->requested : 4;
@@ -7402,6 +7405,21 @@ static void dg_job_free(DGJob *g) {
     dg_questions_free(g->w, g->nq);
     dg_request_free(&g->rq);
     memset(g, 0, sizeof *g);
+}
+
+/* Read r's answer canvases into dst, width * groups tokens: each group's
+ * base with the mask after it, and the read's random tokens in the answer
+ * slots. */
+static void dg_job_canvas(const DGJob *g, int *dst, int r) {
+    memset(dst, 0, (size_t)g->width * g->groups * sizeof *dst);
+    for (int b = 0; b < g->groups; b++) {
+        memcpy(dst + (size_t)b * g->width, g->cv[b].base.v, (size_t)g->cv[b].base.n * sizeof *dst);
+        dst[(size_t)b * g->width + g->cv[b].base.n] = DG_CANVAS_MASK_TOKEN;
+    }
+    DGMT rng;
+    dg_mt_seed(&rng, g->seed + (uint32_t)r * 7919u);
+    for (int x = 0; x < g->nq; x++)
+        dst[(size_t)(x / g->group_cap) * g->width + g->slot[x]] = (int)dg_mt_vocab(&rng);
 }
 
 static size_t dg_job_score_bytes(const DGJob *g, int read) {
@@ -7577,19 +7595,9 @@ static int dg_systemone(DGModel *m, DGTokenizer *tok, const char *j, size_t len,
     float *sequential_hidden =
         jb_arena_alloc(sequential_storage, sequential_count, sizeof *sequential_hidden, 0);
 #endif
-    for (int r = 0; r < job.max_reads; r++) {
-        memset(job.canvas, 0, (size_t)job.width * job.groups * sizeof *job.canvas);
-        for (int b = 0; b < job.groups; b++) {
-            memcpy(job.canvas + (size_t)b * job.width, job.cv[b].base.v,
-                   (size_t)job.cv[b].base.n * sizeof *job.canvas);
-            job.canvas[(size_t)b * job.width + job.cv[b].base.n] = DG_CANVAS_MASK_TOKEN;
-        }
-        DGMT rng;
-        dg_mt_seed(&rng, job.seed + (uint32_t)r * 7919u);
-        for (int x = 0; x < job.nq; x++)
-            job.canvas[(size_t)(x / job.group_cap) * job.width + job.slot[x]] =
-                (int)dg_mt_vocab(&rng);
 #ifdef JB_CANVAS_SEQUENTIAL
+    for (int r = 0; r < job.max_reads; r++) {
+        dg_job_canvas(&job, job.canvas, r);
         float *h = sequential_hidden;
         for (int b = 0; b < job.groups; b++) {
             float *one = dg_decode(m, kv, (int)job.pt.n, job.canvas + (size_t)b * job.width,
@@ -7597,18 +7605,32 @@ static int dg_systemone(DGModel *m, DGTokenizer *tok, const char *j, size_t len,
             memcpy(h + (size_t)b * job.width * DG_H, one, (size_t)job.width * DG_H * sizeof *h);
             dg_decode_end(workspace);
         }
-#else
-        size_t score_bytes = dg_job_score_bytes(&job, r);
-        float *h = dg_decode(m, kv, (int)job.pt.n, job.canvas, job.width, job.groups, score_bytes,
-                             workspace);
-#endif
         dg_job_score(emb, &job, h, 0, r, workspace);
-#ifndef JB_CANVAS_SEQUENTIAL
-        dg_decode_end(workspace);
-#endif
         if (!job.active)
             break;
     }
+#else
+    /* Reads differ only in their random answer-slot tokens, so they share one
+     * decode as extra canvases, each attending to its own tokens and the
+     * prefix: the weights stream once for all of them. Automatic reads run
+     * the first alone, because its entropy decides whether more follow. Each
+     * read is scored in order, as it would be alone. */
+    int per_read = job.width * job.groups, most = JB_MAX_CTX / per_read;
+    for (int r = 0; r < job.max_reads && job.active;) {
+        int count = !job.requested && r == 0 ? 1 : job.max_reads - r;
+        if (count > most)
+            count = most;
+        for (int k = 0; k < count; k++)
+            dg_job_canvas(&job, job.canvas + (size_t)k * per_read, r + k);
+        size_t score_bytes = dg_job_score_bytes(&job, r);
+        float *h = dg_decode(m, kv, (int)job.pt.n, job.canvas, job.width, job.groups * count,
+                             score_bytes, workspace);
+        for (int k = 0; k < count; k++)
+            dg_job_score(emb, &job, h, k * job.groups, r + k, workspace);
+        dg_decode_end(workspace);
+        r += count;
+    }
+#endif
 #ifdef JB_CANVAS_SEQUENTIAL
     dg_control_end(workspace);
 #endif
@@ -7766,17 +7788,7 @@ static int dg_system_batch(DGModel *m, DGTokenizer *tok, const char *const *row,
             if (!g[b].active || r >= g[b].max_reads)
                 continue;
             base[b] = at;
-            memset(g[b].canvas, 0, (size_t)width * g[b].groups * sizeof *g[b].canvas);
-            for (int q = 0; q < g[b].groups; q++) {
-                memcpy(g[b].canvas + (size_t)q * width, g[b].cv[q].base.v,
-                       (size_t)g[b].cv[q].base.n * sizeof *g[b].canvas);
-                g[b].canvas[(size_t)q * width + g[b].cv[q].base.n] = DG_CANVAS_MASK_TOKEN;
-            }
-            DGMT rng;
-            dg_mt_seed(&rng, g[b].seed + (uint32_t)r * 7919u);
-            for (int x = 0; x < g[b].nq; x++)
-                g[b].canvas[(size_t)(x / g[b].group_cap) * width + g[b].slot[x]] =
-                    (int)dg_mt_vocab(&rng);
+            dg_job_canvas(&g[b], g[b].canvas, r);
             for (int q = 0; q < g[b].groups; q++) {
                 memcpy(canvas + (size_t)at * width, g[b].canvas + (size_t)q * width,
                        (size_t)width * sizeof *canvas);
