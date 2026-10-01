@@ -1015,6 +1015,10 @@ typedef struct {
     void (*free)(DGDevice p);
     void (*to_device)(DGDevice dst, const void *src, size_t bytes);
     void (*to_host)(void *dst, DGDevice src, size_t bytes);
+    /* Page-locked host memory, which device copies reach directly; NULL
+     * when unavailable. */
+    void *(*host_alloc)(size_t bytes);
+    void (*host_free)(void *p);
     /* Scratch nvfp4_mm needs for this many tokens. */
     size_t (*nvfp4_scratch)(int tokens);
     /* Row t of y = m[group[t]] times row t of x, as dg_nvfp4_mm_ref computes
@@ -1054,6 +1058,24 @@ typedef struct {
      * added to d, normalized by post, added to x, and x scaled by scalar. */
     void (*moe_tail)(DGDevice x, DGDevice eo, DGDevice slot, DGDevice weight, DGDevice d,
                      DGDevice p2, DGDevice post, float scalar, int tokens);
+    /* A device table of count matrices, which matrix_table writes at dst;
+     * nvfp4_grouped indexes it by expert. */
+    size_t (*table_bytes)(int count);
+    void (*matrix_table)(DGDevice dst, const DGAccelMatrix *const *m, int count);
+    /* dg_route_token for each token's router logits: top experts and their
+     * weights, DG_TOPK a token; a non-finite logit sets bit 2 of the device
+     * int *flag. */
+    void (*route)(DGDevice logits, DGDevice scale, int tokens, DGDevice top, DGDevice weight,
+                  DGDevice flag);
+    /* The routed rows grouped by expert in dg_ff's order: index[row] is a
+     * row's token and slot[t, k] a token's row, and tiles, whose count goes
+     * to the device int *ntiles, hold rows nvfp4_grouped multiplies
+     * together. tiles holds nvfp4_scratch(tokens * DG_TOPK) bytes. */
+    void (*group)(DGDevice top, int tokens, DGDevice index, DGDevice slot, DGDevice tiles,
+                  DGDevice ntiles);
+    /* nvfp4_mm from group's tiles, over routed rows of x. */
+    void (*nvfp4_grouped)(DGDevice table, DGDevice tiles, DGDevice ntiles, int routed, DGDevice x,
+                          DGDevice y, int rows, int cols);
 } DGAccelOps;
 
 static const DGAccelOps *dg_accel(void);
@@ -1075,6 +1097,9 @@ typedef struct {
      * allocation weights. */
     const DGAccelOps *accel;
     DGDevice weights;
+    /* Each layer's gate, up and down matrices as device tables, inside
+     * weights. */
+    DGDevice expert_table[DG_L][3];
 } DGModel;
 
 enum { DG_UNKNOWN = -1, DG_BF16, DG_U8, DG_F8E4M3, DG_F32 };
@@ -1397,6 +1422,7 @@ static const char *const dg_accel_tensors[] = {
     "pre_feedforward_layernorm_2.weight",
     "router.proj.weight",
     "router.scale",
+    "router.per_expert_scale",
     "post_feedforward_layernorm_2.weight",
     "post_feedforward_layernorm.weight",
 };
@@ -1450,6 +1476,18 @@ static void dg_upload_model(DGModel *m) {
                         t->device = p;
                 }
         }
+        for (int l = 0; l < DG_L; l++)
+            for (int k = 0; k < 3; k++) {
+                at = jb_align_up(at, 256);
+                if (pass) {
+                    const DGAccelMatrix *list[DG_EXPERTS];
+                    for (int e = 0; e < DG_EXPERTS; e++)
+                        list[e] = m->nvexpert[l * DG_EXPERTS + e].accel[k];
+                    m->expert_table[l][k] = m->weights + at;
+                    a->matrix_table(m->expert_table[l][k], list, DG_EXPERTS);
+                }
+                at = jb_size_add(at, a->table_bytes(DG_EXPERTS));
+            }
         if (!pass && !(m->weights = a->alloc(at)))
             return;
     }
@@ -3255,13 +3293,14 @@ static const char *const dg_cuda_source[] = {
     " * one row so the stores spread over the memory banks. The E2M1 table keeps\n"
     " * -0.0, as the reference's sign flip produces it. */\n"
     "extern \"C\" __global__ void __launch_bounds__(DG_ROWS)\n"
-    "dg_nvfp4_mm(const dg_matrix *m, const dg_tile *tiles, int ntiles, const float *x,\n"
+    "dg_nvfp4_mm(const dg_matrix *m, const dg_tile *tiles, const int *count, const float *x,\n"
     "        float *y, int rows, int cols) {\n"
     "    __shared__ float e2m1[16];\n"
     "    __shared__ uint2 ws[DG_BLOCKS][DG_ROWS + 1];\n"
     "    __shared__ float ss[DG_BLOCKS][DG_ROWS + 1];\n"
     "    __shared__ float xs[DG_TOKENS][DG_BLOCKS * 16];\n"
     "    int tx = threadIdx.x, r0 = blockIdx.x * DG_ROWS, r = r0 + tx, blocks = cols / 16;\n"
+    "    int ntiles = *count;\n"
     "    if (tx < 16) {\n"
     "        const float mag[8] = {0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f};\n"
     "        e2m1[tx] = tx & 8 ? -mag[tx & 7] : mag[tx & 7];\n"
@@ -3457,7 +3496,7 @@ static const char *const dg_cuda_source[] = {
     "                amax = fabsf(x[k]);\n"
     "        }\n"
     "        if (bad) {\n"
-    "            *flag = 1;\n"
+    "            atomicOr(flag, 1);\n"
     "            continue;\n"
     "        }\n"
     "        float s = dg_f8e4m3_round((amax / 6) / base) * base;\n"
@@ -3728,6 +3767,149 @@ static const char *const dg_cuda_source[] = {
     "        if (g < keys && c < kn)\n"
     "            kt[(size_t)c * keys + g] = tile[tx][r];\n"
     "    }\n"
+    "}\n"
+    "/* dg_exp, fdlibm's __ieee754_exp, as the host computes it. */\n"
+    "__device__ double dg_exp(double x) {\n"
+    "    const double ln2_hi = 6.93147180369123816490e-01, ln2_lo = 1.90821492927058770002e-10,\n"
+    "                 inv_ln2 = 1.44269504088896338700e+00, p1 = 1.66666666666666019037e-01,\n"
+    "                 p2 = -2.77777777770155933842e-03, p3 = 6.61375632143793436117e-05,\n"
+    "                 p4 = -1.65339022054652515390e-06, p5 = 4.13813679705723846039e-08,\n"
+    "                 two_m1000 = 9.33263618503218878990e-302;\n"
+    "    unsigned long long bits = (unsigned long long)__double_as_longlong(x);\n"
+    "    unsigned hx = (unsigned)(bits >> 32) & 0x7fffffffu;\n"
+    "    int negative = (int)(bits >> 63), k = 0;\n"
+    "    double hi = 0, lo = 0;\n"
+    "    if (hx >= 0x40862E42u) {\n"
+    "        if (hx >= 0x7ff00000u)\n"
+    "            return x != x ? x + x : negative ? 0.0 : x;\n"
+    "        if (x > 7.09782712893383973096e+02)\n"
+    "            return __longlong_as_double(0x7ff0000000000000LL);\n"
+    "        if (x < -7.45133219101941108420e+02)\n"
+    "            return 0.0;\n"
+    "    }\n"
+    "    if (hx > 0x3fd62e42u) {\n"
+    "        if (hx < 0x3FF0A2B2u) {\n"
+    "            hi = negative ? x + ln2_hi : x - ln2_hi;\n"
+    "            lo = negative ? -ln2_lo : ln2_lo;\n"
+    "            k = negative ? -1 : 1;\n"
+    "        } else {\n"
+    "            k = (int)(inv_ln2 * x + (negative ? -0.5 : 0.5));\n"
+    "            double t = k;\n"
+    "            hi = x - t * ln2_hi;\n"
+    "            lo = t * ln2_lo;\n"
+    "        }\n"
+    "        x = hi - lo;\n"
+    "    } else if (hx < 0x3e300000u)\n"
+    "        return 1.0 + x;\n"
+    "    double t = x * x, c = x - t * (p1 + t * (p2 + t * (p3 + t * (p4 + t * p5)))), y;\n"
+    "    if (k == 0)\n"
+    "        return 1.0 - ((x * c) / (c - 2.0) - x);\n"
+    "    y = 1.0 - ((lo - (x * c) / (2.0 - c)) - hi);\n"
+    "    unsigned long long yb = (unsigned long long)__double_as_longlong(y);\n"
+    "    if (k >= -1021)\n"
+    "        return __longlong_as_double((long long)(yb + ((unsigned long long)(long long)k << "
+    "52)));\n"
+    "    return __longlong_as_double((long long)(yb + ((unsigned long long)(long long)(k + 1000) "
+    "<< 52))) *\n"
+    "           two_m1000;\n"
+    "}\n"
+    "\n"
+    "/* dg_route_token, one token per block: each thread computes one expert's\n"
+    " * exponential, and one thread does the top-k and the sums in the\n"
+    " * reference's order. A non-finite logit sets bit 2 of *flag. */\n"
+    "extern \"C\" __global__ void dg_route(const float *logits, const unsigned short *scale, int "
+    "tokens,\n"
+    "        int *top, float *weight, int *flag) {\n"
+    "    __shared__ double ex[DG_EXPERTS_N];\n",
+    "    __shared__ float mxs;\n"
+    "    for (int t = blockIdx.x; t < tokens; t += gridDim.x) {\n"
+    "        const float *rt = logits + (size_t)t * DG_EXPERTS_N;\n"
+    "        int e = threadIdx.x;\n"
+    "        __syncthreads();\n"
+    "        if (e == 0) {\n"
+    "            float mx = rt[0];\n"
+    "            for (int i = 1; i < DG_EXPERTS_N; i++)\n"
+    "                if (rt[i] > mx)\n"
+    "                    mx = rt[i];\n"
+    "            mxs = mx;\n"
+    "        }\n"
+    "        __syncthreads();\n"
+    "        ex[e] = dg_exp((double)rt[e] - mxs);\n"
+    "        if (!dg_finitef(rt[e]))\n"
+    "            atomicOr(flag, 2);\n"
+    "        __syncthreads();\n"
+    "        if (e == 0) {\n"
+    "            int ix[DG_TOPK_N];\n"
+    "            float ev[DG_TOPK_N];\n"
+    "            for (int k = 0; k < DG_TOPK_N; k++) {\n"
+    "                ix[k] = k;\n"
+    "                ev[k] = -3.402823466e+38f;\n"
+    "            }\n"
+    "            for (int i = 0; i < DG_EXPERTS_N; i++)\n"
+    "                for (int k = 0; k < DG_TOPK_N; k++)\n"
+    "                    if (rt[i] > ev[k]) {\n"
+    "                        for (int q = DG_TOPK_N - 1; q > k; q--) {\n"
+    "                            ev[q] = ev[q - 1];\n"
+    "                            ix[q] = ix[q - 1];\n"
+    "                        }\n"
+    "                        ev[k] = rt[i];\n"
+    "                        ix[k] = i;\n"
+    "                        break;\n"
+    "                    }\n"
+    "            double all = 0, sel = 0;\n"
+    "            for (int i = 0; i < DG_EXPERTS_N; i++)\n"
+    "                all += ex[i];\n"
+    "            for (int k = 0; k < DG_TOPK_N; k++) {\n"
+    "                ev[k] = (float)(dg_exp((double)ev[k] - mxs) / all);\n"
+    "                sel += ev[k];\n"
+    "            }\n"
+    "            for (int k = 0; k < DG_TOPK_N; k++) {\n"
+    "                top[(size_t)t * DG_TOPK_N + k] = ix[k];\n"
+    "                weight[(size_t)t * DG_TOPK_N + k] = ev[k] / (float)sel * "
+    "dg_bf(scale[ix[k]]);\n"
+    "            }\n"
+    "        }\n"
+    "    }\n"
+    "}\n"
+    "\n"
+    "/* The routed rows grouped by expert, in the host loop's order (expert, then\n"
+    " * token, then slot), and their tiles of up to DG_TOKENS rows; one block,\n"
+    " * one thread per expert. */\n"
+    "extern \"C\" __global__ void dg_group(const int *top, int tokens, int *index, int *slot,\n"
+    "        dg_tile *tiles, int *ntiles) {\n"
+    "    __shared__ int count[DG_EXPERTS_N], rowoff[DG_EXPERTS_N], tileoff[DG_EXPERTS_N];\n"
+    "    int e = threadIdx.x, c = 0;\n"
+    "    for (int t = 0; t < tokens; t++)\n"
+    "        for (int k = 0; k < DG_TOPK_N; k++)\n"
+    "            c += top[(size_t)t * DG_TOPK_N + k] == e;\n"
+    "    count[e] = c;\n"
+    "    __syncthreads();\n"
+    "    if (e == 0) {\n"
+    "        int rows = 0, n = 0;\n"
+    "        for (int i = 0; i < DG_EXPERTS_N; i++) {\n"
+    "            rowoff[i] = rows;\n"
+    "            tileoff[i] = n;\n"
+    "            rows += count[i];\n"
+    "            n += (count[i] + DG_TOKENS - 1) / DG_TOKENS;\n"
+    "        }\n"
+    "        *ntiles = n;\n"
+    "    }\n"
+    "    __syncthreads();\n"
+    "    int row = rowoff[e];\n"
+    "    for (int t = 0; t < tokens; t++)\n"
+    "        for (int k = 0; k < DG_TOPK_N; k++)\n"
+    "            if (top[(size_t)t * DG_TOPK_N + k] == e) {\n"
+    "                index[row] = t;\n"
+    "                slot[(size_t)t * DG_TOPK_N + k] = row;\n"
+    "                row++;\n"
+    "            }\n"
+    "    for (int i = 0; i * DG_TOKENS < c; i++) {\n"
+    "        dg_tile tl;\n"
+    "        tl.start = rowoff[e] + i * DG_TOKENS;\n"
+    "        tl.count = c - i * DG_TOKENS < DG_TOKENS ? c - i * DG_TOKENS : DG_TOKENS;\n"
+    "        tl.group = e;\n"
+    "        tiles[tileoff[e] + i] = tl;\n"
+    "    }\n"
     "}\n"};
 
 /* The kernel's struct dg_tile: tokens start..start + count - 1 use matrix
@@ -3761,13 +3943,15 @@ enum {
     DG_CUDA_BF16_WIDE,
     DG_CUDA_BF16_NARROW,
     DG_CUDA_TRANSPOSE_KEYS,
+    DG_CUDA_ROUTE,
+    DG_CUDA_GROUP,
     DG_CUDA_KERNELS
 };
 
 static const char *const dg_cuda_kernel_names[DG_CUDA_KERNELS] = {
-    "dg_nvfp4_mm",       "dg_bf16_mm",       "dg_rms",  "dg_gelu_mul",  "dg_nvfp4_qdq",
-    "dg_gather",         "dg_moe_tail",      "dg_rope", "dg_attention", "dg_bf16_mm_wide",
-    "dg_bf16_mm_narrow", "dg_transpose_keys"};
+    "dg_nvfp4_mm",       "dg_bf16_mm",        "dg_rms",   "dg_gelu_mul",  "dg_nvfp4_qdq",
+    "dg_gather",         "dg_moe_tail",       "dg_rope",  "dg_attention", "dg_bf16_mm_wide",
+    "dg_bf16_mm_narrow", "dg_transpose_keys", "dg_route", "dg_group"};
 
 /* The driver and NVRTC entry points, and the process-wide context and
  * kernels. */
@@ -3784,6 +3968,8 @@ static struct {
     CUresult (*htod)(CUdeviceptr, const void *, size_t);
     CUresult (*dtoh)(void *, CUdeviceptr, size_t);
     CUresult (*dtod)(CUdeviceptr, CUdeviceptr, size_t);
+    CUresult (*host_alloc)(void **, size_t);
+    CUresult (*host_free)(void *);
     CUresult (*launch)(CUfunction, unsigned, unsigned, unsigned, unsigned, unsigned, unsigned,
                        unsigned, void *, void **, void **);
     nvrtcResult (*create)(nvrtcProgram *, const char *, const char *, int, const char *const *,
@@ -3812,7 +3998,7 @@ static int dg_cuda_symbol(void *lib, const char *name, void *slot) {
  * and allocates with plain malloc. */
 static void dg_cuda_compile(int major, int minor) {
     char arch[48], tile_rows[32], tile_tokens[32], bf16_tokens[32], row_max[32], head_max[32],
-        threads[32], width[32];
+        threads[32], width[32], experts[32], topk[32];
     snprintf(arch, sizeof arch, "--gpu-architecture=compute_%d%d", major, minor);
     snprintf(tile_rows, sizeof tile_rows, "-DDG_ROWS=%d", DG_CUDA_ROWS);
     snprintf(tile_tokens, sizeof tile_tokens, "-DDG_TOKENS=%d", DG_CUDA_TOKENS);
@@ -3821,9 +4007,22 @@ static void dg_cuda_compile(int major, int minor) {
     snprintf(head_max, sizeof head_max, "-DDG_HEAD_MAX=%d", DG_FULL_HEAD_DIM);
     snprintf(threads, sizeof threads, "-DDG_THREADS=%d", DG_CUDA_THREADS);
     snprintf(width, sizeof width, "-DDG_WIDTH=%d", DG_H);
-    const char *options[] = {arch,          "--fmad=false", "--prec-div=true", "--prec-sqrt=true",
-                             "--ftz=false", tile_rows,      tile_tokens,       bf16_tokens,
-                             row_max,       head_max,       threads,           width};
+    snprintf(experts, sizeof experts, "-DDG_EXPERTS_N=%d", DG_EXPERTS);
+    snprintf(topk, sizeof topk, "-DDG_TOPK_N=%d", DG_TOPK);
+    const char *options[] = {arch,
+                             "--fmad=false",
+                             "--prec-div=true",
+                             "--prec-sqrt=true",
+                             "--ftz=false",
+                             tile_rows,
+                             tile_tokens,
+                             bf16_tokens,
+                             row_max,
+                             head_max,
+                             threads,
+                             width,
+                             experts,
+                             topk};
     /* The source is split into pieces short enough for ISO C string
      * literals. */
     size_t length = 1;
@@ -3889,6 +4088,8 @@ static void dg_cuda_open(void) {
                  dg_cuda_symbol(cu, "cuMemcpyHtoD_v2", &dg_cuda.htod) &
                  dg_cuda_symbol(cu, "cuMemcpyDtoH_v2", &dg_cuda.dtoh) &
                  dg_cuda_symbol(cu, "cuMemcpyDtoD_v2", &dg_cuda.dtod) &
+                 dg_cuda_symbol(cu, "cuMemAllocHost_v2", &dg_cuda.host_alloc) &
+                 dg_cuda_symbol(cu, "cuMemFreeHost", &dg_cuda.host_free) &
                  dg_cuda_symbol(cu, "cuLaunchKernel", &dg_cuda.launch) &
                  dg_cuda_symbol(rtc, "nvrtcCreateProgram", &dg_cuda.create) &
                  dg_cuda_symbol(rtc, "nvrtcCompileProgram", &dg_cuda.compile) &
@@ -3959,6 +4160,17 @@ static void dg_cuda_to_host(void *dst, DGDevice src, size_t bytes) {
     dg_cuda_check(dg_cuda.dtoh(dst, (CUdeviceptr)src, bytes), "cuMemcpyDtoH");
 }
 
+static void *dg_cuda_host_alloc(size_t bytes) {
+    void *p = NULL;
+    dg_cuda_current();
+    return dg_cuda.host_alloc(&p, bytes ? bytes : 1) ? NULL : p;
+}
+
+static void dg_cuda_host_free(void *p) {
+    dg_cuda_current();
+    dg_cuda_check(dg_cuda.host_free(p), "cuMemFreeHost");
+}
+
 static void dg_cuda_release(DGAccelMatrix *a) {
     jb_release(a);
 }
@@ -3979,7 +4191,48 @@ static size_t dg_cuda_align16(size_t n) {
 
 static size_t dg_cuda_nvfp4_scratch(int tokens) {
     return dg_cuda_align16(DG_EXPERTS * sizeof(DGCudaMatrix)) +
-           dg_cuda_align16((size_t)tokens * sizeof(DGCudaTile));
+           dg_cuda_align16((size_t)tokens * sizeof(DGCudaTile)) + 16;
+}
+
+static size_t dg_cuda_table_bytes(int count) {
+    return (size_t)count * sizeof(DGCudaMatrix);
+}
+
+static void dg_cuda_matrix_table(DGDevice dst, const DGAccelMatrix *const *m, int count) {
+    DGCudaMatrix *table = xcalloc((size_t)count, sizeof *table);
+    for (int i = 0; i < count; i++) {
+        table[i].w = m[i]->w;
+        table[i].s = m[i]->s;
+        table[i].global = m[i]->global;
+    }
+    dg_cuda_to_device(dst, table, (size_t)count * sizeof *table);
+    jb_release(table);
+}
+
+static void dg_cuda_route(DGDevice logits, DGDevice scale, int tokens, DGDevice top,
+                          DGDevice weight, DGDevice flag) {
+    CUdeviceptr dl = logits, ds = scale, dt = top, dw = weight, df = flag;
+    void *args[] = {&dl, &ds, &tokens, &dt, &dw, &df};
+    dg_cuda_launch(DG_CUDA_ROUTE, dg_cuda_blocks(tokens, 1, 1u << 30), 1, DG_EXPERTS, args);
+}
+
+static void dg_cuda_group(DGDevice top, int tokens, DGDevice index, DGDevice slot, DGDevice tiles,
+                          DGDevice ntiles) {
+    CUdeviceptr dt = top, di = index, ds = slot, dl = tiles, dn = ntiles;
+    void *args[] = {&dt, &tokens, &di, &ds, &dl, &dn};
+    dg_cuda_launch(DG_CUDA_GROUP, 1, 1, DG_EXPERTS, args);
+}
+
+/* The grouped product from the device's own tiles; the grid covers the
+ * most tiles rows routed rows can make, and blocks past *ntiles exit. */
+static void dg_cuda_nvfp4_grouped(DGDevice table, DGDevice tiles, DGDevice ntiles, int routed,
+                                  DGDevice x, DGDevice y, int rows, int cols) {
+    CUdeviceptr dt = table, dl = tiles, dn = ntiles, dx = x, dy = y;
+    long long bound = routed / DG_CUDA_TOKENS + DG_EXPERTS;
+    void *args[] = {&dt, &dl, &dn, &dx, &dy, &rows, &cols};
+    dg_cuda_launch(DG_CUDA_NVFP4_MM, dg_cuda_blocks(rows, DG_CUDA_ROWS, 1u << 30),
+                   dg_cuda_blocks(bound < routed ? bound : routed, 1, DG_CUDA_GRID_Y), DG_CUDA_ROWS,
+                   args);
 }
 
 /* Splits tokens into tiles of up to DG_CUDA_TOKENS consecutive tokens that
@@ -4015,12 +4268,14 @@ static void dg_cuda_nvfp4_mm(const DGAccelMatrix *const *m, const int *group, in
         t += n;
     }
     CUdeviceptr dt = (CUdeviceptr)scratch,
-                dl = dt + dg_cuda_align16(DG_EXPERTS * sizeof(DGCudaMatrix)), dx = x, dy = y;
+                dl = dt + dg_cuda_align16(DG_EXPERTS * sizeof(DGCudaMatrix)),
+                dn = dl + dg_cuda_align16((size_t)tokens * sizeof(DGCudaTile)), dx = x, dy = y;
     dg_cuda_to_device(dt, table, (size_t)count * sizeof *table);
     dg_cuda_to_device(dl, tiles, (size_t)ntiles * sizeof *tiles);
+    dg_cuda_to_device(dn, &ntiles, sizeof ntiles);
     jb_release(table);
     jb_release(tiles);
-    void *args[] = {&dt, &dl, &ntiles, &dx, &dy, &rows, &cols};
+    void *args[] = {&dt, &dl, &dn, &dx, &dy, &rows, &cols};
     dg_cuda_launch(DG_CUDA_NVFP4_MM, dg_cuda_blocks(rows, DG_CUDA_ROWS, 1u << 30),
                    dg_cuda_blocks(ntiles, 1, DG_CUDA_GRID_Y), DG_CUDA_ROWS, args);
 }
@@ -4131,6 +4386,8 @@ static const DGAccelOps *dg_accel(void) {
                                     dg_cuda_free,
                                     dg_cuda_to_device,
                                     dg_cuda_to_host,
+                                    dg_cuda_host_alloc,
+                                    dg_cuda_host_free,
                                     dg_cuda_nvfp4_scratch,
                                     dg_cuda_nvfp4_mm,
                                     dg_cuda_bf16_mm,
@@ -4141,7 +4398,12 @@ static const DGAccelOps *dg_accel(void) {
                                     dg_cuda_copy,
                                     dg_cuda_rope,
                                     dg_cuda_attention,
-                                    dg_cuda_moe_tail};
+                                    dg_cuda_moe_tail,
+                                    dg_cuda_table_bytes,
+                                    dg_cuda_matrix_table,
+                                    dg_cuda_route,
+                                    dg_cuda_group,
+                                    dg_cuda_nvfp4_grouped};
     pthread_once(&once, dg_cuda_open);
     if (dg_cuda.failure)
         die2("CUDA accelerator failed", dg_cuda.failure);
@@ -4190,17 +4452,11 @@ static size_t dg_attention_workspace_bytes(int n, int old, int seq, int segments
         jb_workspace_plan(&used, (size_t)segments, sizeof(DGKV *));
         jb_workspace_plan(&used, (size_t)segments, sizeof(int));
     }
-    /* dg_attention_accel: rotary tables, segment tables, and K and V for
-     * the K/V output, at the widest width. */
+    /* dg_attention_accel: rotary tables and segment tables. */
     if (accel) {
-        int kn = DG_LOCAL_KV_HEADS * DG_LOCAL_HEAD_DIM > DG_FULL_KV_HEADS * DG_FULL_HEAD_DIM
-                     ? DG_LOCAL_KV_HEADS * DG_LOCAL_HEAD_DIM
-                     : DG_FULL_KV_HEADS * DG_FULL_HEAD_DIM;
         jb_workspace_plan(&used, (size_t)n * DG_FULL_HEAD_DIM, sizeof(float));
         jb_workspace_plan(&used, (size_t)segments, sizeof(int));
         jb_workspace_plan(&used, (size_t)segments, sizeof(int));
-        jb_workspace_plan(&used, (size_t)n * kn, sizeof(float));
-        jb_workspace_plan(&used, (size_t)n * kn, sizeof(float));
         return used;
     }
     /* Full attention has the largest Q/K/V projections in this model. */
@@ -4218,17 +4474,9 @@ static size_t dg_ff_workspace_bytes(const DGModel *m, int n) {
     size_t used = 0;
 #define DG_PLAN_FLOAT(count) jb_workspace_plan(&used, (size_t)(count), sizeof(float))
 #define DG_PLAN_INT(count) jb_workspace_plan(&used, (size_t)(count), sizeof(int))
-    /* dg_ff_accel keeps its activations on the device; the host holds the
-     * routing. */
-    if (m->accel) {
-        DG_PLAN_FLOAT((size_t)n * DG_EXPERTS); /* router output */
-        DG_PLAN_INT((size_t)n * DG_TOPK);      /* experts */
-        DG_PLAN_FLOAT((size_t)n * DG_TOPK);    /* weights */
-        DG_PLAN_INT((size_t)n * DG_TOPK);      /* token of each routed row */
-        DG_PLAN_INT((size_t)n * DG_TOPK);      /* expert of each routed row */
-        DG_PLAN_INT((size_t)n * DG_TOPK);      /* routed row of each slot */
+    /* dg_ff_accel keeps everything on the device. */
+    if (m->accel)
         return used;
-    }
     DG_PLAN_FLOAT((size_t)n * DG_H);       /* z1 */
     DG_PLAN_FLOAT((size_t)n * DG_DENSE);   /* gate */
     DG_PLAN_FLOAT((size_t)n * DG_DENSE);   /* up */
@@ -4274,9 +4522,12 @@ typedef struct {
     JBArena control_arena;
     size_t capacity, kv_capacity, control_capacity;
     int active, kv_active, control_active;
-    /* The session's accelerator activations, or 0. */
+    /* The session's accelerator activations, or 0, and page-locked host
+     * memory for the staged K/V output. */
     DGDevice device;
     size_t device_bytes;
+    float *pinned;
+    size_t pinned_bytes;
 #ifdef JB_PROFILE
     JBProfile profile;
 #endif
@@ -4308,7 +4559,19 @@ static void dg_workspace_destroy(DGWorkspace *workspace) {
         jb_arena_free(&workspace->control_arena);
     if (workspace->device)
         dg_accel()->free(workspace->device);
+    if (workspace->pinned)
+        dg_accel()->host_free(workspace->pinned);
     memset(workspace, 0, sizeof *workspace);
+}
+
+static int dg_kv_width(int layer);
+
+/* Where layer l's K then V start in the staged K/V output, in floats. */
+static size_t dg_kv_stage_offset(int n, int l) {
+    size_t at = 0;
+    for (int i = 0; i < l; i++)
+        at += (size_t)n * dg_kv_width(i) * 2;
+    return at;
 }
 
 /* An accelerated layer's device activations for n tokens, carved from the
@@ -4316,7 +4579,8 @@ static void dg_workspace_destroy(DGWorkspace *workspace) {
  * either layer kind. */
 typedef struct {
     DGDevice x, res, z, q, k, v, a, g, u, d, z2, rin, route, qz2, weight, index, slot, flag, gather,
-        eg, eh, eqh, eo, scratch, rope, seg_old, seg_base, kv_k, kv_v, kt;
+        eg, eh, eqh, eo, scratch, rope, seg_old, seg_base, kv_k, kv_v, kt, top, tiles, ntiles,
+        kv_out;
     /* Rows of the widest K/V width that kv_k and kv_v each hold. */
     int kv_rows;
 } DGDeviceLayout;
@@ -4326,6 +4590,8 @@ typedef struct {
 typedef struct {
     DGDevice base;
     int kv_rows;
+    /* Page-locked room for the staged K/V output, or NULL. */
+    float *pinned;
 } DGDeviceWork;
 
 static size_t dg_device_layout(DGDeviceLayout *d, DGDevice base, int n, int kv_rows,
@@ -4367,6 +4633,10 @@ static size_t dg_device_layout(DGDeviceLayout *d, DGDevice base, int n, int kv_r
     DG_CARVE(kv_k, jb_size_mul((size_t)kv_rows, kn * 4));
     DG_CARVE(kv_v, jb_size_mul((size_t)kv_rows, kn * 4));
     DG_CARVE(kt, jb_size_mul((size_t)n + (size_t)kv_rows, kn * 4));
+    DG_CARVE(top, jb_size_mul(total, 4));
+    DG_CARVE(tiles, a->nvfp4_scratch((int)total));
+    DG_CARVE(ntiles, 4);
+    DG_CARVE(kv_out, jb_size_mul(dg_kv_stage_offset(n, DG_L), 4));
 #undef DG_CARVE
     d->kv_rows = kv_rows;
     return at;
@@ -4375,7 +4645,7 @@ static size_t dg_device_layout(DGDeviceLayout *d, DGDevice base, int n, int kv_r
 /* The session's device workspace for n tokens and kv_rows cached K/V rows,
  * grown as needed; its base is 0 when the model runs on the CPU kernels. */
 static DGDeviceWork dg_device_begin(DGWorkspace *owner, const DGModel *m, int n, int kv_rows) {
-    DGDeviceWork work = {0, kv_rows};
+    DGDeviceWork work = {0, kv_rows, NULL};
     if (!m->accel)
         return work;
     DGDeviceLayout d;
@@ -4389,7 +4659,18 @@ static DGDeviceWork dg_device_begin(DGWorkspace *owner, const DGModel *m, int n,
             die("accelerator out of memory for activations");
         owner->device_bytes = bytes;
     }
+    size_t staged = jb_size_mul(dg_kv_stage_offset(n, DG_L), 4);
+    if (owner->pinned_bytes < staged) {
+        if (owner->pinned)
+            m->accel->host_free(owner->pinned);
+        owner->pinned_bytes = 0;
+        owner->pinned = m->accel->host_alloc(staged);
+        if (!owner->pinned)
+            die("accelerator out of page-locked memory");
+        owner->pinned_bytes = staged;
+    }
     work.base = owner->device;
+    work.pinned = owner->pinned;
     return work;
 }
 
@@ -4577,8 +4858,6 @@ static void dg_attention_accel(DGModel *m, int l, int segments, int seq, int pos
     float *table = jb_arena_alloc(workspace, (size_t)n * DG_FULL_HEAD_DIM, sizeof *table, 0);
     int *seg_old = jb_arena_alloc(workspace, (size_t)segments, sizeof *seg_old, 0),
         *seg_base = jb_arena_alloc(workspace, (size_t)segments, sizeof *seg_base, 0);
-    float *k = jb_arena_alloc(workspace, (size_t)n * widest, sizeof *k, 0),
-          *v = jb_arena_alloc(workspace, (size_t)n * widest, sizeof *v, 0);
     /* The host's part comes first: each upload waits for the work queued
      * before it, and nothing but the input norm is queued yet. */
     JB_TO(attention_qkv, qkv_start);
@@ -4646,10 +4925,22 @@ static void dg_attention_accel(DGModel *m, int l, int segments, int seq, int pos
     JB_TICK(output_start);
     dg_mm_accel(m, ow, dev->a, dev->z, n, DG_H, qn);
     JB_TO(attention_output, output_start);
+    /* The K/V output's cached rows are host memory and are copied now; its
+     * own rows are staged on the device and come down after the last
+     * layer, through dg_kv_fetch, so no layer waits for them. */
     if (out) {
-        a->to_host(k, dev->k, (size_t)n * kn * 4);
-        a->to_host(v, dev->v, (size_t)n * kn * 4);
-        dg_kv_output(out, cache, lens, segments, seq, kn, k, v);
+        for (int s = 0; s < segments; s++) {
+            int old = cache ? cache[s]->n : 0;
+            if (out[s].n != old + lens[s] || !out[s].k || !out[s].v)
+                die("K/V output does not match planned storage");
+            if (old) {
+                memcpy(out[s].k, cache[s]->k, (size_t)old * kn * 4);
+                memcpy(out[s].v, cache[s]->v, (size_t)old * kn * 4);
+            }
+        }
+        DGDevice stage = dev->kv_out + dg_kv_stage_offset(n, l) * 4;
+        a->copy(stage, dev->k, (size_t)n * kn * 4);
+        a->copy(stage + (size_t)n * kn * 4, dev->v, (size_t)n * kn * 4);
     }
     jb_arena_reset(workspace, mark);
 }
@@ -4979,9 +5270,8 @@ static void dg_ff(DGModel *m, int l, float *x, int n, JBArena *workspace) {
     JB_TO(ff_other, ff_tail_start);
 }
 
-/* dg_ff on the accelerator, from d->x to d->x, including the layer scalar.
- * The router's top-k and softmax, which use the C library's exp, run on the
- * host between the router and the experts. */
+/* dg_ff on the accelerator, from d->x to d->x, including the layer scalar,
+ * with routing on the device too. */
 static void dg_ff_accel(DGModel *m, int l, int n, const DGDeviceLayout *d, JBArena *workspace) {
     const DGAccelOps *a = m->accel;
     size_t mark = jb_arena_mark(workspace), total = (size_t)n * DG_TOPK;
@@ -5006,58 +5296,23 @@ static void dg_ff_accel(DGModel *m, int l, int n, const DGDeviceLayout *d, JBAre
     a->rms(d->z2, d->x, pre2->device, 0, 0, 0, n, DG_H);
     a->rms(d->rin, d->x, 0, rs->device, sqrtf(DG_H), 0, n, DG_H);
     dg_mm_accel(m, rw, d->rin, d->route, n, DG_EXPERTS, DG_H);
-    /* Queued before the logits come down, so it runs during the wait. */
-    dg_nvfp4_qdq_accel(m, d->qz2, d->z2, n, DG_H, m->nv_a13[l], d->flag);
-    float *route = jb_arena_alloc(workspace, (size_t)n * DG_EXPERTS, sizeof *route, 0);
-    a->to_host(route, d->route, (size_t)n * DG_EXPERTS * 4);
     JB_TO(dense, ff_start);
-    JB_TICK(router_start);
-    for (size_t i = 0; i < (size_t)n * DG_EXPERTS; i++)
-        if (!jb_finitef(route[i]))
-            die("non-finite DiffusionGemma router logits");
-    int *top = jb_arena_alloc(workspace, total, sizeof *top, 0);
-    float *tw = jb_arena_alloc(workspace, total, sizeof *tw, 0);
-    {
-        int t;
-#ifdef _OPENMP
-        JB_OMP();
-#pragma omp parallel for schedule(dynamic)
-#endif
-        for (t = 0; t < n; t++)
-            dg_route_token(route + (size_t)t * DG_EXPERTS, re, top + (size_t)t * DG_TOPK,
-                           tw + (size_t)t * DG_TOPK);
-    }
-    JB_TO(router, router_start);
     JB_TICK(expert_start);
-    /* Routed rows grouped by expert, as the CPU loop visits them. */
-    int *index = jb_arena_alloc(workspace, total, sizeof *index, 0),
-        *group = jb_arena_alloc(workspace, total, sizeof *group, 0),
-        *slot = jb_arena_alloc(workspace, total, sizeof *slot, 0);
-    int rows = 0;
-    const DGAccelMatrix *gate[DG_EXPERTS], *up[DG_EXPERTS], *down[DG_EXPERTS];
-    for (int e = 0; e < DG_EXPERTS; e++) {
-        const DGNvExpert *v = &m->nvexpert[l * DG_EXPERTS + e];
-        gate[e] = v->accel[0];
-        up[e] = v->accel[1];
-        down[e] = v->accel[2];
-        for (int t = 0; t < n; t++)
-            for (int k = 0; k < DG_TOPK; k++)
-                if (top[(size_t)t * DG_TOPK + k] == e) {
-                    index[rows] = t;
-                    group[rows] = e;
-                    slot[(size_t)t * DG_TOPK + k] = rows;
-                    rows++;
-                }
-    }
-    a->to_device(d->index, index, (size_t)rows * sizeof *index);
-    a->to_device(d->slot, slot, total * sizeof *slot);
-    a->to_device(d->weight, tw, total * sizeof *tw);
-    a->gather(d->gather, d->qz2, d->index, rows, DG_H);
-    a->nvfp4_mm(gate, group, rows, d->gather, d->eg, d->scratch);
-    a->nvfp4_mm(up, group, rows, d->gather, d->eh, d->scratch);
-    a->gelu_mul(d->eh, d->eg, d->eh, (size_t)rows * DG_MOE);
-    dg_nvfp4_qdq_accel(m, d->eqh, d->eh, rows, DG_MOE, m->nv_a2[l], d->flag);
-    a->nvfp4_mm(down, group, rows, d->eqh, d->eo, d->scratch);
+    /* Routing, grouping and the experts stay on the device: nothing here
+     * waits for the host. */
+    int routed = (int)total;
+    a->route(d->route, re->device, n, d->top, d->weight, d->flag);
+    dg_nvfp4_qdq_accel(m, d->qz2, d->z2, n, DG_H, m->nv_a13[l], d->flag);
+    a->group(d->top, n, d->index, d->slot, d->tiles, d->ntiles);
+    a->gather(d->gather, d->qz2, d->index, routed, DG_H);
+    a->nvfp4_grouped(m->expert_table[l][0], d->tiles, d->ntiles, routed, d->gather, d->eg, DG_MOE,
+                     DG_H);
+    a->nvfp4_grouped(m->expert_table[l][1], d->tiles, d->ntiles, routed, d->gather, d->eh, DG_MOE,
+                     DG_H);
+    a->gelu_mul(d->eh, d->eg, d->eh, total * DG_MOE);
+    dg_nvfp4_qdq_accel(m, d->eqh, d->eh, routed, DG_MOE, m->nv_a2[l], d->flag);
+    a->nvfp4_grouped(m->expert_table[l][2], d->tiles, d->ntiles, routed, d->eqh, d->eo, DG_H,
+                     DG_MOE);
     a->moe_tail(d->x, d->eo, d->slot, d->weight, d->d, p2->device, post->device,
                 dg_at(dg_layer_tensor(m, l, "layer_scalar"), 0), n);
     JB_TO(experts, expert_start);
@@ -5091,8 +5346,31 @@ static void dg_accel_leave(const DGModel *m, const DGDeviceWork *work, float *x,
     dg_device_layout(&d, work->base, n, work->kv_rows, m->accel);
     m->accel->to_host(x, d.x, (size_t)n * DG_H * 4);
     m->accel->to_host(&bad, d.flag, sizeof bad);
+    if (bad & 2)
+        die("non-finite DiffusionGemma router logits");
     if (bad)
         die("non-finite NVFP4 activation");
+}
+
+/* The staged K/V output, in one copy to page-locked memory after the last
+ * layer; dg_kv_fetch then copies each layer's rows out of it. */
+static void dg_kv_download(const DGModel *m, const DGDeviceWork *work, int n) {
+    DGDeviceLayout d;
+    dg_device_layout(&d, work->base, n, work->kv_rows, m->accel);
+    m->accel->to_host(work->pinned, d.kv_out, dg_kv_stage_offset(n, DG_L) * 4);
+}
+
+/* Layer l's downloaded K/V rows into its output, for segments first onward:
+ * segment s's own rows follow its cached ones there. */
+static void dg_kv_fetch(const DGDeviceWork *work, int n, int l, DGKV *out, int first, int segments,
+                        int seq, const int *old, const int *lens) {
+    int kn = dg_kv_width(l);
+    const float *k = work->pinned + dg_kv_stage_offset(n, l), *v = k + (size_t)n * kn;
+    for (int s = 0; s < segments; s++) {
+        size_t own = (size_t)(first + s) * seq * kn, keep = (size_t)lens[s] * kn * 4;
+        memcpy(out[s].k + (size_t)old[s] * kn, k + own, keep);
+        memcpy(out[s].v + (size_t)old[s] * kn, v + own, keep);
+    }
 }
 
 /* dg_layer on the accelerator, from and to the device's activations; device
@@ -5243,8 +5521,13 @@ static void dg_prefill(DGModel *m, const int *prompt, int np, DGKV kv[DG_L], DGW
         dg_accel_enter(m, device, enc, np);
     for (int l = 0; l < DG_L; l++)
         dg_layer(m, l, enc, np, 0, NULL, &kv[l], DG_CAUSAL, 1, workspace, device);
-    if (device)
+    if (device) {
+        int zero = 0;
         dg_accel_leave(m, device, enc, np);
+        dg_kv_download(m, device, np);
+        for (int l = 0; l < DG_L; l++)
+            dg_kv_fetch(device, np, l, &kv[l], 0, 1, np, &zero, &np);
+    }
     jb_arena_reset(workspace, 0);
     dg_workspace_end(owner);
 }
@@ -5263,8 +5546,12 @@ static void dg_prefill_suffix(DGModel *m, const int *token, int n, const DGKV pr
         dg_accel_enter(m, device, x, n);
     for (int l = 0; l < DG_L; l++)
         dg_layer(m, l, x, n, prefix[l].n, &prefix[l], &kv[l], DG_SUFFIX, 1, workspace, device);
-    if (device)
+    if (device) {
         dg_accel_leave(m, device, x, n);
+        dg_kv_download(m, device, n);
+        for (int l = 0; l < DG_L; l++)
+            dg_kv_fetch(device, n, l, &kv[l], 0, 1, n, &prefix[l].n, &n);
+    }
     jb_arena_reset(workspace, 0);
     dg_workspace_end(owner);
 }
@@ -5311,8 +5598,14 @@ static void dg_prefill_suffix_multi(DGModel *m, const int *token, const int *len
         }
         dg_layer_multi(m, l, x, batch, seq, cache, lens, out, DG_SUFFIX, workspace, device);
     }
-    if (device)
+    if (device) {
         dg_accel_leave(m, device, x, batch * seq);
+        dg_kv_download(m, device, batch * seq);
+        for (int l = 0; l < DG_L; l++)
+            for (int b = 0; b < batch; b++)
+                dg_kv_fetch(device, batch * seq, l, &kv[(size_t)b * DG_L + l], b, 1, seq,
+                            &prefix[l].n, &lens[b]);
+    }
     jb_arena_reset(workspace, 0);
     dg_workspace_end(owner);
 }
@@ -8046,6 +8339,72 @@ static void dg_test_accel_attention(uint64_t *rs) {
         jb_release(host[i]);
 }
 
+/* The accelerator's routing against dg_route_token, with tied logits, and
+ * its grouping against dg_ff's row order: rows by expert, then token, then
+ * slot. */
+static void dg_test_accel_routing(uint64_t *rs) {
+    const DGAccelOps *a = dg_accel();
+    if (!a)
+        return;
+
+    enum { tokens = 37, total = tokens * DG_TOPK };
+
+    float *logits = xmalloc((size_t)tokens * DG_EXPERTS * 4), *tw = xmalloc(total * 4),
+          *gw = xmalloc(total * 4);
+    int *top = xmalloc(total * sizeof *top), *gtop = xmalloc(total * sizeof *gtop),
+        *index = xmalloc(total * sizeof *index), *slot = xmalloc(total * sizeof *slot),
+        *gindex = xmalloc(total * sizeof *gindex), *gslot = xmalloc(total * sizeof *gslot);
+    uint8_t *scale = xmalloc(DG_EXPERTS * 2);
+    for (int i = 0; i < tokens * DG_EXPERTS; i++)
+        logits[i] = 4 * jb_rng_unit(rs);
+    for (int t = 0; t < tokens; t += 3) /* ties, which go to the lower expert */
+        logits[(size_t)t * DG_EXPERTS + 17] = logits[(size_t)t * DG_EXPERTS + 90] = 9.0f;
+    for (int e = 0; e < DG_EXPERTS; e++)
+        jb_put_bf16(scale + e * 2, 1 + jb_rng_unit(rs) / 4);
+    DGTensor re = {0};
+    re.data = scale;
+    for (int t = 0; t < tokens; t++)
+        dg_route_token(logits + (size_t)t * DG_EXPERTS, &re, top + t * DG_TOPK, tw + t * DG_TOPK);
+    int rows = 0;
+    for (int e = 0; e < DG_EXPERTS; e++)
+        for (int t = 0; t < tokens; t++)
+            for (int k = 0; k < DG_TOPK; k++)
+                if (top[t * DG_TOPK + k] == e) {
+                    index[rows] = t;
+                    slot[t * DG_TOPK + k] = rows++;
+                }
+    size_t lb = (size_t)tokens * DG_EXPERTS * 4, ib = total * sizeof(int);
+    DGDevice dl = a->alloc(lb), ds = a->alloc(DG_EXPERTS * 2), dt = a->alloc(ib),
+             dw = a->alloc(total * 4), df = a->alloc(4), di = a->alloc(ib), dsl = a->alloc(ib),
+             dtl = a->alloc(a->nvfp4_scratch(total)), dn = a->alloc(4);
+    if (!dl || !ds || !dt || !dw || !df || !di || !dsl || !dtl || !dn)
+        die2("accelerator self-test failed: device memory", a->name);
+    int flag = 0, ntiles = 0;
+    a->to_device(dl, logits, lb);
+    a->to_device(ds, scale, DG_EXPERTS * 2);
+    a->to_device(df, &flag, sizeof flag);
+    a->route(dl, ds, tokens, dt, dw, df);
+    a->group(dt, tokens, di, dsl, dtl, dn);
+    a->to_host(gtop, dt, ib);
+    a->to_host(gw, dw, total * 4);
+    a->to_host(gindex, di, ib);
+    a->to_host(gslot, dsl, ib);
+    a->to_host(&flag, df, sizeof flag);
+    a->to_host(&ntiles, dn, sizeof ntiles);
+    if (flag || memcmp(gtop, top, ib) || ntiles < 1 || ntiles > total)
+        die2("accelerator self-test failed: routing", a->name);
+    if (JB_STRICT_MATH && memcmp(gw, tw, total * 4))
+        die2("accelerator self-test failed: differs from the reference", "routing weights");
+    if (memcmp(gindex, index, ib) || memcmp(gslot, slot, ib))
+        die2("accelerator self-test failed: expert grouping", a->name);
+    DGDevice all[] = {dl, ds, dt, dw, df, di, dsl, dtl, dn};
+    for (size_t i = 0; i < sizeof all / sizeof *all; i++)
+        a->free(all[i]);
+    void *host[] = {logits, tw, gw, top, gtop, index, slot, gindex, gslot, scale};
+    for (size_t i = 0; i < sizeof host / sizeof *host; i++)
+        jb_release(host[i]);
+}
+
 /* Distance in float units in the last place from a double reference. */
 static double jb_float_ulps(float got, double want) {
     double spacing = fabs(want) < FLT_MIN ? 0x1p-149 : ldexp(1.0, ilogb(want) - 23);
@@ -8180,6 +8539,7 @@ static void dg_kernel_selftest(void) {
     dg_test_portable_math();
     dg_test_accel_layer(&rs);
     dg_test_accel_attention(&rs);
+    dg_test_accel_routing(&rs);
     dg_test_nonfinite_activation();
 }
 
