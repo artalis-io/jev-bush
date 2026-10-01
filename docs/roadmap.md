@@ -621,6 +621,44 @@ Over eight rows the kernel window fell from 5.04 to 4.26 s and idle time from
 byte-identical on all 200 answers: 80x the reference. The K/V cache itself
 still lives on the host, and each attention call uploads its cached rows.
 
+### Where the exact GPU path stands
+
+Measured over eight rows on a quiet DGX Spark, the GPU is busy 90% of the
+kernel window (3.85 of 4.26 s), so what remains is the kernels, about a
+second each for attention, the BF16 products and the NVFP4 products.
+Rejected or deferred, so nobody retries them blind:
+
+- A device-resident K/V cache. The cache uploads moved 3.07 GB over eight
+  rows but took 0.058 s of GPU time, and the host spent 0.068 s in them while
+  the GPU waited: GB10's shared memory makes them cheap. At about 2% it is
+  not worth keeping device copies of the prefix cache in step with the
+  host's across rows, sessions and error unwinding.
+- Paired `float2` reads of the staged activations in the BF16 and NVFP4
+  kernels: no change, as the compiler already merged the loads.
+- Packed FP32 arithmetic (`__fmul2_rn`, `__fadd2_rn`). GB10, compute
+  capability 12.1, has no packed FP32 instructions: the intrinsics compile
+  to scalar operations, and their multiply and add were fused into an FMA
+  even with `--fmad=false`, differing from the separate operations on 2.2%
+  of 16.7 million random inputs. It cannot be used while results must be
+  exact.
+
+What bounds the kernels: removing the arithmetic from the largest BF16
+launch cut it from 1,970 to 385 us, so about 80% of the BF16 (and, by the
+same structure, NVFP4) time is FP32 multiplies and adds, issued at roughly
+half the instruction rate; fused multiply-adds would halve it but round
+differently. Attention is bound by the FP64 additions of the exact score
+sums, whose count the reference's order fixes; the other FP64 work is
+already off that pipe.
+
+For comparison, the full benchmark of 400 rows takes 490 s on the Spark's
+exact GPU path, model load included, against about 1,100 s on the 64-core
+Threadripper's AVX-512 fast-math build with two 32-thread workers. Against
+the GPU's own capability the exact path is roughly an order of magnitude
+slower than a non-exact engine: it gives up tensor cores, split sums and
+FP32 scores to stay bit-identical to the reference. Large further gains
+would need a fast accelerator mode, as fast math is for the CPU, that
+gives up that identity.
+
 ## 7. Make benchmark comparisons auditable
 
 Before publishing a faster number:
