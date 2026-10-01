@@ -81,14 +81,17 @@ could join, which is why the others remain out of scope.
 Exactness has a price. The exact kernels give up tensor cores, split sums and
 FP32 attention scores, so the GPU runs roughly an order of magnitude below a
 non-exact engine on the same hardware. Even so, the full 400-row benchmark
-takes 490 s on a DGX Spark's exact GPU path, against about 1,100 s for the
-64-core Threadripper's AVX-512 fast-math build.
+with automatic reads (one or four a row, as OpenJev's entropy rule decides)
+takes 439 s on a DGX Spark's exact GPU path. The Threadripper's
+AVX-512 fast-math build took about 1,100 s with two workers for one read a
+row, less work than automatic reads.
 
 Fast-math builds give up bit-identity on the GPU as they do on the CPU, and
 use the tensor cores (see [Build](#build)). The strict build stays the oracle:
 fast kernels are checked against it within FP32 rounding, and the fast mode's
-quality is judged on the benchmark, where its full 400-row run takes 226 s on
-the same DGX Spark at 66.80% accuracy, against the strict build's 65.95%.
+quality is judged on the benchmark, where its full 400-row run with
+automatic reads takes 181 s on the same DGX Spark at 66.70% accuracy, against
+the strict build's 65.95%.
 
 For production GPGPU inference, use
 [OpenJev](https://github.com/razorback16/openjev) or
@@ -228,10 +231,11 @@ from 8.75 s with the exact kernels to 2.89 s. The FP4 expert kernel streams
 weights and activations through shared memory with coalesced 16-byte loads,
 which is why packed activation rows are padded to 16 bytes; it reads expert
 weights at about 200 GB/s of GB10's rated 273 GB/s. With the fast-math prefix
-reuse described above, the full 400-row benchmark takes 226 s, against 776 s
-for a fast-math build with the exact kernels and no prefix reuse, and 490 s
-for the strict build. Decoding the answer canvases is now the largest
-phase.
+reuse described above and reads batched as described under
+[Decision semantics](#decision-semantics), the full 400-row benchmark with
+automatic reads takes 181 s, against 776 s for a fast-math build with the
+exact kernels, no prefix reuse and no batched reads, and 439 s for the
+strict build.
 
 Loading the driver and NVRTC with `dlopen` means the libraries found on the
 usual search path (`LD_LIBRARY_PATH`, `ld.so.conf`) are the code that runs, as
@@ -483,7 +487,12 @@ candidate's probability and no generated text.
 SHA-256 over Python-compatible canonical JSON seeds a Python-compatible
 MT19937 canvas. Identical requests are deterministic. With no `samples`
 field, OpenJev's entropy rule performs either one or four reads; `samples: N`
-requests exactly `N` reads. Only `steps: 1` is supported.
+requests exactly `N` reads. Only `steps: 1` is supported. Reads differ only in
+their random answer-slot tokens, so the reads after the first (with `samples`,
+all of them) run together as extra canvases of one decode, which streams the
+weights once for all of them; each is scored as it would be alone, and strict
+output is byte-identical to reading one at a time. The first automatic read
+runs alone, because its entropy decides whether more follow.
 
 ## Exact model path
 
@@ -543,13 +552,16 @@ The trusted reference is OpenJev commit `91d5005` with patched vLLM commit
 | OpenJev NVFP4, automatic reads | 66.80% | **1.3940** | **0.3107** | **0.2352** | 0.4404 |
 | Jev Bush NVFP4, strict, one read | 66.10% | 1.5476 | 0.3268 | 0.2540 | 0.4421 |
 | Jev Bush NVFP4, fast-math, one read | 66.80% | 1.5777 | 0.3272 | 0.2454 | 0.4441 |
-| Jev Bush NVFP4, strict, portable `expf`/`tanhf`, one read | 65.95% | 1.4296 | 0.3168 | 0.2442 | 0.4366 |
-| Jev Bush NVFP4, fast-math CUDA, tensor cores, one read | 66.80% | 1.4358 | 0.3167 | 0.2402 | 0.4353 |
+| Jev Bush NVFP4, strict, portable `expf`/`tanhf`, automatic reads | 65.95% | 1.4296 | 0.3168 | 0.2442 | 0.4366 |
+| Jev Bush NVFP4, fast-math CUDA, tensor cores, automatic reads | 66.70% | 1.4398 | 0.3164 | 0.2409 | 0.4353 |
 
 The strict portable row is the current strict build, whose output is the same
 on every platform, and the last row the fast CUDA build with prefix reuse on a
-DGX Spark; the rows above them were recorded with the C library's `expf` and
-`tanhf` at earlier commits. On the same code and machine, switching to the
+DGX Spark. Both ran the requests as published, without `samples`, so OpenJev's
+entropy rule chose four reads for 366 of the 400 rows; earlier versions of
+this table mislabeled them as one read. The Jev Bush rows above them are
+recorded as one read a row, with the C library's `expf` and `tanhf` at earlier
+commits. On the same code and machine, switching to the
 portable functions changed 4.6% of argmaxes and moved accuracy from 65.85% to
 65.95% and log loss from 1.4382 to 1.4296: this model's decisions shift with
 any one-ulp change, as between fast-math and strict builds, and the numbers
