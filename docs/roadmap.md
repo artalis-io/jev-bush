@@ -654,7 +654,9 @@ already off that pipe.
 
 For comparison, the full benchmark of 400 rows takes 490 s on the Spark's
 exact GPU path, model load included, against about 1,100 s on the 64-core
-Threadripper's AVX-512 fast-math build with two 32-thread workers. Against
+Threadripper's AVX-512 fast-math build with two 32-thread workers. (A
+correction: the Spark ran automatic reads, four for 366 rows, and the
+Threadripper one read a row, so the Spark did more work.) Against
 the GPU's own capability the exact path is roughly an order of magnitude
 slower than a non-exact engine: it gives up tensor cores, split sums and
 FP32 scores to stay bit-identical to the reference. Large further gains
@@ -727,6 +729,20 @@ floats a token, though that is not measured. Over eight rows with prefix
 reuse, FP4 kernel time falls from 0.90 to 0.54 s, and the full benchmark
 from 265 to 226 s, with all 2,000 answers unchanged. Decoding is now the
 largest phase: 111 s of the benchmark, against 73 s of prefill.
+
+### Batched reads
+
+Profiling eight four-read rows by forward pass showed decoding kept the GPU
+94% busy, so it was not waiting on the host: each row ran four decode passes
+of 32 tokens, one per read, and each streamed nearly all the weights again.
+Reads differ only in their random answer-slot tokens, and only the first
+automatic read's entropy decides whether the others run, so the others now
+run together as extra canvases of one decode. Strict output is byte-identical
+to reading one at a time (all 200 parity answers, and all 40 answers of the
+eight four-read rows). Over those eight rows, fast CUDA decoding falls from
+2.42 to 1.47 s. Over the full benchmark with automatic reads, the fast CUDA
+build takes 181 s instead of 226 s, decoding 69 s instead of 111 s, and the
+strict CUDA build 439 s instead of 490 s.
 
 ## 7. Make benchmark comparisons auditable
 
