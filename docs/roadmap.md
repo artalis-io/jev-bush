@@ -744,6 +744,21 @@ eight four-read rows). Over those eight rows, fast CUDA decoding falls from
 build takes 181 s instead of 226 s, decoding 69 s instead of 111 s, and the
 strict CUDA build 439 s instead of 490 s.
 
+### The entropy check's vocabulary logits
+
+After batched reads, candidate scoring was 32 s of the fast CUDA build's
+181 s, all on the CPU, and most of it the first automatic read's entropy
+check: every answer slot's logits over the whole 262,144-token vocabulary,
+softcapped and scanned for the top 20 on one thread. The accelerator now
+holds the tied embedding (1.48 GB more device memory) and computes those
+logits with its BF16 product, 7.3 ms a row on the DGX Spark and bit for bit
+the reference's in strict builds. On the host, the softcap and the softmax
+terms run in parallel, one value each, while the maximum, the top 20 and the
+sums keep their order; the top-20 scan skips logits below its smallest
+entry, which removed most of what remained. Strict output is byte-identical,
+on the GPU and on NEON alone. Over the full benchmark the fast CUDA build
+takes 163 s instead of 181 s, its candidate scoring 14 s instead of 32 s.
+
 ## 7. Make benchmark comparisons auditable
 
 Before publishing a faster number:

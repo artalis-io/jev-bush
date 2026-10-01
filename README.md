@@ -69,9 +69,10 @@ only because it avoids all three.
   defined(JB_CUDA)` block behind a small operations table, like the SIMD
   backends. The engine calls the table in the reference's order and has no
   other CUDA conditionals.
-- **It is narrow.** It covers one vendor and one model's transformer layers.
-  Tokenization, the prefix cache, the K/V cache, candidate scoring and
-  everything else stay on the CPU. It is not the start of a GPU framework.
+- **It is narrow.** It covers one vendor and one model's transformer layers,
+  plus the vocabulary product of the automatic-read entropy check.
+  Tokenization, the prefix cache, the K/V cache, the rest of candidate scoring
+  and everything else stay on the CPU. It is not the start of a GPU framework.
 
 CUDA can make that guarantee because NVRTC exposes the controls exactness
 needs: no contraction into FMAs, correctly rounded division and square root,
@@ -90,7 +91,7 @@ Fast-math builds give up bit-identity on the GPU as they do on the CPU, and
 use the tensor cores (see [Build](#build)). The strict build stays the oracle:
 fast kernels are checked against it within FP32 rounding, and the fast mode's
 quality is judged on the benchmark, where its full 400-row run with
-automatic reads takes 181 s on the same DGX Spark at 66.70% accuracy, against
+automatic reads takes 163 s on the same DGX Spark at 66.70% accuracy, against
 the strict build's 65.95%.
 
 For production GPGPU inference, use
@@ -177,8 +178,9 @@ cc -O3 -march=native -std=c11 -Wall -Wextra -pedantic -fopenmp -DJB_CUDA \
   jb.c -lm -ldl -lpthread -o jb
 ```
 
-The expert matrices and the layers' BF16 tensors are placed in one device
-allocation when the model loads. Each layer then runs on the GPU from its
+The expert matrices, the layers' BF16 tensors and the tied embedding are
+placed in one device allocation when the model loads; the embedding serves the
+vocabulary logits of the first automatic read's entropy check. Each layer then runs on the GPU from its
 input norm to its layer scalar: the projections, Q/K norms, rotary embedding,
 attention scores, softmax and value sums, the dense feed-forward layer, the
 norms, GELU, activation quantization and the experts, grouped by expert. The
@@ -233,7 +235,7 @@ which is why packed activation rows are padded to 16 bytes; it reads expert
 weights at about 200 GB/s of GB10's rated 273 GB/s. With the fast-math prefix
 reuse described above and reads batched as described under
 [Decision semantics](#decision-semantics), the full 400-row benchmark with
-automatic reads takes 181 s, against 776 s for a fast-math build with the
+automatic reads takes 163 s, against 776 s for a fast-math build with the
 exact kernels, no prefix reuse and no batched reads, and 439 s for the
 strict build.
 
