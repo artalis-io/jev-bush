@@ -68,6 +68,16 @@
 #include <unistd.h>
 #endif
 
+/* Lets GCC and clang check the arguments of printf-style helpers. MinGW's
+ * C runtime takes the C99 formats, which plain printf there would not. */
+#if defined(__MINGW32__)
+#define JB_PRINTF(f, a) __attribute__((format(gnu_printf, f, a)))
+#elif defined(__GNUC__) || defined(__clang__)
+#define JB_PRINTF(f, a) __attribute__((format(printf, f, a)))
+#else
+#define JB_PRINTF(f, a)
+#endif
+
 #define JB_VERSION "0.1.0"
 #define JB_MAX_CTX 4096
 #define JB_MAX_CAND 255
@@ -554,7 +564,7 @@ static int jb_threads(void) {
 #endif
 }
 
-static void jb_path(char *out, size_t cap, const char *fmt, ...) {
+JB_PRINTF(3, 4) static void jb_path(char *out, size_t cap, const char *fmt, ...) {
     va_list a;
     va_start(a, fmt);
     int n = vsnprintf(out, cap, fmt, a);
@@ -1004,7 +1014,10 @@ typedef struct DGAccelMatrix DGAccelMatrix;
  * and runs each step of a layer on device addresses, in the order it issues
  * them; to_host waits for the steps before it. dg_accel() returns NULL when
  * none is built or available; alloc returns 0 when the device is out of
- * memory. The other operations report failures through die(). */
+ * memory. free, host_free and release never fail: they run on cleanup
+ * paths, including a failed call's and ones without an error frame, and a
+ * device left unusable by an earlier fault fails every later call. The other
+ * operations report failures through die(). */
 typedef struct {
     const char *name;
     /* A handle for an NVFP4 matrix whose packed weights and block scales the
@@ -1094,7 +1107,8 @@ typedef struct {
     DGNvExpert *nvexpert;
     float nv_a13[DG_L], nv_a2[DG_L];
     /* Set when every weight the layers use is on the accelerator, in the one
-     * allocation weights. */
+     * allocation weights; while the model loads, the accelerator any device
+     * memory already placed belongs to. */
     const DGAccelOps *accel;
     DGDevice weights;
     /* Each layer's gate, up and down matrices as device tables, inside
@@ -1387,17 +1401,20 @@ static void dg_unmap_shards(DGModel *m) {
 /* Device memory is not tracked by error frames, so a failed load releases it
  * here, like the mapped shards. */
 static void dg_release_accel(DGModel *m) {
+    const DGAccelOps *a = m->accel;
+    if (!a)
+        return;
     if (m->nvexpert)
         for (int i = 0; i < DG_L * DG_EXPERTS; i++)
             for (int k = 0; k < 3; k++)
                 if (m->nvexpert[i].accel[k]) {
-                    dg_accel()->release(m->nvexpert[i].accel[k]);
+                    a->release(m->nvexpert[i].accel[k]);
                     m->nvexpert[i].accel[k] = NULL;
                 }
     for (size_t i = 0; i < m->nt; i++)
         m->tensor[i].device = 0;
     if (m->weights)
-        dg_accel()->free(m->weights);
+        a->free(m->weights);
     m->weights = 0;
     m->accel = NULL;
 }
@@ -1451,6 +1468,7 @@ static void dg_upload_model(DGModel *m) {
     const DGAccelOps *a = m->nvfp4 ? dg_accel() : NULL;
     if (!a)
         return;
+    m->accel = a;
     for (int pass = 0; pass < 2; pass++) {
         size_t at = 0;
         for (int i = 0; i < DG_L * DG_EXPERTS; i++) {
@@ -1488,10 +1506,11 @@ static void dg_upload_model(DGModel *m) {
                 }
                 at = jb_size_add(at, a->table_bytes(DG_EXPERTS));
             }
-        if (!pass && !(m->weights = a->alloc(at)))
+        if (!pass && !(m->weights = a->alloc(at))) {
+            m->accel = NULL;
             return;
+        }
     }
-    m->accel = a;
 }
 
 static void dg_free(DGModel *m) {
@@ -4033,9 +4052,13 @@ static void dg_cuda_compile(int major, int minor) {
         dg_cuda.failure = "out of memory";
         return;
     }
-    source[0] = 0;
-    for (size_t i = 0; i < sizeof dg_cuda_source / sizeof *dg_cuda_source; i++)
-        strcat(source, dg_cuda_source[i]);
+    size_t at = 0;
+    for (size_t i = 0; i < sizeof dg_cuda_source / sizeof *dg_cuda_source; i++) {
+        size_t n = strlen(dg_cuda_source[i]);
+        memcpy(source + at, dg_cuda_source[i], n);
+        at += n;
+    }
+    source[at] = 0;
     nvrtcProgram prog;
     int created = !dg_cuda.create(&prog, source, "jb_layers.cu", 0, NULL, NULL);
     free(source);
@@ -4145,9 +4168,11 @@ static DGDevice dg_cuda_alloc(size_t bytes) {
     return dg_cuda.alloc(&p, bytes ? bytes : 1) ? 0 : (DGDevice)p;
 }
 
+/* The frees ignore errors: after a fault every call fails, and there is
+ * nothing to do about memory the context will never return. */
 static void dg_cuda_free(DGDevice p) {
-    dg_cuda_current();
-    dg_cuda_check(dg_cuda.free((CUdeviceptr)p), "cuMemFree");
+    if (!dg_cuda.ctx_set(dg_cuda.ctx))
+        (void)dg_cuda.free((CUdeviceptr)p);
 }
 
 static void dg_cuda_to_device(DGDevice dst, const void *src, size_t bytes) {
@@ -4167,8 +4192,8 @@ static void *dg_cuda_host_alloc(size_t bytes) {
 }
 
 static void dg_cuda_host_free(void *p) {
-    dg_cuda_current();
-    dg_cuda_check(dg_cuda.host_free(p), "cuMemFreeHost");
+    if (!dg_cuda.ctx_set(dg_cuda.ctx))
+        (void)dg_cuda.host_free(p);
 }
 
 static void dg_cuda_release(DGAccelMatrix *a) {
@@ -4523,7 +4548,8 @@ typedef struct {
     size_t capacity, kv_capacity, control_capacity;
     int active, kv_active, control_active;
     /* The session's accelerator activations, or 0, and page-locked host
-     * memory for the staged K/V output. */
+     * memory for the staged K/V output, both from accel. */
+    const DGAccelOps *accel;
     DGDevice device;
     size_t device_bytes;
     float *pinned;
@@ -4558,9 +4584,9 @@ static void dg_workspace_destroy(DGWorkspace *workspace) {
     if (workspace->control_arena.allocation)
         jb_arena_free(&workspace->control_arena);
     if (workspace->device)
-        dg_accel()->free(workspace->device);
+        workspace->accel->free(workspace->device);
     if (workspace->pinned)
-        dg_accel()->host_free(workspace->pinned);
+        workspace->accel->host_free(workspace->pinned);
     memset(workspace, 0, sizeof *workspace);
 }
 
@@ -4650,6 +4676,7 @@ static DGDeviceWork dg_device_begin(DGWorkspace *owner, const DGModel *m, int n,
         return work;
     DGDeviceLayout d;
     size_t bytes = dg_device_layout(&d, 0, n, kv_rows, m->accel);
+    owner->accel = m->accel;
     if (owner->device_bytes < bytes) {
         if (owner->device)
             m->accel->free(owner->device);
@@ -5765,7 +5792,7 @@ static void db_ch(DGBuf *b, char c) {
     b->p[b->n] = 0;
 }
 
-static void db_fmt(DGBuf *b, const char *fmt, ...) {
+JB_PRINTF(2, 3) static void db_fmt(DGBuf *b, const char *fmt, ...) {
     va_list a, z;
     va_start(a, fmt);
     va_copy(z, a);
@@ -6866,7 +6893,8 @@ static int dg_systemone(DGModel *m, DGTokenizer *tok, const char *j, size_t len,
 
 /* Returns zero when the rows do not all hit the current exact schema entry;
  * the caller then executes them sequentially, allowing normal cache replace. */
-static int dg_system_batch(DGModel *m, DGTokenizer *tok, char **row, size_t *len, int batch,
+static int dg_system_batch(DGModel *m, DGTokenizer *tok, const char *const *row,
+                           const size_t *len, int batch,
                            DGPrefixCache *prefix, DGWorkspace *workspace, char **output,
                            size_t *output_length) {
     if (batch < 2 || !prefix || !prefix->schema)
@@ -7304,24 +7332,21 @@ static jb_status jb_session_decide_json_batch_call(jb_session *session,
     }
     char **output = xcalloc(request_count, sizeof *output);
     size_t *length = xcalloc(request_count, sizeof *length);
-    char **mutable_request = xmalloc(request_count * sizeof *mutable_request);
     for (size_t i = 0; i < request_count; i++) {
         if (!request_json[i] || !request_lengths[i])
             die("batch request is empty");
         if (request_lengths[i] > JB_MAX_JSON)
             die("batch request JSON is too large");
-        mutable_request[i] = (char *)request_json[i];
     }
     int batched = request_count > 1 &&
                   dg_system_batch(&session->model->model, &session->model->tokenizer,
-                                  mutable_request, (size_t *)request_lengths, (int)request_count,
+                                  request_json, request_lengths, (int)request_count,
                                   jb_session_prefix(session), &session->workspace, output, length);
     if (!batched)
         for (size_t i = 0; i < request_count; i++)
             dg_systemone(&session->model->model, &session->model->tokenizer, request_json[i],
                          request_lengths[i], jb_session_prefix(session), &session->workspace,
                          &output[i], &length[i]);
-    jb_release(mutable_request);
     jb_frame_leave(&frame);
     *out_json = output;
     *out_lengths = length;

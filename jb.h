@@ -13,14 +13,15 @@ extern "C" {
 typedef struct jb_model jb_model;
 typedef struct jb_session jb_session;
 
+/* Enumerator values are part of the ABI and never change. */
 typedef enum {
     JB_OK = 0,
-    JB_ERROR_INVALID_ARGUMENT,
-    JB_ERROR_IO,
-    JB_ERROR_MODEL,
-    JB_ERROR_REQUEST,
-    JB_ERROR_OUT_OF_MEMORY,
-    JB_ERROR_INTERNAL
+    JB_ERROR_INVALID_ARGUMENT = 1,
+    JB_ERROR_IO = 2,
+    JB_ERROR_MODEL = 3,
+    JB_ERROR_REQUEST = 4,
+    JB_ERROR_OUT_OF_MEMORY = 5,
+    JB_ERROR_INTERNAL = 6
 } jb_status;
 
 typedef struct {
@@ -29,7 +30,11 @@ typedef struct {
     size_t length;
 } jb_string;
 
-typedef enum { JB_DECISION_BOOLEAN, JB_DECISION_CHOICE, JB_DECISION_SCORE } jb_decision_type;
+typedef enum {
+    JB_DECISION_BOOLEAN = 0,
+    JB_DECISION_CHOICE = 1,
+    JB_DECISION_SCORE = 2
+} jb_decision_type;
 
 typedef struct {
     jb_string id;
@@ -88,12 +93,15 @@ const char *jb_status_string(jb_status status);
  * function below sets its non-NULL output parameters to NULL or zero. */
 const char *jb_last_error(void);
 
+/* A model is immutable once loaded and may be shared by sessions on any
+ * threads. */
 jb_status jb_model_load(const char *model_directory, jb_model **out_model);
 /* All sessions referring to a model must be freed before the model. */
 void jb_model_free(jb_model *model);
 
 /* A session owns reusable scratch, K/V, and exact schema-prefix state. It is
- * single-threaded; separate sessions may share the same immutable model. */
+ * not thread-safe: one call at a time per session. Separate sessions may
+ * share the same immutable model. */
 jb_status jb_session_create(jb_model *model, const jb_schema *schema, jb_session **out_session);
 /* Passing NULL with length zero creates a dynamic JSON-only session for full
  * OpenJev requests, which is what the CLI uses. */
@@ -106,12 +114,16 @@ void jb_session_free(jb_session *session);
  * threads. The string is valid until the session's next call or its free. */
 const char *jb_session_last_error(const jb_session *session);
 
+/* A result is released with jb_result_free; a batch of them, the array
+ * included, with jb_results_free. Batch calls take 1 to 16 inputs. */
 jb_status jb_session_decide(jb_session *session, const jb_input *input, jb_result **out_result);
 jb_status jb_session_decide_batch(jb_session *session, const jb_input *inputs, size_t input_count,
                                   jb_result ***out_results);
 
 /* JSON calls accept/return the existing complete OpenJev request/result shape.
- * Exact repeated schemas automatically reuse their prefix state. */
+ * Exact repeated schemas automatically reuse their prefix state. The output
+ * is released with jb_free: one buffer for a single call; each string, then
+ * the string array and the length array, for a batch of 1 to 16 requests. */
 jb_status jb_session_decide_json(jb_session *session, const char *request_json,
                                  size_t request_length, char **out_json, size_t *out_length);
 jb_status jb_session_decide_json_batch(jb_session *session, const char *const *request_json,
@@ -120,6 +132,7 @@ jb_status jb_session_decide_json_batch(jb_session *session, const char *const *r
 
 void jb_result_free(jb_result *result);
 void jb_results_free(jb_result **results, size_t count);
+/* Releases a buffer or array a JSON call returned; NULL is ignored. */
 void jb_free(void *allocation);
 
 #ifdef __cplusplus
