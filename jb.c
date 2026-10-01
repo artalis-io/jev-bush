@@ -4158,6 +4158,109 @@ static const char *const dg_cuda_source[] = {
     "                                        heads, kvh, canvas, full, window);\n"
     "}\n"
     "#endif\n"
+    "\n"
+    "#if DG_FAST\n"
+    "__device__ __forceinline__ unsigned dg_bf16_pair(float even, float odd) {\n"
+    "    unsigned d;\n"
+    "    asm(\"cvt.rn.bf16x2.f32 %0, %1, %2;\" : \"=r\"(d) : \"f\"(odd), \"f\"(even));\n"
+    "    return d;\n"
+    "}\n"
+    "\n"
+    "/* c += a b for a 16 x 16 BF16 tile a, a 16 x 8 tile b and FP32 c, in the\n"
+    " * m16n8k16 fragment layout. */\n"
+    "__device__ __forceinline__ void dg_mma_bf16(float *c, const unsigned *a, unsigned b0,\n"
+    "        unsigned b1) {\n"
+    "    asm volatile(\"mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 \"\n"
+    "                 \"{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\"\n"
+    "                 : \"+f\"(c[0]), \"+f\"(c[1]), \"+f\"(c[2]), \"+f\"(c[3])\n"
+    "                 : \"r\"(a[0]), \"r\"(a[1]), \"r\"(a[2]), \"r\"(a[3]), \"r\"(b0), \"r\"(b1));\n"
+    "}\n"
+    "\n"
+    "/* dg_bf16_mm on tensor cores, for column counts that are a multiple of 32.\n"
+    " * Each FP32 activation is the sum of three BF16 parts, which hold all of\n"
+    " * its bits, so every product is exact and only the FP32 sums round. A\n"
+    " * block of eight warps covers 128 rows and 64 tokens, 32 columns at a\n"
+    " * time through shared memory; each warp computes 32 rows by 32 tokens. */\n"
+    "extern \"C\" __global__ void __launch_bounds__(256) dg_bf16_mm_fast(const unsigned short *w,\n"
+    "        const float *x, float *y, int tokens, int rows, int cols) {\n"
+    "    __shared__ unsigned ws[128][20];\n"
+    "    __shared__ unsigned xs[3][64][20];\n"
+    "    int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, g = lane >> 2, c = lane & 3;\n"
+    "    int wr = (warp & 3) * 32, wt = (warp >> 2) * 32, r0 = blockIdx.x * 128;\n"
+    "    for (int t0 = blockIdx.y * 64; t0 < tokens; t0 += gridDim.y * 64) {\n"
+    "        float acc[2][4][4];\n"
+    "        for (int i = 0; i < 2; i++)\n"
+    "            for (int j = 0; j < 4; j++)\n"
+    "                acc[i][j][0] = acc[i][j][1] = acc[i][j][2] = acc[i][j][3] = 0;\n"
+    "        for (int k0 = 0; k0 < cols; k0 += 32) {\n"
+    "            {\n"
+    "                int row = tid >> 1, half = tid & 1, gr = r0 + row;\n"
+    "                uint4 v0 = make_uint4(0, 0, 0, 0), v1 = v0;\n"
+    "                if (gr < rows) {\n"
+    "                    const uint4 *p = (const uint4 *)(w + (size_t)gr * cols + k0) + half * 2;\n"
+    "                    v0 = p[0];\n"
+    "                    v1 = p[1];\n"
+    "                }\n",
+    "                unsigned *d = &ws[row][half * 8];\n"
+    "                d[0] = v0.x;\n"
+    "                d[1] = v0.y;\n"
+    "                d[2] = v0.z;\n"
+    "                d[3] = v0.w;\n"
+    "                d[4] = v1.x;\n"
+    "                d[5] = v1.y;\n"
+    "                d[6] = v1.z;\n"
+    "                d[7] = v1.w;\n"
+    "            }\n"
+    "            {\n"
+    "                int tok = tid >> 2, part = tid & 3, gt = t0 + tok;\n"
+    "                float4 f0 = make_float4(0, 0, 0, 0), f1 = f0;\n"
+    "                if (gt < tokens) {\n"
+    "                    const float4 *p = (const float4 *)(x + (size_t)gt * cols + k0) + part * 2;\n"
+    "                    f0 = p[0];\n"
+    "                    f1 = p[1];\n"
+    "                }\n"
+    "                float f[8] = {f0.x, f0.y, f0.z, f0.w, f1.x, f1.y, f1.z, f1.w};\n"
+    "                for (int i = 0; i < 4; i++) {\n"
+    "                    float a = f[2 * i], b = f[2 * i + 1];\n"
+    "                    for (int s = 0; s < 3; s++) {\n"
+    "                        unsigned p = dg_bf16_pair(a, b);\n"
+    "                        xs[s][tok][part * 4 + i] = p;\n"
+    "                        a -= __uint_as_float(p << 16);\n"
+    "                        b -= __uint_as_float(p & 0xffff0000u);\n"
+    "                    }\n"
+    "                }\n"
+    "            }\n"
+    "            __syncthreads();\n"
+    "            for (int kk = 0; kk < 16; kk += 8) {\n"
+    "                unsigned a[2][4];\n"
+    "                for (int i = 0; i < 2; i++) {\n"
+    "                    int row = wr + i * 16 + g;\n"
+    "                    a[i][0] = ws[row][kk + c];\n"
+    "                    a[i][1] = ws[row + 8][kk + c];\n"
+    "                    a[i][2] = ws[row][kk + c + 4];\n"
+    "                    a[i][3] = ws[row + 8][kk + c + 4];\n"
+    "                }\n"
+    "                for (int s = 0; s < 3; s++)\n"
+    "                    for (int j = 0; j < 4; j++) {\n"
+    "                        int tok = wt + j * 8 + g;\n"
+    "                        unsigned b0 = xs[s][tok][kk + c], b1 = xs[s][tok][kk + c + 4];\n"
+    "                        dg_mma_bf16(acc[0][j], a[0], b0, b1);\n"
+    "                        dg_mma_bf16(acc[1][j], a[1], b0, b1);\n"
+    "                    }\n"
+    "            }\n"
+    "            __syncthreads();\n"
+    "        }\n"
+    "        for (int i = 0; i < 2; i++)\n"
+    "            for (int j = 0; j < 4; j++)\n"
+    "                for (int e = 0; e < 4; e++) {\n"
+    "                    int r = r0 + wr + i * 16 + g + (e >> 1) * 8,\n"
+    "                        t = t0 + wt + j * 8 + 2 * c + (e & 1);\n"
+    "                    if (r < rows && t < tokens)\n"
+    "                        y[(size_t)t * rows + r] = acc[i][j][e];\n"
+    "                }\n"
+    "    }\n"
+    "}\n"
+    "#endif\n"
 };
 
 /* The kernel's struct dg_tile: tokens start..start + count - 1 use matrix
@@ -4196,6 +4299,7 @@ enum {
     /* Fast builds only, from here on. */
     DG_CUDA_ATTENTION_FAST_LOCAL,
     DG_CUDA_ATTENTION_FAST_FULL,
+    DG_CUDA_BF16_FAST,
     DG_CUDA_KERNELS
 };
 
@@ -4203,7 +4307,7 @@ static const char *const dg_cuda_kernel_names[DG_CUDA_KERNELS] = {
     "dg_nvfp4_mm",       "dg_bf16_mm",        "dg_rms",   "dg_gelu_mul",  "dg_nvfp4_qdq",
     "dg_gather",         "dg_moe_tail",       "dg_rope",  "dg_attention", "dg_bf16_mm_wide",
     "dg_bf16_mm_narrow", "dg_transpose_keys", "dg_route", "dg_group", "dg_attention_fast_local",
-    "dg_attention_fast_full"};
+    "dg_attention_fast_full", "dg_bf16_mm_fast"};
 
 /* The driver and NVRTC entry points, and the process-wide context and
  * kernels. */
@@ -4559,6 +4663,11 @@ static void dg_cuda_bf16_mm(DGDevice w, DGDevice x, DGDevice y, int tokens, int 
         die("accelerator BF16 matrices need an even column count");
     CUdeviceptr dw = w, dx = x, dy = y;
     void *args[] = {&dw, &dx, &dy, &tokens, &rows, &cols};
+    if (dg_cuda.fast && cols % 32 == 0) {
+        dg_cuda_launch(DG_CUDA_BF16_FAST, dg_cuda_blocks(rows, 128, 1u << 30),
+                       dg_cuda_blocks(tokens, 64, DG_CUDA_GRID_Y), 256, args);
+        return;
+    }
     if (cols % 64 == 0) {
         long long wide = (long long)dg_cuda_blocks(rows, 128, 1u << 30) *
                          dg_cuda_blocks(tokens, 32, DG_CUDA_GRID_Y);
@@ -8450,11 +8559,17 @@ static void dg_test_accel_layer(uint64_t *rs) {
         if (JB_STRICT_MATH && memcmp((gotp), (wantp), (bytes)))                                    \
             die2("accelerator self-test failed: differs from the reference", what);                \
     } while (0)
+/* Fast builds' products sum in FP32 in another order than the reference's FP32
+ * sums, which over 2816 terms differ by about 1e-5 relative. */
+#define DG_ACCEL_CLOSE(gotp, wantp, count)                                                         \
+    for (size_t i_ = 0; i_ < (size_t)(count); i_++)                                                \
+        jb_check_close(a->name, (gotp)[i_], (wantp)[i_], 1e-4 * (1 + fabs((wantp)[i_])))
     /* BF16 product, on a shape for each kernel. */
     dg_mm_data_ref(w, x, yref, tokens, rows, cols);
     a->bf16_mm(dw, dx, dy, tokens, rows, cols);
     a->to_host(y, dy, yb);
     DG_ACCEL_SAME("BF16 matmul", y, yref, yb);
+    DG_ACCEL_CLOSE(y, yref, (size_t)tokens * rows);
     {
         enum { big_rows = 768, big_tokens = 512 };
 
@@ -8475,6 +8590,7 @@ static void dg_test_accel_layer(uint64_t *rs) {
         a->bf16_mm(dw2, dx2, dy2, big_tokens, big_rows, cols);
         a->to_host(y2, dy2, yb2);
         DG_ACCEL_SAME("BF16 matmul, many tokens", y2, y2ref, yb2);
+        DG_ACCEL_CLOSE(y2, y2ref, (size_t)big_tokens * big_rows);
         a->free(dw2);
         a->free(dx2);
         a->free(dy2);
@@ -8548,6 +8664,7 @@ static void dg_test_accel_layer(uint64_t *rs) {
     a->to_host(got, dz, xb);
     DG_ACCEL_SAME("MoE tail", got, want, xb);
 #undef DG_ACCEL_SAME
+#undef DG_ACCEL_CLOSE
     DGDevice all[] = {dw, dsc, dfac, dp2, dx, dadd, dy, dz, dg, deo, dindex, dslot, dwt};
     for (size_t i = 0; i < sizeof all / sizeof *all; i++)
         a->free(all[i]);
