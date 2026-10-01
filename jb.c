@@ -1026,7 +1026,7 @@ typedef uint64_t DGDevice;
 typedef struct DGAccelMatrix DGAccelMatrix;
 
 /* An optional accelerator for the transformer layers, bit-identical to the
- * reference. The caller places weights in device memory (alloc, to_device)
+ * reference in strict builds; in fast builds, as close as fast math. The caller places weights in device memory (alloc, to_device)
  * and runs each step of a layer on device addresses, in the order it issues
  * them; to_host waits for the steps before it. dg_accel() returns NULL when
  * none is built or available; alloc returns 0 when the device is out of
@@ -3143,7 +3143,10 @@ static const DGKernelOps *dg_kernels(void) {
  * NVRTC compiles with --fmad=false and
  * IEEE division and square root, and every kernel keeps the reference's
  * order of operations for each value, so results match the reference bit
- * for bit, which the selftest checks. Each calling thread makes the context
+ * for bit, which the selftest checks. Fast builds (-ffast-math), like the
+ * CPU's, give that up for speed: on GPUs with BF16 tensor cores (compute
+ * capability 8.0 or later) attention runs on tensor cores in FP32-level
+ * precision instead, which the selftest bounds. Each calling thread makes the context
  * current; work is ordered on the legacy default stream, and a copy to the
  * host waits for it. */
 #if defined(JB_CUDA)
@@ -3966,7 +3969,196 @@ static const char *const dg_cuda_source[] = {
     "        tl.group = e;\n"
     "        tiles[tileoff[e] + i] = tl;\n"
     "    }\n"
-    "}\n"};
+    "}\n"
+    "\n"
+    "#if DG_FAST\n"
+    "/* Fast builds only: tensor-core kernels that give up the reference's\n"
+    " * bits, as -ffast-math does on the CPU. Each FP32 operand is split into a\n"
+    " * TF32 high part and a TF32 low part, and a product takes three MMAs (high\n"
+    " * by high, high by low, low by high), which keeps it about as accurate as\n",
+    " * an FP32 product; sums accumulate in FP32. */\n"
+    "#define DG_NEG_INF __int_as_float(0xff800000)\n"
+    "\n"
+    "__device__ __forceinline__ void dg_tf32_split(float x, unsigned &hi, unsigned &lo) {\n"
+    "    asm(\"cvt.rna.tf32.f32 %0, %1;\" : \"=r\"(hi) : \"f\"(x));\n"
+    "    asm(\"cvt.rna.tf32.f32 %0, %1;\" : \"=r\"(lo) : \"f\"(x - __uint_as_float(hi)));\n"
+    "}\n"
+    "\n"
+    "/* c += a b for a 16 x 8 TF32 tile a, an 8 x 8 tile b and FP32 c, in the\n"
+    " * m16n8k8 fragment layout. */\n"
+    "__device__ __forceinline__ void dg_mma_tf32(float *c, const unsigned *a, unsigned b0,\n"
+    "        unsigned b1) {\n"
+    "    asm volatile(\"mma.sync.aligned.m16n8k8.row.col.f32.tf32.tf32.f32 \"\n"
+    "                 \"{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\"\n"
+    "                 : \"+f\"(c[0]), \"+f\"(c[1]), \"+f\"(c[2]), \"+f\"(c[3])\n"
+    "                 : \"r\"(a[0]), \"r\"(a[1]), \"r\"(a[2]), \"r\"(a[3]), \"r\"(b0), \"r\"(b1));\n"
+    "}\n"
+    "\n"
+    "/* The split product of a 16 x 8 tile with elements x[0..3] in fragment\n"
+    " * order and an 8 x 8 tile with elements y0 and y1. */\n"
+    "__device__ __forceinline__ void dg_mma_split(float *c, const float *x, float y0, float y1) {\n"
+    "    unsigned ah[4], al[4], bh0, bl0, bh1, bl1;\n"
+    "    for (int i = 0; i < 4; i++)\n"
+    "        dg_tf32_split(x[i], ah[i], al[i]);\n"
+    "    dg_tf32_split(y0, bh0, bl0);\n"
+    "    dg_tf32_split(y1, bh1, bl1);\n"
+    "    dg_mma_tf32(c, ah, bh0, bh1);\n"
+    "    dg_mma_tf32(c, ah, bl0, bl1);\n"
+    "    dg_mma_tf32(c, al, bh0, bh1);\n"
+    "}\n"
+    "\n"
+    "/* The keys query t of a segment may see, as dg_attention computes them. */\n"
+    "__device__ void dg_key_range(int t, int seq, int old, int canvas, int full, int window,\n"
+    "        int *start, int *end) {\n"
+    "    int e = canvas ? old + seq : old + t + 1, s = 0;\n"
+    "    if (!full) {\n"
+    "        if (canvas) {\n"
+    "            int pos = old + t;\n"
+    "            s = pos >= window ? pos - window + 1 : 0;\n"
+    "            if (e > pos + window)\n"
+    "                e = pos + window;\n"
+    "        } else\n"
+    "            s = e > window ? e - window : 0;\n"
+    "    }\n"
+    "    *start = s;\n"
+    "    *end = e;\n"
+    "}\n"
+    "\n"
+    "/* Attention in one pass over the keys, with an online softmax. A block\n"
+    " * of four warps takes 16 queries of one segment and one head, and walks\n"
+    " * the keys they see 32 at a time: each warp scores 8 keys against the 16\n"
+    " * queries, the block rescales its running maxima and sums, and each warp\n"
+    " * accumulates a quarter of the output dimensions. Cached keys and values\n"
+    " * come from k_old and v_old, the segment's own from k and v. */\n"
+    "template <int HD>\n"
+    "__device__ void dg_attention_fast_body(float *out, const float *q, const float *k,\n"
+    "        const float *v, const float *k_old, const float *v_old, const int *seg_old,\n"
+    "        const int *seg_base, int seq, int heads, int kvh, int canvas, int full, int window) {\n"
+    "    __shared__ float pt[16][33];\n"
+    "    __shared__ float m_run[16], l_run[16], rescale[16];\n"
+    "    const int qn = heads * HD, kn = kvh * HD, DW = HD / 4, NT = DW / 8;\n"
+    "    int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, g = lane >> 2, c = lane & 3;\n"
+    "    int tiles = (seq + 15) / 16, s = blockIdx.x / tiles, t0 = blockIdx.x % tiles * 16;\n"
+    "    int h = blockIdx.y, kh = h / (heads / kvh), old = seg_old[s];\n"
+    "    const float *kc = k_old + (size_t)seg_base[s] * kn + (size_t)kh * HD,\n"
+    "                *kq = k + (size_t)s * seq * kn + (size_t)kh * HD,\n"
+    "                *vc = v_old + (size_t)seg_base[s] * kn + (size_t)kh * HD,\n"
+    "                *vq = v + (size_t)s * seq * kn + (size_t)kh * HD;\n"
+    "    int kmin = old + seq, kmax = 0;\n"
+    "    for (int i = 0; i < 16 && t0 + i < seq; i++) {\n"
+    "        int a, b;\n"
+    "        dg_key_range(t0 + i, seq, old, canvas, full, window, &a, &b);\n"
+    "        kmin = a < kmin ? a : kmin;\n",
+    "        kmax = b > kmax ? b : kmax;\n"
+    "    }\n"
+    "    if (tid < 16) {\n"
+    "        m_run[tid] = DG_NEG_INF;\n"
+    "        l_run[tid] = 0;\n"
+    "    }\n"
+    "    float o[NT][4];\n"
+    "    for (int i = 0; i < NT; i++)\n"
+    "        o[i][0] = o[i][1] = o[i][2] = o[i][3] = 0;\n"
+    "    int ta = t0 + g, tb = t0 + g + 8;\n"
+    "    const float *qa = ta < seq ? q + ((size_t)s * seq + ta) * qn + (size_t)h * HD : 0,\n"
+    "                *qb = tb < seq ? q + ((size_t)s * seq + tb) * qn + (size_t)h * HD : 0;\n"
+    "    for (int k0 = kmin; k0 < kmax; k0 += 32) {\n"
+    "        float sc[4] = {0, 0, 0, 0};\n"
+    "        int key = k0 + warp * 8 + g;\n"
+    "        const float *kr = key >= kmax ? 0 : key < old ? kc + (size_t)key * kn\n"
+    "                                                         : kq + (size_t)(key - old) * kn;\n"
+    "        for (int d = 0; d < HD; d += 8) {\n"
+    "            float x[4] = {qa ? qa[d + c] : 0.0f, qb ? qb[d + c] : 0.0f,\n"
+    "                          qa ? qa[d + c + 4] : 0.0f, qb ? qb[d + c + 4] : 0.0f};\n"
+    "            dg_mma_split(sc, x, kr ? kr[d + c] : 0.0f, kr ? kr[d + c + 4] : 0.0f);\n"
+    "        }\n"
+    "        __syncthreads();\n"
+    "        for (int e = 0; e < 4; e++) {\n"
+    "            int row = g + (e >> 1) * 8, col = warp * 8 + 2 * c + (e & 1), t = t0 + row, j = k0 + col;\n"
+    "            int a, b;\n"
+    "            dg_key_range(t, seq, old, canvas, full, window, &a, &b);\n"
+    "            pt[row][col] = t < seq && j >= a && j < b ? sc[e] : DG_NEG_INF;\n"
+    "        }\n"
+    "        __syncthreads();\n"
+    "        {\n"
+    "            int row = tid >> 3, part = tid & 7;\n"
+    "            float x[4], mx = DG_NEG_INF, sum = 0;\n"
+    "            for (int i = 0; i < 4; i++) {\n"
+    "                x[i] = pt[row][part * 4 + i];\n"
+    "                mx = fmaxf(mx, x[i]);\n"
+    "            }\n"
+    "            for (int off = 1; off < 8; off <<= 1)\n"
+    "                mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, off));\n"
+    "            float m_old = m_run[row], m_new = fmaxf(m_old, mx);\n"
+    "            for (int i = 0; i < 4; i++) {\n"
+    "                x[i] = m_new == DG_NEG_INF ? 0.0f : __expf(x[i] - m_new);\n"
+    "                pt[row][part * 4 + i] = x[i];\n"
+    "                sum += x[i];\n"
+    "            }\n"
+    "            for (int off = 1; off < 8; off <<= 1)\n"
+    "                sum += __shfl_xor_sync(0xffffffffu, sum, off);\n"
+    "            __syncwarp();\n"
+    "            if (part == 0) {\n"
+    "                float f = m_old == DG_NEG_INF ? 0.0f : __expf(m_old - m_new);\n"
+    "                rescale[row] = f;\n"
+    "                l_run[row] = l_run[row] * f + sum;\n"
+    "                m_run[row] = m_new;\n"
+    "            }\n"
+    "        }\n"
+    "        __syncthreads();\n"
+    "        float fa = rescale[g], fb = rescale[g + 8];\n"
+    "        for (int i = 0; i < NT; i++) {\n"
+    "            o[i][0] *= fa;\n"
+    "            o[i][1] *= fa;\n"
+    "            o[i][2] *= fb;\n"
+    "            o[i][3] *= fb;\n"
+    "        }\n"
+    "        for (int ks = 0; ks < 32; ks += 8) {\n"
+    "            float p[4] = {pt[g][ks + c], pt[g + 8][ks + c], pt[g][ks + c + 4],\n"
+    "                          pt[g + 8][ks + c + 4]};\n"
+    "            int j0 = k0 + ks + c, j1 = j0 + 4;\n"
+    "            const float *v0 = j0 >= kmax ? 0 : (j0 < old ? vc + (size_t)j0 * kn\n"
+    "                                                             : vq + (size_t)(j0 - old) * kn),\n"
+    "                        *v1 = j1 >= kmax ? 0 : (j1 < old ? vc + (size_t)j1 * kn\n"
+    "                                                             : vq + (size_t)(j1 - old) * kn);\n"
+    "            for (int i = 0; i < NT; i++) {\n"
+    "                int d = warp * DW + i * 8 + g;\n"
+    "                dg_mma_split(o[i], p, v0 ? v0[d] : 0.0f, v1 ? v1[d] : 0.0f);\n"
+    "            }\n"
+    "        }\n"
+    "    }\n"
+    "    float la = l_run[g], lb = l_run[g + 8];\n"
+    "    for (int i = 0; i < NT; i++) {\n",
+    "        int d = warp * DW + i * 8 + 2 * c;\n"
+    "        if (qa) {\n"
+    "            float *oa = out + ((size_t)s * seq + ta) * qn + (size_t)h * HD + d;\n"
+    "            oa[0] = o[i][0] / la;\n"
+    "            oa[1] = o[i][1] / la;\n"
+    "        }\n"
+    "        if (qb) {\n"
+    "            float *ob = out + ((size_t)s * seq + tb) * qn + (size_t)h * HD + d;\n"
+    "            ob[0] = o[i][2] / lb;\n"
+    "            ob[1] = o[i][3] / lb;\n"
+    "        }\n"
+    "    }\n"
+    "}\n"
+    "\n"
+    "extern \"C\" __global__ void __launch_bounds__(128) dg_attention_fast_local(float *out,\n"
+    "        const float *q, const float *k, const float *v, const float *k_old, const float *v_old,\n"
+    "        const int *seg_old, const int *seg_base, int seq, int heads, int kvh, int canvas,\n"
+    "        int full, int window) {\n"
+    "    dg_attention_fast_body<DG_LOCAL_HD>(out, q, k, v, k_old, v_old, seg_old, seg_base, seq,\n"
+    "                                        heads, kvh, canvas, full, window);\n"
+    "}\n"
+    "\n"
+    "extern \"C\" __global__ void __launch_bounds__(128) dg_attention_fast_full(float *out,\n"
+    "        const float *q, const float *k, const float *v, const float *k_old, const float *v_old,\n"
+    "        const int *seg_old, const int *seg_base, int seq, int heads, int kvh, int canvas,\n"
+    "        int full, int window) {\n"
+    "    dg_attention_fast_body<DG_HEAD_MAX>(out, q, k, v, k_old, v_old, seg_old, seg_base, seq,\n"
+    "                                        heads, kvh, canvas, full, window);\n"
+    "}\n"
+    "#endif\n"
+};
 
 /* The kernel's struct dg_tile: tokens start..start + count - 1 use matrix
  * group. */
@@ -4001,13 +4193,17 @@ enum {
     DG_CUDA_TRANSPOSE_KEYS,
     DG_CUDA_ROUTE,
     DG_CUDA_GROUP,
+    /* Fast builds only, from here on. */
+    DG_CUDA_ATTENTION_FAST_LOCAL,
+    DG_CUDA_ATTENTION_FAST_FULL,
     DG_CUDA_KERNELS
 };
 
 static const char *const dg_cuda_kernel_names[DG_CUDA_KERNELS] = {
     "dg_nvfp4_mm",       "dg_bf16_mm",        "dg_rms",   "dg_gelu_mul",  "dg_nvfp4_qdq",
     "dg_gather",         "dg_moe_tail",       "dg_rope",  "dg_attention", "dg_bf16_mm_wide",
-    "dg_bf16_mm_narrow", "dg_transpose_keys", "dg_route", "dg_group"};
+    "dg_bf16_mm_narrow", "dg_transpose_keys", "dg_route", "dg_group", "dg_attention_fast_local",
+    "dg_attention_fast_full"};
 
 /* The driver and NVRTC entry points, and the process-wide context and
  * kernels. */
@@ -4043,6 +4239,9 @@ static struct {
     const char *failure;
     char compile_log[4096];
     int ready;
+    /* The fast kernels replace exact ones: in fast builds on a GPU with
+     * BF16 tensor cores (compute capability 8.0 or later). */
+    int fast;
 } dg_cuda;
 
 /* dlsym returns an object pointer; copy it into the function pointer. */
@@ -4057,7 +4256,10 @@ static int dg_cuda_symbol(void *lib, const char *name, void *slot) {
  * dg_accel_failure() and allocates with plain malloc. */
 static void dg_cuda_compile(int major, int minor) {
     char arch[48], tile_rows[32], tile_tokens[32], bf16_tokens[32], row_max[32], head_max[32],
-        threads[32], width[32], experts[32], topk[32];
+        local_hd[32], threads[32], width[32], experts[32], topk[32], fast[32];
+    dg_cuda.fast = !JB_STRICT_MATH && major >= 8;
+    snprintf(fast, sizeof fast, "-DDG_FAST=%d", dg_cuda.fast);
+    snprintf(local_hd, sizeof local_hd, "-DDG_LOCAL_HD=%d", DG_LOCAL_HEAD_DIM);
     snprintf(arch, sizeof arch, "--gpu-architecture=compute_%d%d", major, minor);
     snprintf(tile_rows, sizeof tile_rows, "-DDG_ROWS=%d", DG_CUDA_ROWS);
     snprintf(tile_tokens, sizeof tile_tokens, "-DDG_TOKENS=%d", DG_CUDA_TOKENS);
@@ -4078,10 +4280,12 @@ static void dg_cuda_compile(int major, int minor) {
                              bf16_tokens,
                              row_max,
                              head_max,
+                             local_hd,
                              threads,
                              width,
                              experts,
-                             topk};
+                             topk,
+                             fast};
     /* The source is split into pieces short enough for ISO C string
      * literals. */
     size_t length = 1;
@@ -4121,7 +4325,8 @@ static void dg_cuda_compile(int major, int minor) {
         dg_cuda.failure = "loading the kernels";
     else {
         dg_cuda.ready = 1;
-        for (int i = 0; i < DG_CUDA_KERNELS; i++)
+        int kernels = dg_cuda.fast ? DG_CUDA_KERNELS : DG_CUDA_ATTENTION_FAST_LOCAL;
+        for (int i = 0; i < kernels; i++)
             if (dg_cuda.function_get(&dg_cuda.kernel[i], module, dg_cuda_kernel_names[i])) {
                 dg_cuda.failure = "loading the kernels";
                 dg_cuda.ready = 0;
@@ -4419,6 +4624,21 @@ static void dg_cuda_attention(DGDevice a, DGDevice q, DGDevice k, DGDevice v, DG
                               DGDevice v_old, DGDevice seg_old, DGDevice seg_base, int n, int seq,
                               int kvh, int hd, int canvas, int full, int max_keys, int old_rows,
                               DGDevice scratch) {
+    if (dg_cuda.fast) {
+        /* One block per 16 queries of a segment and head; no transposed
+         * keys and no limit on the span. */
+        if (hd != DG_LOCAL_HEAD_DIM && hd != DG_FULL_HEAD_DIM)
+            die("accelerator attention head size is unsupported");
+        int segments = n / seq, heads = DG_HEADS, window = DG_LOCAL_WINDOW;
+        CUdeviceptr da = a, dq = q, dk = k, dv = v, dko = k_old, dvo = v_old, dso = seg_old,
+                    dsb = seg_base;
+        void *args[] = {&da, &dq,  &dk,    &dv,  &dko,    &dvo,  &dso,
+                        &dsb, &seq, &heads, &kvh, &canvas, &full, &window};
+        dg_cuda_launch(hd == DG_FULL_HEAD_DIM ? DG_CUDA_ATTENTION_FAST_FULL
+                                              : DG_CUDA_ATTENTION_FAST_LOCAL,
+                       (unsigned)(segments * ((seq + 15) / 16)), DG_HEADS, 128, args);
+        return;
+    }
     if (max_keys > DG_CUDA_ROW_MAX || hd > DG_FULL_HEAD_DIM)
         die("accelerator attention span is too long");
     int kn = kvh * hd, keys = old_rows + n;
@@ -8338,16 +8558,14 @@ static void dg_test_accel_layer(uint64_t *rs) {
 }
 
 /* The accelerator's rotary embedding and attention against the reference's
- * loops, on a local-layer shape: two segments sharing one cache, and one
- * without, in canvas and causal modes. Bit for bit in strict builds. */
-static void dg_test_accel_attention(uint64_t *rs) {
-    const DGAccelOps *a = dg_accel();
-    if (!a)
-        return;
+ * loops, on a local-layer or full-layer shape: two segments sharing one
+ * cache, and one without, in canvas and causal modes. Bit for bit in strict
+ * builds. */
+static void dg_test_accel_attention_shape(const DGAccelOps *a, uint64_t *rs, int full) {
+    enum { segments = 3, seq = 4, n = segments * seq };
 
-    enum { segments = 3, seq = 4, n = segments * seq, hd = DG_LOCAL_HEAD_DIM };
-
-    int kvh = DG_LOCAL_KV_HEADS, qn = DG_HEADS * hd, kn = kvh * hd, half = hd / 2;
+    int hd = full ? DG_FULL_HEAD_DIM : DG_LOCAL_HEAD_DIM;
+    int kvh = full ? DG_FULL_KV_HEADS : DG_LOCAL_KV_HEADS, qn = DG_HEADS * hd, kn = kvh * hd, half = hd / 2;
     int seg_old[segments] = {6, 6, 0}, seg_base[segments] = {0, 0, 6}, rows = 6;
     size_t qb = (size_t)n * qn * 4, kb = (size_t)n * kn * 4, ob = (size_t)rows * kn * 4,
            tb = (size_t)n * DG_FULL_HEAD_DIM * 4;
@@ -8419,11 +8637,16 @@ static void dg_test_accel_attention(uint64_t *rs) {
                         oo[d] += p * vv[(size_t)kh * hd + d];
                 }
             }
-        a->attention(dout, dq, dk, dv, dko, dvo, dso, dsb, n, seq, kvh, hd, canvas, 0, rows + seq,
-                     rows, dkd);
+        a->attention(dout, dq, dk, dv, dko, dvo, dso, dsb, n, seq, kvh, hd, canvas, full,
+                     rows + seq, rows, dkd);
         a->to_host(got, dout, qb);
+        /* Fast builds' accelerator sums scores in FP32 on tensor cores,
+         * where the reference sums in double. The test's values average 1,
+         * so scores reach several hundred and FP32 sums of them carry
+         * about 1e-4 of absolute error into the softmax. */
+        double tolerance = JB_STRICT_MATH ? 1e-5 : 5e-4;
         for (size_t i = 0; i < (size_t)n * qn; i++)
-            jb_check_close(a->name, got[i], want[i], 1e-5 * (1 + fabs(want[i])));
+            jb_check_close(a->name, got[i], want[i], tolerance * (1 + fabs(want[i])));
         if (JB_STRICT_MATH && memcmp(got, want, qb))
             die2("accelerator self-test failed: differs from the reference", "attention");
     }
@@ -8433,6 +8656,14 @@ static void dg_test_accel_attention(uint64_t *rs) {
     void *host[] = {q, k, v, ko, vo, table, want, got, ts};
     for (size_t i = 0; i < sizeof host / sizeof *host; i++)
         jb_release(host[i]);
+}
+
+static void dg_test_accel_attention(uint64_t *rs) {
+    const DGAccelOps *a = dg_accel();
+    if (!a)
+        return;
+    dg_test_accel_attention_shape(a, rs, 0);
+    dg_test_accel_attention_shape(a, rs, 1);
 }
 
 /* The accelerator's routing against dg_route_token, with tied logits, and
