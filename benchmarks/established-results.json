@@ -239,6 +239,14 @@
           "gpu_seconds_eight_rows": {"nvfp4": {"before": 1.33, "after": 1.08}, "busy": {"before": 4.07, "after": 3.81}},
           "rejected_larger_tiles_nvfp4_seconds": {"16_tokens": 1.73, "32_tokens": 1.69}
         },
+        "gpu_routing_and_deferred_kv_output": {
+          "conditions": "runs back to back",
+          "strict_seconds": 41.3,
+          "previous_seconds_same_conditions": 43.9,
+          "strict_identical_answer_objects": 200,
+          "kernel_window_seconds_eight_rows": {"before": 5.04, "after": 4.26},
+          "idle_seconds_eight_rows": {"before": 1.22, "after": 0.41}
+        },
         "strict_identical_answer_objects_register_tiles": 200,
         "strict_neon_seconds_same_code": 275,
         "strict_reference_seconds": 3353,

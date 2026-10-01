@@ -589,6 +589,38 @@ stored. NVFP4 time fell from 1.33 to 1.08 s, GPU time from 4.07 to 3.81 s,
 and the 40 parity rows from 45.3 to 43.9 s back to back, byte-identical on
 all 200 answers: 76x the reference. The selftest gained a two-token shape.
 
+### Routing on the GPU and a deferred K/V output
+
+Two waits per layer remained: the router's logits came down for the host's
+top-k, softmax and grouping, and a prefill's K and V came down for the K/V
+output. Both are gone.
+
+The router's softmax used the C library's double `exp`. Strict builds now use
+`dg_exp`, fdlibm's `__ieee754_exp`, within 1 ulp; GCC, Clang and MSVC on
+x86-64 and GCC on AArch64 produce the same bits, and the router rounds its
+weights to float, so the reference did not move: the 40 parity rows were
+byte-identical to the previous reference. A routing kernel runs
+`dg_route_token` with a block per token, each thread computing one expert's
+exponential and one thread the top-k and the ordered sums; a grouping kernel,
+with a thread per expert, writes the routed rows in the host loop's order and
+the NVFP4 tiles, whose count stays in device memory. Each layer's expert
+matrix tables are built once, inside the weights allocation, and the NVFP4
+kernel launches for the most tiles the rows can make. Selftests check routing
+and grouping against the reference's loops, ties included.
+
+A prefill's K/V output now copies each layer's K and V to device staging; the
+cached rows, host memory already, are copied at once. After the last layer
+one copy brings the staging to page-locked host memory and the host copies
+each layer's rows into the cache. Copying straight from staging into the
+freshly allocated cache was slower than the per-layer downloads it replaced
+(1.7 s of copies over eight rows): pageable destinations go through the
+driver's bounce buffers.
+
+Over eight rows the kernel window fell from 5.04 to 4.26 s and idle time from
+1.2 to 0.4 s; the 40 parity rows take 41.3 s against 43.9 s back to back,
+byte-identical on all 200 answers: 80x the reference. The K/V cache itself
+still lives on the host, and each attention call uploads its cached rows.
+
 ## 7. Make benchmark comparisons auditable
 
 Before publishing a faster number:
