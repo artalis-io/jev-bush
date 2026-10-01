@@ -700,12 +700,33 @@ benchmark, the fast CUDA build takes 265 s against 776 s with the exact
 kernels and no prefix reuse, and 490 s for the strict build, at 66.80%
 accuracy and 1.4358 log loss.
 
-What remains is mostly decoding. A 64-token answer canvas routes 512 rows to
-nearly all 128 experts, so each pass reads about 12.8 GB of expert weights;
-the FP4 kernel already reads them at about 320 GB/s, above GB10's rated
-273 GB/s (caches help), so the memory system bounds it, not the arithmetic.
-Prefill's expert products re-read each expert's weights for every tile of
-eight tokens and could reuse them across an expert's tiles.
+A correction to the first version of this section, which said the FP4
+kernel read expert weights at about 320 GB/s, at the memory limit. That
+figure assumed each 64-token canvas touches all 128 experts; it touches
+fewer. Timed alone with all 128 experts, the kernel streamed weights at only
+about 115 GB/s, whether an expert had 4 tokens or 60. Its scattered 4-byte
+loads, one step in flight per warp, were the limit, not re-reading an
+expert's weights for each tile of eight tokens: reading them once per run of
+tiles changed nothing, and neither did issuing a run's loads before its
+MMAs.
+
+Streaming each block's weights, 64 rows by 256 columns, and its run's
+activations through shared memory with coalesced 16-byte loads, the next
+stage's loads in flight while this one is multiplied, fixed it. Packed
+activation rows are padded to 16 bytes for those loads.
+
+| gate and up, 128 experts | before | staged |
+|---|---:|---:|
+| 4 tokens an expert | 1,252 us | 685 us |
+| 30 tokens an expert | 1,331 us | 796 us |
+| 60 tokens an expert | 1,447 us | 805 us |
+
+That is about 200 GB/s of GB10's rated 273 GB/s. The down projection gains
+less as tokens grow, which is consistent with its larger output of 2,816
+floats a token, though that is not measured. Over eight rows with prefix
+reuse, FP4 kernel time falls from 0.90 to 0.54 s, and the full benchmark
+from 265 to 226 s, with all 2,000 answers unchanged. Decoding is now the
+largest phase: 111 s of the benchmark, against 73 s of prefill.
 
 ## 7. Make benchmark comparisons auditable
 

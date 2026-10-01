@@ -87,7 +87,7 @@ takes 490 s on a DGX Spark's exact GPU path, against about 1,100 s for the
 Fast-math builds give up bit-identity on the GPU as they do on the CPU, and
 use the tensor cores (see [Build](#build)). The strict build stays the oracle:
 fast kernels are checked against it within FP32 rounding, and the fast mode's
-quality is judged on the benchmark, where its full 400-row run takes 265 s on
+quality is judged on the benchmark, where its full 400-row run takes 226 s on
 the same DGX Spark at 66.80% accuracy, against the strict build's 65.95%.
 
 For production GPGPU inference, use
@@ -223,12 +223,15 @@ still compile. The self-test checks each fast operation against the reference
 within FP32 rounding bounds, and strict builds compile and run exactly the
 same kernels as before.
 
-Over eight rows on a DGX Spark, GPU kernel time falls from 8.75 s with the
-exact kernels to 2.89 s. With the fast-math prefix reuse described above, the
-full 400-row benchmark takes 265 s, against 776 s for a fast-math build with
-the exact kernels and no prefix reuse, and 490 s for the strict build. Decoding the answer canvases now dominates, and it reads
-nearly every expert's weights once per 64-token pass, so memory bandwidth,
-not arithmetic, bounds it.
+Over eight rows on a DGX Spark without prefix reuse, GPU kernel time falls
+from 8.75 s with the exact kernels to 2.89 s. The FP4 expert kernel streams
+weights and activations through shared memory with coalesced 16-byte loads,
+which is why packed activation rows are padded to 16 bytes; it reads expert
+weights at about 200 GB/s of GB10's rated 273 GB/s. With the fast-math prefix
+reuse described above, the full 400-row benchmark takes 226 s, against 776 s
+for a fast-math build with the exact kernels and no prefix reuse, and 490 s
+for the strict build. Decoding the answer canvases is now the largest
+phase.
 
 Loading the driver and NVRTC with `dlopen` means the libraries found on the
 usual search path (`LD_LIBRARY_PATH`, `ld.so.conf`) are the code that runs, as

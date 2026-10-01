@@ -106,7 +106,8 @@
       "score_mae": 0.43529219092096305,
       "argmax_agreement_with_strict_portable": 0.942,
       "mean_total_variation_to_strict_portable": 0.05782612476362679,
-      "seconds_400_rows": 265,
+      "seconds_400_rows": 226,
+      "seconds_400_rows_before_staged_fp4_kernel": 265,
       "seconds_400_rows_exact_kernels_fast_math_without_prefix_reuse": 776,
       "seconds_400_rows_strict_exact_gpu": 490,
       "prefill_tokens": 99521,
@@ -114,6 +115,13 @@
       "gpu_kernel_seconds_eight_rows_without_prefix_reuse": {
         "exact_kernels": {"bf16": 2.99, "nvfp4": 2.56, "attention": 1.64, "norms_and_moe_tail": 1.23, "total": 8.75},
         "fast_kernels": {"bf16": 0.97, "nvfp4": 1.26, "attention": 0.21, "norms_and_moe_tail": 0.27, "total": 2.89}
+      },
+      "staged_fp4_kernel": {
+        "note": "weights and activations through shared memory with 16-byte loads; answers unchanged",
+        "isolated_gate_up_us_128_experts": {"4_tokens": {"before": 1252, "after": 685},
+                                             "30_tokens": {"before": 1331, "after": 796},
+                                             "60_tokens": {"before": 1447, "after": 805}},
+        "fp4_kernel_seconds_eight_rows_with_prefix_reuse": {"before": 0.903, "after": 0.543}
       },
       "prefix_reuse_drift_40_rows": {
         "cuda_fast": {"argmax_agreement": 0.965, "mean_total_variation": 0.0347},
