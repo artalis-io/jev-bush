@@ -655,6 +655,21 @@ static int cmp_vocab(const void *a, const void *b) {
     return c ? c : (x->n > y->n) - (x->n < y->n);
 }
 
+/* bsearch's key for a byte span, which a Vocab could only hold by casting
+ * away const. */
+typedef struct {
+    const char *s;
+    uint32_t n;
+} VocabKey;
+
+static int cmp_vocab_key(const void *a, const void *b) {
+    const VocabKey *x = a;
+    const Vocab *y = b;
+    size_t n = x->n < y->n ? x->n : y->n;
+    int c = memcmp(x->s, y->s, n);
+    return c ? c : (x->n > y->n) - (x->n < y->n);
+}
+
 static int cmp_merge(const void *a, const void *b) {
     const Merge *x = a, *y = b;
     return x->a != y->a ? (x->a > y->a) - (x->a < y->a) : (x->b > y->b) - (x->b < y->b);
@@ -1158,6 +1173,12 @@ static int dg_tensor_cmp(const void *a, const void *b) {
     return strcmp(x->name, y->name);
 }
 
+/* bsearch's comparison of a tensor name with a tensor. */
+static int dg_tensor_key_cmp(const void *a, const void *b) {
+    const DGTensor *y = b;
+    return strcmp(a, y->name);
+}
+
 static int dg_is_text(const char *name) {
     return !strncmp(name, "model.decoder.", 14) ||
            (!strncmp(name, "model.encoder.language_model.", 29) && strstr(name, ".layer_scalar"));
@@ -1252,9 +1273,7 @@ static void dg_parse_shard(DGModel *m, int si, const char *dir) {
 }
 
 static DGTensor *dg_tensor(DGModel *m, const char *name) {
-    DGTensor key = {0};
-    key.name = (char *)name;
-    DGTensor *t = bsearch(&key, m->tensor, m->nt, sizeof *m->tensor, dg_tensor_cmp);
+    DGTensor *t = bsearch(name, m->tensor, m->nt, sizeof *m->tensor, dg_tensor_key_cmp);
     if (t)
         return t;
     die2("missing DiffusionGemma tensor", name);
@@ -1523,8 +1542,8 @@ static void dg_free(DGModel *m) {
 }
 
 static Vocab *dgt_vfind(DGTokenizer *d, const char *s, size_t n) {
-    Vocab k = {0, (char *)s, (uint32_t)n};
-    return bsearch(&k, d->vocab, d->nv, sizeof *d->vocab, cmp_vocab);
+    VocabKey k = {s, (uint32_t)n};
+    return bsearch(&k, d->vocab, d->nv, sizeof *d->vocab, cmp_vocab_key);
 }
 
 static Merge *dgt_mfind(DGTokenizer *d, uint32_t a, uint32_t b) {
@@ -3103,7 +3122,24 @@ static const DGKernelOps *dg_kernels(void) {
  * loaded at run time and the kernels are compiled from the source below on
  * first use, so builds need neither CUDA headers nor nvcc. Without a driver,
  * NVRTC or a device, dg_accel() returns NULL and the CPU kernels run; so
- * does JB_CUDA=0 in the environment. NVRTC compiles with --fmad=false and
+ * does JB_CUDA=0 in the environment, and so do kernels that fail to compile
+ * or load, which dg_accel_failure() then describes. The library never
+ * writes to stderr itself; the CLI reports a failure there.
+ *
+ * Loading with dlopen and dlsym is the cost of needing no CUDA toolkit to
+ * build: it happens only in -DJB_CUDA builds, on Linux, once, under
+ * pthread_once, and only from the driver's and NVRTC's own library names.
+ * Those names are searched the usual way, so whoever controls the library
+ * path (LD_LIBRARY_PATH, ld.so.conf) chooses the code that runs, as with
+ * any shared library. The resolved entry points live in dg_cuda, a
+ * function-pointer table in writable memory because it is filled at run
+ * time. It is written only inside pthread_once, before any reader, and is
+ * read-only afterwards; jev-bush has no sandbox or sealed memory for an
+ * overwrite to bypass, so the table is not made read-only after it is
+ * filled. Every other dispatch table here, DGKernelOps and DGAccelOps
+ * included, is static const.
+ *
+ * NVRTC compiles with --fmad=false and
  * IEEE division and square root, and every kernel keeps the reference's
  * order of operations for each value, so results match the reference bit
  * for bit, which the selftest checks. Each calling thread makes the context
@@ -4001,7 +4037,10 @@ static struct {
     nvrtcResult (*destroy)(nvrtcProgram *);
     CUcontext ctx;
     CUfunction kernel[DG_CUDA_KERNELS];
+    /* Why the kernels are unavailable although a device is, and NVRTC's
+     * log when compiling them failed. */
     const char *failure;
+    char compile_log[4096];
     int ready;
 } dg_cuda;
 
@@ -4013,8 +4052,8 @@ static int dg_cuda_symbol(void *lib, const char *name, void *slot) {
 }
 
 /* Compiles and loads the kernels. Runs under pthread_once, which no error
- * frame may unwind through, so it records a failure for dg_accel() to report
- * and allocates with plain malloc. */
+ * frame may unwind through, so it records a failure for
+ * dg_accel_failure() and allocates with plain malloc. */
 static void dg_cuda_compile(int major, int minor) {
     char arch[48], tile_rows[32], tile_tokens[32], bf16_tokens[32], row_max[32], head_max[32],
         threads[32], width[32], experts[32], topk[32];
@@ -4074,7 +4113,7 @@ static void dg_cuda_compile(int major, int minor) {
         size_t n = 0;
         char *log = NULL;
         if (!dg_cuda.log_size(prog, &n) && n > 1 && (log = malloc(n)) && !dg_cuda.log(prog, log))
-            fprintf(stderr, "%s\n", log);
+            snprintf(dg_cuda.compile_log, sizeof dg_cuda.compile_log, "%s", log);
         free(log);
         dg_cuda.failure = "compiling the kernels";
     } else if (dg_cuda.module_load(&module, ptx))
@@ -4430,14 +4469,28 @@ static const DGAccelOps *dg_accel(void) {
                                     dg_cuda_group,
                                     dg_cuda_nvfp4_grouped};
     pthread_once(&once, dg_cuda_open);
-    if (dg_cuda.failure)
-        die2("CUDA accelerator failed", dg_cuda.failure);
     return dg_cuda.ready ? &cuda : NULL;
 }
+
+#ifndef JB_NO_MAIN
+/* After dg_accel(): why a present device runs nothing, or NULL; *log gets
+ * NVRTC's log, empty unless compiling failed. Only the CLI reports it. */
+static const char *dg_accel_failure(const char **log) {
+    *log = dg_cuda.compile_log;
+    return dg_cuda.ready ? NULL : dg_cuda.failure;
+}
+#endif
 #else
 static const DGAccelOps *dg_accel(void) {
     return NULL;
 }
+
+#ifndef JB_NO_MAIN
+static const char *dg_accel_failure(const char **log) {
+    *log = "";
+    return NULL;
+}
+#endif
 #endif
 
 static DGTensor *dg_layer_tensor(DGModel *m, int l, const char *tail) {
@@ -7652,6 +7705,17 @@ void jb_results_free(jb_result **results, size_t count) {
 }
 
 #ifndef JB_NO_MAIN
+/* Says on stderr when the accelerator was built and a device found, but its
+ * kernels failed, so the CPU kernels run instead. */
+static void dg_report_accel(void) {
+    const char *log, *failure;
+    if (dg_accel() || !(failure = dg_accel_failure(&log)))
+        return;
+    fprintf(stderr, "jb: CUDA accelerator unavailable, running on the CPU: %s\n", failure);
+    if (*log)
+        fprintf(stderr, "%s\n", log);
+}
+
 static int dg_decide_file(const char *dir, const char *path) {
     size_t n;
     char *j = read_all(path, &n);
@@ -7659,8 +7723,11 @@ static int dg_decide_file(const char *dir, const char *path) {
     jb_session *session = NULL;
     char *output = NULL;
     size_t output_length = 0;
-    if (jb_model_load(dir, &model) != JB_OK ||
-        jb_session_create_json(model, NULL, 0, &session) != JB_OK ||
+    if (jb_model_load(dir, &model) != JB_OK)
+        die(jb_last_error());
+    if (model->model.nvfp4)
+        dg_report_accel();
+    if (jb_session_create_json(model, NULL, 0, &session) != JB_OK ||
         jb_session_decide_json(session, j, n, &output, &output_length) != JB_OK)
         die(jb_last_error());
     if (fwrite(output, 1, output_length, stdout) != output_length || putchar('\n') == EOF)
@@ -7708,8 +7775,11 @@ static int dg_eval_file(const char *dir, const char *path) {
             die("JB_MICROBATCH must be 1..16");
         mb = (int)v;
     }
-    if (jb_model_load(dir, &model) != JB_OK ||
-        jb_session_create_json(model, NULL, 0, &session) != JB_OK)
+    if (jb_model_load(dir, &model) != JB_OK)
+        die(jb_last_error());
+    if (model->model.nvfp4)
+        dg_report_accel();
+    if (jb_session_create_json(model, NULL, 0, &session) != JB_OK)
         die(jb_last_error());
     char *line = NULL, **rows = xcalloc((size_t)mb, sizeof *rows);
     size_t cap = 0, n = 0, *lens = xcalloc((size_t)mb, sizeof *lens);
@@ -8901,6 +8971,7 @@ static int selftest(void) {
     jb_session_free(public_session);
     dg_kernel_selftest();
     dg_test_locale_numbers();
+    dg_report_accel();
     if (dg_accel())
         printf("{\"selftest\":\"ok\",\"kernels\":\"%s\",\"accelerator\":\"%s\"}\n",
                dg_kernels()->name, dg_accel()->name);

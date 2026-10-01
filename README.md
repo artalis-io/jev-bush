@@ -135,7 +135,15 @@ compute every value in the reference's order, using the same portable `expf`,
 checks each GPU operation against the reference's bits and reports
 `"accelerator":"cuda"`. Without a driver, NVRTC or a device, or with
 `JB_CUDA=0` in the environment, or when the device cannot hold the weights,
-the build runs on the CPU kernels alone.
+the build runs on the CPU kernels alone. So it does when the kernels fail to
+compile or load; the library stays silent, and the CLI says why on stderr,
+with NVRTC's log.
+
+Loading the driver and NVRTC with `dlopen` means the libraries found on the
+usual search path (`LD_LIBRARY_PATH`, `ld.so.conf`) are the code that runs, as
+with any shared library. Their entry points sit in one function-pointer table
+that is filled once, under `pthread_once`, and only read afterwards; every
+other dispatch table in `jb.c` is `static const`.
 
 ### C library API
 
