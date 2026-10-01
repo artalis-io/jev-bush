@@ -1516,6 +1516,11 @@ static void dg_upload_model(DGModel *m) {
                         t->device = p;
                 }
         }
+        /* The tied embedding, for the vocabulary logits of automatic reads. */
+        DGTensor *emb = dg_tensor(m, "model.decoder.embed_tokens.weight");
+        DGDevice ep = dg_place(a, m->weights, &at, emb->data, (size_t)emb->bytes);
+        if (pass)
+            emb->device = ep;
         for (int l = 0; l < DG_L; l++)
             for (int k = 0; k < 3; k++) {
                 at = jb_align_up(at, 256);
@@ -2324,8 +2329,12 @@ static void dg_mv_slice(const DGTensor *w, uint64_t base, const float *x, float 
 /* Project all answer slots together so the tied LM head is streamed once.
  * OpenJev's automatic reread test is entropy over the union of the
  * full-vocabulary top 20 and the explicitly requested label ids. */
-static double dg_slot_logits_entropy(const DGTensor *w, const float *hidden, int n, int **label_ids,
-                                     const int *label_n, double **label_score, float *logits) {
+/* logits holds n answer slots' logits over the vocabulary, which this
+ * rewrites in place; terms has room for DG_VOCAB doubles. The softcap and
+ * the softmax terms are computed in parallel, one value each; the maximum,
+ * the top 20 and the sums run in order, as the reference's do. */
+static double dg_slot_logits_entropy(int n, int **label_ids, const int *label_n,
+                                     double **label_score, float *logits, double *terms) {
     if (n < 1 || n > DG_AUTO_READ_MAX_QUESTIONS)
         die("bad DiffusionGemma answer slot count");
     /* vLLM returns top-20 plus the sorted union of requested label ids at
@@ -2350,7 +2359,15 @@ static double dg_slot_logits_entropy(const DGTensor *w, const float *hidden, int
                 requested[at] = id;
             }
         }
-    dg_mm_data(w->data, hidden, logits, n, DG_VOCAB, DG_H);
+    {
+        int i, total = n * DG_VOCAB;
+#ifdef _OPENMP
+        JB_OMP();
+#pragma omp parallel for schedule(static)
+#endif
+        for (i = 0; i < total; i++)
+            logits[i] = 30.0f * dg_tanhf(logits[i] / 30.0f);
+    }
     double max_entropy = 0;
     for (int t = 0; t < n; t++) {
         float *row = logits + (size_t)t * DG_VOCAB, topv[20];
@@ -2361,10 +2378,12 @@ static double dg_slot_logits_entropy(const DGTensor *w, const float *hidden, int
         }
         float mx = -FLT_MAX;
         for (int v = 0; v < DG_VOCAB; v++) {
-            float z = 30.0f * dg_tanhf(row[v] / 30.0f);
-            row[v] = z;
+            float z = row[v];
             if (z > mx)
                 mx = z;
+            /* topv descends, so nothing below its last entry enters. */
+            if (!(z > topv[19]))
+                continue;
             for (int k = 0; k < 20; k++)
                 if (z > topv[k]) {
                     for (int q = 19; q > k; q--) {
@@ -2376,9 +2395,18 @@ static double dg_slot_logits_entropy(const DGTensor *w, const float *hidden, int
                     break;
                 }
         }
+        {
+            int v;
+#ifdef _OPENMP
+            JB_OMP();
+#pragma omp parallel for schedule(static)
+#endif
+            for (v = 0; v < DG_VOCAB; v++)
+                terms[v] = exp((double)row[v] - mx);
+        }
         double den = 0;
         for (int v = 0; v < DG_VOCAB; v++)
-            den += exp((double)row[v] - mx);
+            den += terms[v];
         double entropy = 0;
         for (int k = 0; k < 20; k++) {
             double p = exp((double)topv[k] - mx) / den;
@@ -5329,6 +5357,9 @@ typedef struct {
     size_t device_bytes;
     float *pinned;
     size_t pinned_bytes;
+    /* Device scratch for work outside a forward pass, from accel. */
+    DGDevice scratch;
+    size_t scratch_bytes;
 #ifdef JB_PROFILE
     JBProfile profile;
 #endif
@@ -5362,6 +5393,8 @@ static void dg_workspace_destroy(DGWorkspace *workspace) {
         workspace->accel->free(workspace->device);
     if (workspace->pinned)
         workspace->accel->host_free(workspace->pinned);
+    if (workspace->scratch)
+        workspace->accel->free(workspace->scratch);
     memset(workspace, 0, sizeof *workspace);
 }
 
@@ -5474,6 +5507,21 @@ static DGDeviceWork dg_device_begin(DGWorkspace *owner, const DGModel *m, int n,
     work.base = owner->device;
     work.pinned = owner->pinned;
     return work;
+}
+
+/* The session's device scratch, at least bytes, from the accelerator its
+ * forward passes use; grown as needed. */
+static DGDevice dg_device_scratch(DGWorkspace *owner, size_t bytes) {
+    if (owner->scratch_bytes < bytes) {
+        if (owner->scratch)
+            owner->accel->free(owner->scratch);
+        owner->scratch_bytes = 0;
+        owner->scratch = owner->accel->alloc(bytes);
+        if (!owner->scratch)
+            die("accelerator out of memory for scratch");
+        owner->scratch_bytes = bytes;
+    }
+    return owner->scratch;
 }
 
 /* dg_mm's checks, then the accelerator's product. */
@@ -7437,6 +7485,7 @@ static size_t dg_job_score_bytes(const DGJob *g, int read) {
         jb_workspace_plan(&bytes, (size_t)g->nq * DG_H, sizeof(float));
         jb_workspace_plan(&bytes, (size_t)g->nq, sizeof(int));
         jb_workspace_plan(&bytes, (size_t)g->nq * DG_VOCAB, sizeof(float));
+        jb_workspace_plan(&bytes, DG_VOCAB, sizeof(double));
     }
     jb_workspace_plan(&bytes, (size_t)max_candidates, sizeof(double));
     return bytes;
@@ -7468,13 +7517,26 @@ static void dg_job_score(DGTensor *emb, DGJob *g, const float *h, int segment0, 
         float *answer_h = jb_arena_alloc(workspace, (size_t)g->nq * DG_H, sizeof *answer_h, 0);
         int *label_n = jb_arena_alloc(workspace, (size_t)g->nq, sizeof *label_n, 0);
         float *logits = jb_arena_alloc(workspace, (size_t)g->nq * DG_VOCAB, sizeof *logits, 0);
+        double *terms = jb_arena_alloc(workspace, DG_VOCAB, sizeof *terms, 0);
         for (int x = 0; x < g->nq; x++) {
             memcpy(answer_h + (size_t)x * DG_H,
                    h + ((size_t)(segment0 + x / g->group_cap) * g->width + g->slot[x]) * DG_H,
                    DG_H * sizeof *answer_h);
             label_n[x] = g->w[x].nc;
         }
-        entropy = dg_slot_logits_entropy(emb, answer_h, g->nq, g->ids, label_n, score, logits);
+        if (owner->accel && emb->device) {
+            /* The same product on the accelerator, which holds the
+             * embedding: bit for bit in strict builds. */
+            const DGAccelOps *a = owner->accel;
+            size_t hb = (size_t)g->nq * DG_H * sizeof *answer_h,
+                   lb = (size_t)g->nq * DG_VOCAB * sizeof *logits;
+            DGDevice d = dg_device_scratch(owner, jb_size_add(hb, lb));
+            a->to_device(d, answer_h, hb);
+            a->bf16_mm(emb->device, d, d + hb, g->nq, DG_VOCAB, DG_H);
+            a->to_host(logits, d + hb, lb);
+        } else
+            dg_mm_data(emb->data, answer_h, logits, g->nq, DG_VOCAB, DG_H);
+        entropy = dg_slot_logits_entropy(g->nq, g->ids, label_n, score, logits, terms);
     } else
         for (int x = 0; x < g->nq; x++)
             for (int c = 0; c < g->w[x].nc; c++) {
