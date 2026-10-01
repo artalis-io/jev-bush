@@ -2001,7 +2001,7 @@ static void dg_nvfp4_mm_ref(const uint8_t *wd, const uint8_t *sd, float global, 
     }
 }
 
-/* expf and tanhf. Strict builds use these, from IEEE additions,
+/* expf, tanhf and the router's exp. Strict builds use these, from IEEE additions,
  * multiplications and divisions in a fixed order and nothing else: no libm
  * and no fused multiply-add, so every strict build, whatever its C library,
  * and the CUDA kernels compute the same bits. Both follow Cephes. Fast math
@@ -2062,6 +2062,62 @@ static float dg_tanhf(float x) {
     float t = 1.0f - 2.0f / (dg_expf(a + a) + 1.0f);
     return x < 0 ? -t : t;
 }
+
+static double dg_double_bits(uint64_t u) {
+    double x;
+    memcpy(&x, &u, sizeof x);
+    return x;
+}
+
+static uint64_t dg_bits_double(double x) {
+    uint64_t u;
+    memcpy(&u, &x, sizeof u);
+    return u;
+}
+
+/* fdlibm's __ieee754_exp, under 1 ulp: x = k ln 2 + r in two parts, a
+ * rational approximation of e^r, and k added to the exponent bits, scaled
+ * in two steps below the normal range. The router's softmax uses it. */
+static double dg_exp(double x) {
+    static const double ln2_hi = 6.93147180369123816490e-01, ln2_lo = 1.90821492927058770002e-10,
+                        inv_ln2 = 1.44269504088896338700e+00, p1 = 1.66666666666666019037e-01,
+                        p2 = -2.77777777770155933842e-03, p3 = 6.61375632143793436117e-05,
+                        p4 = -1.65339022054652515390e-06, p5 = 4.13813679705723846039e-08,
+                        two_m1000 = 9.33263618503218878990e-302;
+    uint64_t bits = dg_bits_double(x);
+    uint32_t hx = (uint32_t)(bits >> 32) & 0x7fffffff;
+    int negative = (int)(bits >> 63), k = 0;
+    double hi = 0, lo = 0;
+    if (hx >= 0x40862E42) {
+        if (hx >= 0x7ff00000)
+            return x != x ? x + x : negative ? 0.0 : x;
+        if (x > 7.09782712893383973096e+02)
+            return INFINITY;
+        if (x < -7.45133219101941108420e+02)
+            return 0.0;
+    }
+    if (hx > 0x3fd62e42) {
+        if (hx < 0x3FF0A2B2) {
+            hi = negative ? x + ln2_hi : x - ln2_hi;
+            lo = negative ? -ln2_lo : ln2_lo;
+            k = negative ? -1 : 1;
+        } else {
+            k = (int)(inv_ln2 * x + (negative ? -0.5 : 0.5));
+            double t = k;
+            hi = x - t * ln2_hi;
+            lo = t * ln2_lo;
+        }
+        x = hi - lo;
+    } else if (hx < 0x3e300000)
+        return 1.0 + x;
+    double t = x * x, c = x - t * (p1 + t * (p2 + t * (p3 + t * (p4 + t * p5)))), y;
+    if (k == 0)
+        return 1.0 - ((x * c) / (c - 2.0) - x);
+    y = 1.0 - ((lo - (x * c) / (2.0 - c)) - hi);
+    if (k >= -1021)
+        return dg_double_bits(dg_bits_double(y) + ((uint64_t)(int64_t)k << 52));
+    return dg_double_bits(dg_bits_double(y) + ((uint64_t)(int64_t)(k + 1000) << 52)) * two_m1000;
+}
 #else
 static float dg_expf(float x) {
     return expf(x);
@@ -2069,6 +2125,10 @@ static float dg_expf(float x) {
 
 static float dg_tanhf(float x) {
     return tanhf(x);
+}
+
+static double dg_exp(double x) {
+    return exp(x);
 }
 #endif
 
@@ -4751,9 +4811,9 @@ static void dg_route_token(const float *rt, const DGTensor *re, int *top, float 
             mx = rt[e];
     double all = 0, sel = 0;
     for (int e = 0; e < DG_EXPERTS; e++)
-        all += exp((double)rt[e] - mx);
+        all += dg_exp((double)rt[e] - mx);
     for (int k = 0; k < DG_TOPK; k++) {
-        ev[k] = (float)(exp((double)ev[k] - mx) / all);
+        ev[k] = (float)(dg_exp((double)ev[k] - mx) / all);
         sel += ev[k];
     }
     for (int k = 0; k < DG_TOPK; k++) {
@@ -8032,6 +8092,25 @@ static void dg_test_portable_math(void) {
         die("portable math self-test failed: special values");
     if (hash != 0x5f90bd09fe8f8bdeu)
         die("portable math self-test failed: bits differ from the recorded ones");
+    /* dg_exp: 2^20 arguments over its whole finite range, within 2 ulp of
+     * the C library's exp where the result is normal, and bits that GCC,
+     * Clang and MSVC on x86-64 and GCC on AArch64 all reproduced. */
+    uint64_t exp_hash = 1469598103934665603u;
+    double worst = 0;
+    for (int i = 0; i < 1 << 20; i++) {
+        double x = -746.0 + 1456.0 * i / (1 << 20), y = dg_exp(x), want = exp(x);
+        uint64_t b = dg_bits_double(y);
+        exp_hash = (exp_hash ^ b) * 1099511628211u;
+        if (want > 0x1p-1022 && want < 0x1p1023) {
+            double err = fabs(y - want) / ldexp(1.0, ilogb(want) - 52);
+            if (err > worst)
+                worst = err;
+        }
+    }
+    if (worst > 2.0 || dg_exp(0) != 1 || dg_exp(-INFINITY) != 0 || dg_exp(INFINITY) != INFINITY)
+        die("portable math self-test failed: exp");
+    if (exp_hash != 0x22cedbf2137180efu)
+        die("portable math self-test failed: exp bits differ from the recorded ones");
 #else
     (void)hash;
 #endif
