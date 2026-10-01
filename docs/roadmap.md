@@ -194,7 +194,9 @@ Fast-math prefix reuse is disabled. Testing found that prompt splitting changes
 temporary-buffer shape and therefore fast-math rounding; later NVFP4 activation
 rounding amplified the initially tiny difference. Strict compilation produced
 byte-identical cached and monolithic results. Approximate fast-math caching
-would violate the execution-only optimization contract.
+would violate the execution-only optimization contract. (Superseded: fast-math
+builds now reuse the prefix as an approximation of the same kind as fast math;
+strict caching remains exact. See "A fast CUDA mode" below.)
 
 The attainable speedup is limited by the answer-canvas work that remains. Use
 the measured prefill fraction and shared-prefix fraction to predict the ceiling
@@ -659,6 +661,52 @@ FP32 scores to stay bit-identical to the reference. Large further gains
 would need a fast accelerator mode, as fast math is for the CPU, that
 gives up that identity.
 
+### A fast CUDA mode
+
+Fast-math builds (`-ffast-math -DJB_CUDA`) now give up bit-identity on the
+GPU as they do on the CPU. On compute capability 8.0 and later:
+
+- attention runs as one fused pass with an online softmax, its products on
+  tensor cores with each operand split into a TF32 high and low part. Split
+  BF16 operands (about 16 bits) were tried first and rejected: their score
+  errors reached 1e-4, where 3xTF32 stays at FP32 level;
+- BF16 projections run on tensor cores with each activation split into three
+  BF16 parts, which makes every product exact; decode-sized launches split
+  the columns across warps, as 22 blocks left most of the 48 SMs idle;
+- norms sum their squares across the block, still in double.
+
+On compute capability 12.x the expert activations stay packed as NVFP4 and
+the expert products run on the block-scaled FP4 tensor cores
+(`mma.sync ... kind::mxf4nvf4.block_scale`, target `compute_121a`), whose
+E2M1 and E4M3 products are exact.
+
+Kernel time over eight rows on the same DGX Spark, both fast-math builds
+without prefix reuse:
+
+| kernels | exact | fast |
+|---|---:|---:|
+| BF16 products | 2.99 s | 0.97 s |
+| NVFP4 experts | 2.56 s | 1.26 s |
+| attention | 1.64 s | 0.21 s |
+| norms and MoE tail | 1.23 s | 0.27 s |
+| total | 8.75 s | 2.89 s |
+
+Fast-math builds had prefix reuse disabled, which made them prefill 2.5 times
+the tokens of strict builds (249,902 against 99,521 over the benchmark). They
+now reuse the prefix as an approximation: on the 40 parity rows cached and
+monolithic fast CUDA results agree on 96.5% of argmaxes (mean total variation
+0.035), less than fast math's own distance from strict. Over the full
+benchmark, the fast CUDA build takes 265 s against 776 s with the exact
+kernels and no prefix reuse, and 490 s for the strict build, at 66.80%
+accuracy and 1.4358 log loss.
+
+What remains is mostly decoding. A 64-token answer canvas routes 512 rows to
+nearly all 128 experts, so each pass reads about 12.8 GB of expert weights;
+the FP4 kernel already reads them at about 320 GB/s, above GB10's rated
+273 GB/s (caches help), so the memory system bounds it, not the arithmetic.
+Prefill's expert products re-read each expert's weights for every tile of
+eight tokens and could reuse them across an expert's tiles.
+
 ## 7. Make benchmark comparisons auditable
 
 Before publishing a faster number:
@@ -762,11 +810,12 @@ which optimizations matter, and where the remaining hardware boundary lies.
 
 ## Non-goals
 
-- CUDA, Metal, Vulkan, or WebGPU backends;
+- Metal, Vulkan, WebGPU, or ROCm backends (the README explains why CUDA is
+  the exception);
 - server or HTTP mode;
 - generic GGUF or arbitrary-model loading;
 - model abstraction layers or plugin systems;
-- approximate caches that change decision semantics;
+- approximate caches that change strict decision semantics;
 - optimizing candidate projection while transformer execution dominates.
 
 The project remains one model, one hypothesis, one C inference engine, and a
