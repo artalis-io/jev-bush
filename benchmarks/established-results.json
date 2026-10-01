@@ -151,7 +151,25 @@
       "score_mae": 0.4359,
       "mean_ms_per_row": 268.0,
       "timing_note": "sum of each row's own timing over 400 rows, one request at a time, model load excluded; 115 s wall including load",
-      "seconds_by_phase": {"prefill": 72.4, "decode": 29.9, "candidates": 5.0}
+      "seconds_by_phase": {"prefill": 72.4, "decode": 29.9, "candidates": 5.0},
+      "microbatch_runs": {
+        "note": "JB_MICROBATCH on the fast CUDA build; wall seconds for 400 rows including model load",
+        "one_read": {"1": {"seconds": 115, "rows_batched": 0, "accuracy": 0.6665, "label_log_loss": 1.5191},
+                     "4": {"seconds": 83, "rows_batched": 384, "accuracy": 0.6605, "label_log_loss": 1.5361,
+                           "argmax_agreement_with_unbatched": 0.949},
+                     "8": {"seconds": 82, "rows_batched": 344, "accuracy": 0.6615, "label_log_loss": 1.5405,
+                           "argmax_agreement_with_unbatched": 0.961},
+                     "16": {"seconds": 108, "rows_batched": 80, "accuracy": 0.664, "label_log_loss": 1.5309,
+                            "argmax_agreement_with_unbatched": 0.9905}},
+        "automatic_reads": {"1": {"seconds": 163, "rows_batched": 0, "accuracy": 0.667, "label_log_loss": 1.4398},
+                            "4": {"seconds": 129, "rows_batched": 384, "accuracy": 0.666, "label_log_loss": 1.451,
+                                  "argmax_agreement_with_unbatched": 0.97},
+                            "8": {"seconds": 120, "rows_batched": 344, "accuracy": 0.664, "label_log_loss": 1.4596,
+                                  "argmax_agreement_with_unbatched": 0.9735},
+                            "16": {"seconds": 152, "rows_batched": 80, "accuracy": 0.6655, "label_log_loss": 1.4396,
+                                   "argmax_agreement_with_unbatched": 0.9925}},
+        "strict_cuda_batch_4_parity_40_rows": "all 200 answers byte-identical"
+      }
     }
   ],
   "agreement": {
