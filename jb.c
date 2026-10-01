@@ -1,5 +1,6 @@
 /*
- * Jev Bush -- CPU-first bounded decisions with DiffusionGemma.
+ * Jev Bush -- bounded decisions with DiffusionGemma, on CPUs and, bit for
+ * bit the same, on CUDA.
  *
  * Build: cc -O3 -march=native -ffast-math -std=c11 -Wall -Wextra
  *        -pedantic -fopenmp jb.c -lm -o jb

@@ -2,7 +2,8 @@
 
 ![Jev Bush robot mascot](jev-bush-mascot.png)
 
-> CPU-first probabilistic decisions for DiffusionGemma.
+> Probabilistic decisions for DiffusionGemma: on any CPU, and bit for bit the
+> same on CUDA.
 >
 > Please clap.
 
@@ -32,13 +33,55 @@ flowchart LR
 
 - Be a small, readable, educational implementation of direct probabilistic
   decisions on a real diffusion language model.
-- Run inference on CPUs. GPU backends are deliberately out of scope: adding
-  CUDA, Metal, Vulkan, WebGPU, or another GPGPU path would defeat the point of
-  this project.
+- Run inference on CPUs, with the portable scalar build as the reference that
+  defines every result. One optional accelerator, CUDA, reproduces that
+  reference exactly; other GPU backends (Metal, Vulkan, WebGPU, ROCm) remain
+  out of scope. Why CUDA is the exception is explained below.
 - Make the CPU path correct and fast through model-specific data layouts,
   vectorization, and OpenMP without turning `jb.c` into a generic framework.
 - Remain compatible with OpenJev's bounded decision semantics and public
   evaluation data.
+
+### Why CUDA is different
+
+Jev Bush began CPU-only, and a GPU backend was ruled out because it would have
+defeated the point: a second implementation to read, a toolkit to install, and
+results that differ from the code a reader studies. The CUDA path was admitted
+only because it avoids all three.
+
+- **It computes the same bits.** It is not an alternative numerical method.
+  The kernels are compiled with `--fmad=false`, IEEE division and square
+  root, and no flush to zero. Every value is computed in the reference's order
+  of operations, with the same portable `expf`, `tanhf` and `exp`. The strict
+  scalar build stays the oracle. The self-test checks each GPU operation
+  against its bits, and on the 40 parity rows all 200 answers are
+  byte-identical. Reading the CPU code still tells you exactly what the GPU
+  computes.
+- **It needs nothing to build.** It needs no `nvcc`, no CUDA headers, and no
+  link-time dependency. The driver and NVRTC are loaded with `dlopen` when a
+  model loads, and the kernels compile from source embedded in `jb.c`.
+  Default builds do not contain it at all. A `-DJB_CUDA` build without a
+  driver, NVRTC or a device, or whose kernels fail to compile, runs on the
+  CPU kernels.
+- **It stays out of the way.** All CUDA code sits in one `#if
+  defined(JB_CUDA)` block behind a small operations table, like the SIMD
+  backends. The engine calls the table in the reference's order and has no
+  other CUDA conditionals.
+- **It is narrow.** It covers one vendor and one model's transformer layers.
+  Tokenization, the prefix cache, the K/V cache, candidate scoring and
+  everything else stay on the CPU. It is not the start of a GPU framework.
+
+CUDA can make that guarantee because NVRTC exposes the controls exactness
+needs: no contraction into FMAs, correctly rounded division and square root,
+and denormals kept. Another GPU API would have to prove the same before it
+could join, which is why the others remain out of scope.
+
+Exactness has a price. The kernels give up tensor cores, split sums and FP32
+attention scores, so the GPU runs roughly an order of magnitude below a
+non-exact engine on the same hardware. Even so, the full 400-row benchmark
+takes 490 s on a DGX Spark's exact GPU path, against about 1,100 s for the
+64-core Threadripper's AVX-512 fast-math build. A faster GPU mode would have
+to give up bit-identity, as fast math does on the CPU, and is not planned.
 
 For production GPGPU inference, use
 [OpenJev](https://github.com/razorback16/openjev) or
@@ -461,7 +504,7 @@ here differ by that noise, not by quality.
 ### Why this matters
 
 The result is striking: a compact repository centered on one C file, with no
-runtime dependencies and CPU-only inference, lands just 5.3 accuracy points
+runtime dependencies and inference that needs no GPU, lands just 5.3 accuracy points
 behind the flagship model of
 [a startup that raised $40 million](https://www.theregister.com/2026/09/16/typesafe_ai_debuts_model_for_machines/)
 on the same 2,000 decisions. The benchmark's
@@ -490,8 +533,9 @@ Brier, while fast-math improved accuracy, ECE, and throughput. Resident memory
 is about 14.8 GB per process.
 
 OpenJev on an RTX PRO 6000 Blackwell averaged 54.2 ms per one-read row. That
-GPU comparison is context, not a target backend: Jev Bush is intentionally a
-CPU educational implementation.
+GPU comparison is context, not a target: Jev Bush is an educational
+implementation whose optional CUDA path stays bit-identical to the CPU
+reference rather than chasing that speed.
 
 Current limits are one request per process, 4,096 prompt tokens, 64 tokens per
 answer canvas, 4,096 total batched canvas tokens, and one denoising step. The
