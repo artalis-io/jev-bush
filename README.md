@@ -35,8 +35,9 @@ flowchart LR
   decisions on a real diffusion language model.
 - Run inference on CPUs, with the portable scalar build as the reference that
   defines every result. One optional accelerator, CUDA, reproduces that
-  reference exactly; other GPU backends (Metal, Vulkan, WebGPU, ROCm) remain
-  out of scope. Why CUDA is the exception is explained below.
+  reference exactly in strict builds and, like the CPU, trades exactness for
+  speed in fast-math builds; other GPU backends (Metal, Vulkan, WebGPU, ROCm)
+  remain out of scope. Why CUDA is the exception is explained below.
 - Make the CPU path correct and fast through model-specific data layouts,
   vectorization, and OpenMP without turning `jb.c` into a generic framework.
 - Remain compatible with OpenJev's bounded decision semantics and public
@@ -49,7 +50,8 @@ defeated the point: a second implementation to read, a toolkit to install, and
 results that differ from the code a reader studies. The CUDA path was admitted
 only because it avoids all three.
 
-- **It computes the same bits.** It is not an alternative numerical method.
+- **It computes the same bits** in strict builds. It is not an alternative
+  numerical method.
   The kernels are compiled with `--fmad=false`, IEEE division and square
   root, and no flush to zero. Every value is computed in the reference's order
   of operations, with the same portable `expf`, `tanhf` and `exp`. The strict
@@ -76,12 +78,17 @@ needs: no contraction into FMAs, correctly rounded division and square root,
 and denormals kept. Another GPU API would have to prove the same before it
 could join, which is why the others remain out of scope.
 
-Exactness has a price. The kernels give up tensor cores, split sums and FP32
-attention scores, so the GPU runs roughly an order of magnitude below a
+Exactness has a price. The exact kernels give up tensor cores, split sums and
+FP32 attention scores, so the GPU runs roughly an order of magnitude below a
 non-exact engine on the same hardware. Even so, the full 400-row benchmark
 takes 490 s on a DGX Spark's exact GPU path, against about 1,100 s for the
-64-core Threadripper's AVX-512 fast-math build. A faster GPU mode would have
-to give up bit-identity, as fast math does on the CPU, and is not planned.
+64-core Threadripper's AVX-512 fast-math build.
+
+Fast-math builds give up bit-identity on the GPU as they do on the CPU, and
+use the tensor cores (see [Build](#build)). The strict build stays the oracle:
+fast kernels are checked against it within FP32 rounding, and the fast mode's
+quality is judged on the benchmark, where its full 400-row run takes 265 s on
+the same DGX Spark at 66.80% accuracy, against the strict build's 65.95%.
 
 For production GPGPU inference, use
 [OpenJev](https://github.com/razorback16/openjev) or
@@ -96,9 +103,8 @@ cc -O3 -march=native -std=c11 -Wall -Wextra -pedantic \
   -fopenmp jb.c -lm -o jb
 ```
 
-`eval` keeps one immutable, exact-match schema-prefix K/V entry in strict
-builds. The first row for a schema is a cache miss and uses ordinary monolithic
-prefill; later exact token-prefix matches evaluate only the document-dependent
+`eval` keeps one immutable, exact-match schema-prefix K/V entry. The first row
+for a schema is a cache miss and uses ordinary monolithic prefill; later exact token-prefix matches evaluate only the document-dependent
 suffix. `decide` is always monolithic. Output reports `prefix_cache` as
 `off`, `miss`, or `hit`, `cache_tokens`, and the number of tokens actually
 evaluated as `usage.prefill_tokens`.
@@ -123,11 +129,16 @@ results are reported below. Output records `"math":"fast"`; omit the flag for
 strict IEEE behavior and `"math":"strict"` output. Guards against NaN and
 infinity use bit-level tests, so they still hold under `-ffast-math`.
 
-Prefix reuse is deliberately disabled in fast-math builds. Splitting the
-prompt changes temporary-buffer shape and may change fast-math evaluation by
-tiny amounts; NVFP4 activation rounding can amplify that drift into different
-probabilities. The strict build is byte-identical between cached and
-monolithic execution. This is a correctness boundary, not a tunable tolerance.
+Prefix reuse is exact in strict builds: cached and monolithic execution are
+byte-identical. Fast-math builds reuse the prefix too, as an approximation of
+the same kind as fast math itself. Splitting the prompt changes temporary-buffer
+shape and therefore fast-math rounding, and NVFP4 activation rounding can
+amplify that into different probabilities, so a fast build's answer can depend
+on whether the cache held the schema. On the 40 parity rows, cached and
+monolithic results agree on 96.5% of argmaxes (mean total variation 0.035) for
+the fast CUDA build and on 98% (0.026) for fast-math NEON, less than fast
+math's own distance from the strict build. Use the strict build where results must not depend on cache
+state.
 
 Output also records `"kernels"`: `"avx512"` when the build targets AVX-512F
 and AVX-512DQ, `"avx2"` when it targets AVX2 and FMA without AVX-512, and
@@ -181,6 +192,43 @@ checks each GPU operation against the reference's bits and reports
 the build runs on the CPU kernels alone. So it does when the kernels fail to
 compile or load; the library stays silent, and the CLI says why on stderr,
 with NVRTC's log.
+
+Fast-math builds keep the same layout but give up bit-identity on the GPU as
+they do on the CPU:
+
+```sh
+cc -O3 -march=native -ffast-math -std=c11 -Wall -Wextra -pedantic -fopenmp \
+  -DJB_CUDA jb.c -lm -ldl -lpthread -o jb
+```
+
+On GPUs with BF16 tensor cores (compute capability 8.0 or later):
+
+- **Attention** runs as one fused pass over the keys with an online softmax.
+  Its score and value products run on tensor cores, each FP32 operand split
+  into a TF32 high and low part (three MMAs a product), so they stay about
+  as accurate as FP32 products, but scores sum in FP32, not double.
+- **BF16 projections** run on tensor cores with each activation split into
+  three BF16 parts that hold all of its bits, so every product is exact and
+  only the FP32 sums round. Decode-sized launches split the columns across
+  warps to keep the GPU busy.
+- **Norms** sum their squares across a block's threads instead of in order,
+  still in double.
+
+On compute capability 12.x, which has block-scaled FP4 tensor cores, expert
+activations stay packed as NVFP4 (E2M1 values, E4M3 block scales and a global
+scale), and the expert products run on those tensor cores. Their E2M1 and E4M3
+products are exact, so only the FP32 sums round. That needs NVRTC's
+architecture-specific target; when NVRTC rejects it, the other fast kernels
+still compile. The self-test checks each fast operation against the reference
+within FP32 rounding bounds, and strict builds compile and run exactly the
+same kernels as before.
+
+Over eight rows on a DGX Spark, GPU kernel time falls from 8.75 s with the
+exact kernels to 2.89 s. With the fast-math prefix reuse described above, the
+full 400-row benchmark takes 265 s, against 776 s for a fast-math build with
+the exact kernels and no prefix reuse, and 490 s for the strict build. Decoding the answer canvases now dominates, and it reads
+nearly every expert's weights once per 64-token pass, so memory bandwidth,
+not arithmetic, bounds it.
 
 Loading the driver and NVRTC with `dlopen` means the libraries found on the
 usual search path (`LD_LIBRARY_PATH`, `ld.so.conf`) are the code that runs, as
@@ -357,8 +405,9 @@ back to sequential execution, as do groups whose K/V would exceed 4 GiB: each
 document holds its own copy of the shared prefix K/V, about 440 KiB per token.
 Build with `-DJB_MICROBATCH_KV_LIMIT=BYTES` to change that bound. Attention remains isolated per document and per
 answer canvas, while dense projections, routing, and expert buckets span the
-batch. Output records the actual `microbatch` size. Prefix caching and
-microbatching remain disabled by the fast-math correctness boundary.
+batch. Output records the actual `microbatch` size. Strict microbatched
+results are byte-identical to sequential ones; fast-math ones may differ as
+cached ones do.
 
 [`examples/request.json`](examples/request.json) is a small request spanning
 all three decision types. Its response has the structure shown in
@@ -492,9 +541,11 @@ The trusted reference is OpenJev commit `91d5005` with patched vLLM commit
 | Jev Bush NVFP4, strict, one read | 66.10% | 1.5476 | 0.3268 | 0.2540 | 0.4421 |
 | Jev Bush NVFP4, fast-math, one read | 66.80% | 1.5777 | 0.3272 | 0.2454 | 0.4441 |
 | Jev Bush NVFP4, strict, portable `expf`/`tanhf`, one read | 65.95% | 1.4296 | 0.3168 | 0.2442 | 0.4366 |
+| Jev Bush NVFP4, fast-math CUDA, tensor cores, one read | 66.80% | 1.4358 | 0.3167 | 0.2402 | 0.4353 |
 
-The last row is the current strict build, whose output is the same on every
-platform; the rows above it were recorded with the C library's `expf` and
+The strict portable row is the current strict build, whose output is the same
+on every platform, and the last row the fast CUDA build with prefix reuse on a
+DGX Spark; the rows above them were recorded with the C library's `expf` and
 `tanhf` at earlier commits. On the same code and machine, switching to the
 portable functions changed 4.6% of argmaxes and moved accuracy from 65.85% to
 65.95% and log loss from 1.4382 to 1.4296: this model's decisions shift with
@@ -534,8 +585,9 @@ is about 14.8 GB per process.
 
 OpenJev on an RTX PRO 6000 Blackwell averaged 54.2 ms per one-read row. That
 GPU comparison is context, not a target: Jev Bush is an educational
-implementation whose optional CUDA path stays bit-identical to the CPU
-reference rather than chasing that speed.
+implementation whose optional CUDA path is bit-identical to the CPU reference
+in strict builds, and whose fast-math CUDA build trades that for speed as the
+CPU's fast-math build does.
 
 Current limits are one request per process, 4,096 prompt tokens, 64 tokens per
 answer canvas, 4,096 total batched canvas tokens, and one denoising step. The
