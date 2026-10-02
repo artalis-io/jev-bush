@@ -4650,8 +4650,7 @@ static const char *const dg_cuda_source[] = {
     "        }\n"
     "    }\n"
     "}\n"
-    "#endif\n"
-};
+    "#endif\n"};
 
 /* The kernel's struct dg_tile: tokens start..start + count - 1 use matrix
  * group. */
@@ -4697,12 +4696,26 @@ enum {
     DG_CUDA_KERNELS
 };
 
-static const char *const dg_cuda_kernel_names[DG_CUDA_KERNELS] = {
-    "dg_nvfp4_mm",       "dg_bf16_mm",        "dg_rms",   "dg_gelu_mul",  "dg_nvfp4_qdq",
-    "dg_gather",         "dg_moe_tail",       "dg_rope",  "dg_attention", "dg_bf16_mm_wide",
-    "dg_bf16_mm_narrow", "dg_transpose_keys", "dg_route", "dg_group", "dg_attention_fast_local",
-    "dg_attention_fast_full", "dg_bf16_mm_fast", "dg_bf16_mm_fast_small", "dg_nvfp4_pack",
-    "dg_nvfp4_mm_fp4"};
+static const char *const dg_cuda_kernel_names[DG_CUDA_KERNELS] = {"dg_nvfp4_mm",
+                                                                  "dg_bf16_mm",
+                                                                  "dg_rms",
+                                                                  "dg_gelu_mul",
+                                                                  "dg_nvfp4_qdq",
+                                                                  "dg_gather",
+                                                                  "dg_moe_tail",
+                                                                  "dg_rope",
+                                                                  "dg_attention",
+                                                                  "dg_bf16_mm_wide",
+                                                                  "dg_bf16_mm_narrow",
+                                                                  "dg_transpose_keys",
+                                                                  "dg_route",
+                                                                  "dg_group",
+                                                                  "dg_attention_fast_local",
+                                                                  "dg_attention_fast_full",
+                                                                  "dg_bf16_mm_fast",
+                                                                  "dg_bf16_mm_fast_small",
+                                                                  "dg_nvfp4_pack",
+                                                                  "dg_nvfp4_mm_fp4"};
 
 /* The driver and NVRTC entry points, and the process-wide context and
  * kernels. */
@@ -4757,8 +4770,7 @@ static int dg_cuda_symbol(void *lib, const char *name, void *slot) {
  * dg_accel_failure() and allocates with plain malloc. */
 static void dg_cuda_compile(int major, int minor) {
     char arch[48], tile_rows[32], tile_tokens[32], bf16_tokens[32], row_max[32], head_max[32],
-        local_hd[32], threads[32], width[32], experts[32], topk[32], fast[32], fp4[32],
-        fp4_run[32];
+        local_hd[32], threads[32], width[32], experts[32], topk[32], fast[32], fp4[32], fp4_run[32];
     snprintf(fast, sizeof fast, "-DDG_FAST=%d", dg_cuda.fast);
     snprintf(fp4, sizeof fp4, "-DDG_FP4=%d", dg_cuda.fp4);
     snprintf(fp4_run, sizeof fp4_run, "-DDG_FP4_RUN=%d", DG_CUDA_FP4_RUN);
@@ -5025,8 +5037,7 @@ static void dg_cuda_nvfp4_launch(int rows, int cols, long long tiles, void **arg
     int packed = dg_cuda_packed(cols), per_block = packed ? 64 : DG_CUDA_ROWS;
     dg_cuda_launch(packed ? DG_CUDA_NVFP4_MM_FP4 : DG_CUDA_NVFP4_MM,
                    dg_cuda_blocks(rows, per_block, 1u << 30),
-                   dg_cuda_blocks(tiles, packed ? DG_CUDA_FP4_RUN : 1, DG_CUDA_GRID_Y),
-                   128, args);
+                   dg_cuda_blocks(tiles, packed ? DG_CUDA_FP4_RUN : 1, DG_CUDA_GRID_Y), 128, args);
 }
 
 /* The grouped product from the device's own tiles; the grid covers the
@@ -5188,7 +5199,7 @@ static void dg_cuda_attention(DGDevice a, DGDevice q, DGDevice k, DGDevice v, DG
         int segments = n / seq, heads = DG_HEADS, window = DG_LOCAL_WINDOW;
         CUdeviceptr da = a, dq = q, dk = k, dv = v, dko = k_old, dvo = v_old, dso = seg_old,
                     dsb = seg_base;
-        void *args[] = {&da, &dq,  &dk,    &dv,  &dko,    &dvo,  &dso,
+        void *args[] = {&da,  &dq,  &dk,    &dv,  &dko,    &dvo,  &dso,
                         &dsb, &seq, &heads, &kvh, &canvas, &full, &window};
         dg_cuda_launch(hd == DG_FULL_HEAD_DIM ? DG_CUDA_ATTENTION_FAST_FULL
                                               : DG_CUDA_ATTENTION_FAST_LOCAL,
@@ -7781,9 +7792,8 @@ static int dg_systemone(DGModel *m, DGTokenizer *tok, const char *j, size_t len,
 
 /* Returns zero when the rows do not all hit the current exact schema entry;
  * the caller then executes them sequentially, allowing normal cache replace. */
-static int dg_system_batch(DGModel *m, DGTokenizer *tok, const char *const *row,
-                           const size_t *len, int batch,
-                           DGPrefixCache *prefix, DGWorkspace *workspace, char **output,
+static int dg_system_batch(DGModel *m, DGTokenizer *tok, const char *const *row, const size_t *len,
+                           int batch, DGPrefixCache *prefix, DGWorkspace *workspace, char **output,
                            size_t *output_length) {
     if (batch < 2 || !prefix || !prefix->schema)
         return 0;
@@ -8147,7 +8157,6 @@ void jb_session_free(jb_session *session) {
     jb_release(session);
 }
 
-
 static jb_status jb_session_decide_json_call(jb_session *session, const char *request_json,
                                              size_t request_length, char **out_json,
                                              size_t *out_length) {
@@ -8208,15 +8217,15 @@ static jb_status jb_session_decide_json_batch_call(jb_session *session,
         if (request_lengths[i] > JB_MAX_JSON)
             die("batch request JSON is too large");
     }
-    int batched = request_count > 1 &&
-                  dg_system_batch(&session->model->model, &session->model->tokenizer,
-                                  request_json, request_lengths, (int)request_count,
-                                  &session->prefix, &session->workspace, output, length);
+    int batched =
+        request_count > 1 && dg_system_batch(&session->model->model, &session->model->tokenizer,
+                                             request_json, request_lengths, (int)request_count,
+                                             &session->prefix, &session->workspace, output, length);
     if (!batched)
         for (size_t i = 0; i < request_count; i++)
             dg_systemone(&session->model->model, &session->model->tokenizer, request_json[i],
-                         request_lengths[i], &session->prefix, &session->workspace,
-                         &output[i], &length[i]);
+                         request_lengths[i], &session->prefix, &session->workspace, &output[i],
+                         &length[i]);
     jb_frame_leave(&frame);
     *out_json = output;
     *out_lengths = length;
@@ -8783,8 +8792,7 @@ static void dg_test_mm(uint64_t *rs) {
 /* An accelerator's quantized rows, row bytes each, as the reference's
  * floats: the floats themselves, or packed E2M1 nibbles, E4M3 codes and a
  * float global scale, decoded as the reference computes each value. */
-static void dg_test_nvfp4_unpack(float *out, const uint8_t *in, int tokens, int cols,
-                                 size_t row) {
+static void dg_test_nvfp4_unpack(float *out, const uint8_t *in, int tokens, int cols, size_t row) {
     static const float mag[8] = {0, .5f, 1, 1.5f, 2, 3, 4, 6};
     if (row == (size_t)cols * 4) {
         memcpy(out, in, (size_t)tokens * row);
@@ -9083,7 +9091,7 @@ static void dg_test_accel_layer(uint64_t *rs) {
  * sums, which over 2816 terms differ by about 1e-5 relative. */
 #define DG_ACCEL_CLOSE(gotp, wantp, count)                                                         \
     for (size_t i_ = 0; i_ < (size_t)(count); i_++)                                                \
-        jb_check_close(a->name, (gotp)[i_], (wantp)[i_], 1e-4 * (1 + fabs((wantp)[i_])))
+    jb_check_close(a->name, (gotp)[i_], (wantp)[i_], 1e-4 * (1 + fabs((wantp)[i_])))
     /* BF16 product, on a shape for each kernel. */
     dg_mm_data_ref(w, x, yref, tokens, rows, cols);
     a->bf16_mm(dw, dx, dy, tokens, rows, cols);
