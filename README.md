@@ -486,6 +486,46 @@ criteria are placed in the chat template and tokenized as one string, so
 special-token spellings such as `<turn|>` in request text become control
 tokens. Callers that pass third-party text should strip or escape them first.
 
+### Validate and benchmark a build
+
+To check a machine and measure it on the public benchmark, build the strict,
+sequential-canvas and fast variants, run the self-tests, check that strict
+output does not depend on how requests run, then run the benchmark with both
+read policies and score it. On Linux with OpenMP (add `-DJB_CUDA ... -ldl
+-lpthread` for the CUDA accelerator):
+
+```sh
+# Builds; the self-test reports the kernels in use, such as "kernels":"avx512".
+cc -O3 -march=native -std=c11 -Wall -Wextra -pedantic -fopenmp jb.c -lm -o jb-strict
+cc -O3 -march=native -std=c11 -fopenmp -DJB_CANVAS_SEQUENTIAL jb.c -lm -o jb-strict-seq
+cc -O3 -march=native -ffast-math -std=c11 -Wall -Wextra -pedantic -fopenmp jb.c -lm -o jb-fast
+./jb-strict --selftest && ./jb-fast --selftest
+
+# Strict output must match however requests run.
+OMP_NUM_THREADS=64 python3 tools/check_strict_invariance.py ./jb-strict MODEL_DIR \
+  typed-decisions.jsonl --sequential ./jb-strict-seq
+
+# The benchmark: two workers of half the cores each, one read a row and
+# automatic reads, fast and strict builds.
+for policy in one auto; do
+  extra=""; [ "$policy" = one ] && extra="--samples 1"
+  for b in fast strict; do
+    start=$(date +%s)
+    OMP_NUM_THREADS=32 OMP_PROC_BIND=spread OMP_PLACES=cores \
+      python3 tools/run_openjev_eval.py ./jb-$b MODEL_DIR typed-decisions.jsonl \
+      pred-$b-$policy.jsonl --jobs 2 $extra
+    echo "$b $policy $(( $(date +%s) - start )) s" | tee -a times.txt
+    python3 tools/score_openjev.py typed-decisions.jsonl pred-$b-$policy.jsonl > score-$b-$policy.json
+    python3 tools/summarize_eval.py pred-$b-$policy.jsonl > summary-$b-$policy.txt
+  done
+done
+```
+
+Set the thread counts for the machine: the values above are for 64 cores.
+Strict CPU runs take far longer than fast ones; skip them when only
+throughput matters. [Reproduce the benchmark](#reproduce-the-benchmark)
+explains fetching `typed-decisions.jsonl` and what the scores mean.
+
 ## Decision semantics
 
 Jev Bush reproduces OpenJev's bounded read:
