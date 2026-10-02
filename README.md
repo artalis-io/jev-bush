@@ -368,6 +368,19 @@ and prompt construction) without a model. CI runs it under AddressSanitizer
 and UndefinedBehaviorSanitizer against the malformed requests in
 [`tools/check_requests.sh`](tools/check_requests.sh).
 
+Strict output must not depend on how a request runs, which the self-test
+cannot check without the model.
+[`tools/check_strict_invariance.py`](tools/check_strict_invariance.py) runs a
+strict build on the first rows of a request file as `eval` (prefix-cache
+hits), as `eval` with `JB_MICROBATCH=4`, and as `decide` per row (monolithic
+prefill), and, given a second strict build made with `-DJB_CANVAS_SEQUENTIAL`,
+with every canvas and read decoded on its own; it exits nonzero unless every
+answer object matches:
+
+```sh
+python3 tools/check_strict_invariance.py ./jb MODEL_DIR requests.jsonl --sequential ./jb-seq
+```
+
 [`fuzz/fuzz_json.c`](fuzz/fuzz_json.c) is a libFuzzer target for the JSON
 reader and request validation. Besides sanitizer findings, it checks that
 canonical JSON output re-parses to identical bytes. CI fuzzes it for two
