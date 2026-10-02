@@ -285,6 +285,10 @@ session's most recent decide call from whichever thread reads it, so it stays
 correct when a session moves between threads. `jb_last_error()` describes the
 calling thread's most recent failure, which covers calls without a session:
 model loading and session creation.
+Filesystem open/read failures return `JB_ERROR_IO`; a readable but unsupported
+or malformed checkpoint returns `JB_ERROR_MODEL`; malformed caller data returns
+`JB_ERROR_REQUEST`; allocation and engine-invariant failures retain their
+distinct statuses.
 
 Typed sessions copy their decision schema at creation. `jb_session_decide()`
 accepts a JSON state value plus an optional stable identifier. The equivalent
@@ -293,6 +297,21 @@ returns its deterministic machine-readable result. Batch variants preserve
 input order and use the existing cross-document microbatch path when the exact
 schema prefix permits it. See [`examples/library.c`](examples/library.c)
 for a complete typed example.
+
+Call `jb_api_version()` before using a dynamically loaded library and require
+`JB_API_VERSION`. `JB_SHARED` declares the public symbol visibility;
+`JB_BUILD_SHARED` additionally exports symbols when building a Windows DLL.
+The v0 API is source-stable, not a promise of binary compatibility across
+different v0 releases: public value structs are intentionally small but are
+not size-versioned. Compile the application and library from the same header.
+CPU ISA selection is likewise a build property in v0. A binary built with
+`-march=native` must only run on compatible CPUs; build separate scalar, AVX2,
+AVX-512, or NEON artifacts where deployment portability matters.
+
+The API deliberately exposes no thread-count, workspace-budget, or memory-size
+controls. OpenMP policy belongs to the embedding process, and session scratch
+grows to the largest accepted request. Applications needing hard resource
+isolation should enforce it at the process boundary.
 
 Internally, model execution uses one small `DGKernelOps` table for BF16 GEMM,
 NVFP4 quantization/GEMM, RMS normalization, and attention dots. Scalar, AVX2,
@@ -391,17 +410,38 @@ answer object matches:
 python3 tools/check_strict_invariance.py ./jb MODEL_DIR requests.jsonl --sequential ./jb-seq
 ```
 
-For a machine with the model, the manual model-backed regression runs the
-checked-in request and verifies canonical SHA-256 hashes for both its answer
-objects and token accounting:
+For a machine with the model, the manual model-backed regression first verifies
+the request, configuration, tokenizer, and both model shards against
+[`benchmarks/golden-fixture.json`](benchmarks/golden-fixture.json). It then
+verifies canonical answer/token-accounting hashes and runs the same request
+through the typed C API, requiring exactly equal candidate probabilities:
 
 ```sh
 tools/check_model_golden.py ./jb MODEL_DIR
 ```
 
+Pass `--library ./libjb.so` to test an already built shared library; otherwise
+the script builds a temporary strict native library. Before a release, the
+full manual gate also exercises 40 real rows through cached, monolithic,
+microbatched, sequential-canvas, and optionally strict CUDA execution:
+
+```sh
+tools/release_model_check.sh ./jb ./jb-seq ./libjb.so MODEL_DIR requests.jsonl [./jb-cuda]
+```
+
 This deliberately stays out of hosted CI: downloading and executing a 27B
 model for every source change is disproportionate. Run it on the self-hosted
 CPU/GPU benchmark machines before a release.
+
+Capture the provenance of every accuracy or benchmark run alongside its raw
+output. The manifest records the source revision and dirty state, executable,
+model and dataset hashes, compiler, flags, host topology, relevant environment,
+and GPU inventory:
+
+```sh
+tools/capture_run_manifest.py ./jb MODEL_DIR requests.jsonl \
+  --compiler-flags='-O3 -march=native -std=c11 -fopenmp' > run-manifest.json
+```
 
 [`fuzz/fuzz_json.c`](fuzz/fuzz_json.c) is a libFuzzer target for the JSON
 reader and request validation. Besides sanitizer findings, it checks that
@@ -469,10 +509,11 @@ all three decision types. Its response has the structure shown in
 [`examples/response-shape.json`](examples/response-shape.json); probabilities
 and timings depend on the checkpoint and read policy.
 
-`MODEL_DIR` is either the public `google/diffusion-gemma-26b-it` BF16
-checkpoint or NVIDIA's NVFP4 variant. It must contain `config.json`,
-`model.safetensors.index.json`, `tokenizer.json`, and all referenced
-safetensor shards.
+`MODEL_DIR` is either the public `google/diffusiongemma-26B-A4B-it` BF16
+checkpoint or `nvidia/DiffusionGemma-26B-A4B-IT-NVFP4`. Execution reads
+`tokenizer.json` and the model's exact fixed shard layout directly: two shards
+for NVFP4 or eleven for BF16. The golden manifest additionally authenticates
+`config.json` as checkpoint provenance.
 
 The input is OpenJev's System One request shape:
 

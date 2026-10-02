@@ -18,6 +18,7 @@
 #include <math.h>
 #include <setjmp.h>
 #include <stdarg.h>
+#include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -267,6 +268,18 @@ static void die2(const char *a, const char *b) {
     exit(2);
 }
 
+static void die_status(jb_status status, const char *message) {
+    if (jb_error_frame)
+        jb_error_status = status;
+    die(message);
+}
+
+static void die2_status(jb_status status, const char *a, const char *b) {
+    if (jb_error_frame)
+        jb_error_status = status;
+    die2(a, b);
+}
+
 #ifndef JB_NO_MAIN
 static void flush_output(void) {
     if (fflush(stdout) == EOF || ferror(stdout))
@@ -468,7 +481,7 @@ static size_t jb_size_mul(size_t a, size_t b) {
 
 static size_t jb_align_up(size_t n, size_t alignment) {
     if (!alignment || (alignment & (alignment - 1)))
-        die("invalid arena alignment");
+        die_status(JB_ERROR_INTERNAL, "invalid arena alignment");
     return jb_size_add(n, alignment - 1) & ~(alignment - 1);
 }
 
@@ -489,7 +502,7 @@ static void *jb_arena_alloc(JBArena *a, size_t count, size_t element_size, int c
     size_t bytes = jb_size_mul(count, element_size);
     size_t end = jb_size_add(start, bytes);
     if (end > a->size)
-        die("inference workspace plan is too small");
+        die_status(JB_ERROR_INTERNAL, "inference workspace plan is too small");
     void *p = a->base + start;
     a->used = end;
     if (end > a->peak)
@@ -505,7 +518,7 @@ static size_t jb_arena_mark(const JBArena *a) {
 
 static void jb_arena_reset(JBArena *a, size_t mark) {
     if (mark > a->used)
-        die("invalid arena reset");
+        die_status(JB_ERROR_INTERNAL, "invalid arena reset");
     a->used = mark;
 }
 
@@ -586,9 +599,8 @@ static uint64_t now_ns(void) {
     if (!clock_gettime(CLOCK_MONOTONIC, &t))
         return (uint64_t)t.tv_sec * 1000000000ull + (uint64_t)t.tv_nsec;
 #endif
-    struct timespec fallback;
-    timespec_get(&fallback, TIME_UTC);
-    return (uint64_t)fallback.tv_sec * 1000000000ull + (uint64_t)fallback.tv_nsec;
+    die_status(JB_ERROR_INTERNAL, "monotonic clock unavailable");
+    return 0;
 }
 
 static void map_file(FileMap *m, const char *path) {
@@ -597,10 +609,10 @@ static void map_file(FileMap *m, const char *path) {
     m->hf = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
     if (m->hf == INVALID_HANDLE_VALUE) {
         m->hf = NULL;
-        die2("open", path);
+        die2_status(JB_ERROR_IO, "open", path);
     }
     if (!GetFileSizeEx(m->hf, &z) || z.QuadPart <= 0)
-        die("GetFileSizeEx failed");
+        die_status(JB_ERROR_IO, "GetFileSizeEx failed");
     m->size = (uint64_t)z.QuadPart;
     if (m->size > SIZE_MAX)
         die("model is too large for this address space");
@@ -613,14 +625,14 @@ static void map_file(FileMap *m, const char *path) {
     int fd = open(path, O_RDONLY);
     struct stat st;
     if (fd < 0)
-        die2("open", path);
+        die2_status(JB_ERROR_IO, "open", path);
     if (fstat(fd, &st)) {
         close(fd);
-        die2("open", path);
+        die2_status(JB_ERROR_IO, "open", path);
     }
     if (st.st_size <= 0 || (uintmax_t)st.st_size > SIZE_MAX) {
         close(fd);
-        die("invalid model size");
+        die_status(JB_ERROR_IO, "invalid model size");
     }
     m->size = (uint64_t)st.st_size;
     m->map = mmap(NULL, (size_t)m->size, PROT_READ, MAP_PRIVATE, fd, 0);
@@ -634,11 +646,11 @@ static void map_file(FileMap *m, const char *path) {
         m->map = xmalloc((size_t)m->size);
         FILE *f = fopen(path, "rb");
         if (!f)
-            die2("open", path);
+            die2_status(JB_ERROR_IO, "open", path);
         size_t got = fread(m->map, 1, (size_t)m->size, f);
         fclose(f);
         if (got != (size_t)m->size)
-            die("short read");
+            die_status(JB_ERROR_IO, "short read");
     }
 }
 
@@ -1590,10 +1602,10 @@ static Merge *dgt_mfind(DGTokenizer *d, uint32_t a, uint32_t b) {
 static char *read_whole(const char *path, size_t *n) {
     FILE *f = fopen(path, "rb");
     if (!f)
-        die2("cannot open", path);
+        die2_status(JB_ERROR_IO, "cannot open", path);
     if (fseek(f, 0, SEEK_END) || (*n = (size_t)ftell(f)) > JB_MAX_JSON || fseek(f, 0, SEEK_SET)) {
         fclose(f);
-        die2("invalid JSON file size", path);
+        die2_status(JB_ERROR_IO, "invalid JSON file size", path);
     }
     char *p = jb_try_allocate(*n + 1, 0);
     if (!p) {
@@ -1602,7 +1614,7 @@ static char *read_whole(const char *path, size_t *n) {
     }
     size_t got = fread(p, 1, *n, f);
     if (fclose(f) || got != *n)
-        die2("cannot read", path);
+        die2_status(JB_ERROR_IO, "cannot read", path);
     p[*n] = 0;
     return p;
 }
@@ -5647,7 +5659,7 @@ typedef struct {
 
 static JBArena *dg_workspace_begin(DGWorkspace *workspace, size_t required) {
     if (workspace->active)
-        die("inference workspace is already active");
+        die_status(JB_ERROR_INTERNAL, "inference workspace is already active");
     jb_arena_reserve(&workspace->arena, &workspace->capacity, required);
     workspace->active = 1;
     return &workspace->arena;
@@ -5656,13 +5668,13 @@ static JBArena *dg_workspace_begin(DGWorkspace *workspace, size_t required) {
 static void dg_workspace_end(DGWorkspace *workspace) {
     if (!workspace->active || workspace->arena.used ||
         workspace->arena.peak != workspace->arena.size)
-        die("inference workspace plan mismatch");
+        die_status(JB_ERROR_INTERNAL, "inference workspace plan mismatch");
     workspace->active = 0;
 }
 
 static void dg_workspace_destroy(DGWorkspace *workspace) {
     if (workspace->active || workspace->kv_active || workspace->control_active)
-        die("destroying active inference workspace");
+        die_status(JB_ERROR_INTERNAL, "destroying active inference workspace");
     if (workspace->arena.allocation)
         jb_arena_free(&workspace->arena);
     if (workspace->kv_arena.allocation)
@@ -5829,7 +5841,7 @@ static void dg_nvfp4_qdq_accel(const DGModel *m, DGDevice out, DGDevice in, int 
 
 static JBArena *dg_control_begin(DGWorkspace *workspace, size_t required) {
     if (workspace->control_active)
-        die("worker control storage is already active");
+        die_status(JB_ERROR_INTERNAL, "worker control storage is already active");
     jb_arena_reserve(&workspace->control_arena, &workspace->control_capacity, required);
     workspace->control_active = 1;
     return &workspace->control_arena;
@@ -5839,7 +5851,7 @@ static void dg_control_end(DGWorkspace *workspace) {
     if (!workspace->control_active ||
         workspace->control_arena.used != workspace->control_arena.size ||
         workspace->control_arena.peak != workspace->control_arena.size)
-        die("corrupt worker control storage");
+        die_status(JB_ERROR_INTERNAL, "corrupt worker control storage");
     workspace->control_active = 0;
 }
 
@@ -5895,7 +5907,7 @@ static void dg_kv_init(JBArena *storage, DGKV *kv, int documents, const int *len
 static void dg_worker_kv_begin(DGWorkspace *workspace, DGKV *kv, int documents,
                                const int *lengths) {
     if (workspace->kv_active)
-        die("worker K/V storage is already active");
+        die_status(JB_ERROR_INTERNAL, "worker K/V storage is already active");
     size_t required = dg_kv_bytes(documents, lengths);
     jb_arena_reserve(&workspace->kv_arena, &workspace->kv_capacity, required);
     workspace->kv_active = 1;
@@ -5906,7 +5918,7 @@ static void dg_worker_kv_end(DGWorkspace *workspace, DGKV *kv, int documents) {
     JB_TICK(kv_free_start);
     if (!workspace->kv_active || workspace->kv_arena.used != workspace->kv_arena.size ||
         workspace->kv_arena.peak != workspace->kv_arena.size)
-        die("corrupt worker K/V ownership");
+        die_status(JB_ERROR_INTERNAL, "corrupt worker K/V ownership");
     workspace->kv_active = 0;
     memset(kv, 0, jb_size_mul(jb_size_mul((size_t)documents, DG_L), sizeof *kv));
     JB_TO(kv_free, kv_free_start);
@@ -6910,33 +6922,80 @@ JB_PRINTF(2, 3) static void db_fmt(DGBuf *b, const char *fmt, ...) {
     b->n += (size_t)n;
 }
 
-/* JSON numbers always use '.', but the printf family writes the current
- * locale's decimal point, and a host application may have set one (for
- * example "," for de-DE). Format each number alone and restore '.'. */
+/* The printf family writes the process locale's decimal separator. JSON does
+ * not: remove the one punctuation sequence between the mantissa's digits and
+ * replace it with '.'. No locale lookup is involved, so another thread may
+ * call setlocale without racing this conversion. */
 static void db_decimal(DGBuf *b, const char *z, int n) {
     if (n < 0 || n >= 64)
         die("number formatting failed");
-    const char *point = localeconv()->decimal_point;
-    size_t point_length = point ? strlen(point) : 0, o = 0;
+    size_t o = 0;
+    int exponent = 0, point = 0;
     char out[64];
-    for (const char *c = z; *c;) {
-        if (point_length && !strncmp(c, point, point_length)) {
+    for (const unsigned char *c = (const unsigned char *)z; *c; c++) {
+        if ((*c >= '0' && *c <= '9') || *c == '+' || *c == '-')
+            out[o++] = (char)*c;
+        else if (*c == 'e' || *c == 'E') {
+            exponent = 1;
+            out[o++] = (char)*c;
+        } else if (!exponent && !point) {
+            point = 1;
             out[o++] = '.';
-            c += point_length;
-        } else
-            out[o++] = *c++;
+        }
     }
     db_mem(b, out, o);
 }
 
+#if defined(_WIN32)
+typedef _locale_t JBLocale;
+#else
+typedef locale_t JBLocale;
+#endif
+
+static JBLocale jb_numeric_locale(void) {
+    static JBLocale locale;
+    static atomic_int state;
+    int expected = 0;
+    if (atomic_compare_exchange_strong_explicit(&state, &expected, 1, memory_order_acq_rel,
+                                                memory_order_acquire)) {
+#if defined(_WIN32)
+        locale = _create_locale(LC_NUMERIC, "C");
+#else
+        locale = newlocale(LC_NUMERIC_MASK, "C", (locale_t)0);
+#endif
+        atomic_store_explicit(&state, locale ? 2 : -1, memory_order_release);
+    } else
+        while (atomic_load_explicit(&state, memory_order_acquire) == 1) {
+        }
+    if (atomic_load_explicit(&state, memory_order_acquire) != 2)
+        die_status(JB_ERROR_INTERNAL, "cannot create numeric locale");
+    return locale;
+}
+
+static int jb_numeric_format(char *out, size_t size, double value, int milliseconds) {
+#if defined(_WIN32)
+    _locale_t locale = jb_numeric_locale();
+    int result = milliseconds ? _snprintf_l(out, size, "%.3f", locale, value)
+                              : _snprintf_l(out, size, "%.17g", locale, value);
+    return result;
+#else
+    locale_t locale = jb_numeric_locale();
+    locale_t previous = uselocale(locale);
+    int result = milliseconds ? snprintf(out, size, "%.3f", value)
+                              : snprintf(out, size, "%.17g", value);
+    uselocale(previous);
+    return result;
+#endif
+}
+
 static void db_number(DGBuf *b, double value) {
     char z[64];
-    db_decimal(b, z, snprintf(z, sizeof z, "%.17g", value));
+    db_decimal(b, z, jb_numeric_format(z, sizeof z, value, 0));
 }
 
 static void db_millis(DGBuf *b, double ms) {
     char z[64];
-    db_decimal(b, z, snprintf(z, sizeof z, "%.3f", ms));
+    db_decimal(b, z, jb_numeric_format(z, sizeof z, ms, 1));
 }
 
 static void db_json_string(DGBuf *b, const char *s, int ascii) {
@@ -8187,6 +8246,10 @@ const char *jb_version(void) {
     return JB_VERSION;
 }
 
+uint32_t jb_api_version(void) {
+    return JB_API_VERSION;
+}
+
 const char *jb_status_string(jb_status status) {
     static const char *const text[] = {"ok",
                                        "invalid argument",
@@ -8479,26 +8542,25 @@ void jb_free(void *allocation) {
     jb_release(allocation);
 }
 
-/* strtod follows the locale's decimal point; results always use '.'. */
+/* Parse the JSON number grammar directly, independent of the process locale. */
 static double jb_token_double(const char *json, const JTok *token) {
-    const char *point = localeconv()->decimal_point;
-    size_t point_length = point ? strlen(point) : 0, o = 0;
-    char z[128];
-    if (token->type != JT_PRIMITIVE || !point_length || token->end - token->start > 32)
+    if (token->type != JT_PRIMITIVE || token->end <= token->start ||
+        token->end - token->start > 32)
         die("invalid numeric result field");
-    for (int i = token->start; i < token->end; i++) {
-        if (o + point_length >= sizeof z)
-            die("invalid numeric result field");
-        if (json[i] == '.') {
-            memcpy(z + o, point, point_length);
-            o += point_length;
-        } else
-            z[o++] = json[i];
-    }
-    z[o] = 0;
-    char *end = NULL;
-    double value = strtod(z, &end);
-    if (end != z + o || !jb_finite(value))
+    char text[33], *end = NULL;
+    size_t length = (size_t)(token->end - token->start);
+    memcpy(text, json + token->start, length);
+    text[length] = 0;
+#if defined(_WIN32)
+    _locale_t locale = jb_numeric_locale();
+    double value = _strtod_l(text, &end, locale);
+#else
+    locale_t locale = jb_numeric_locale();
+    locale_t previous = uselocale(locale);
+    double value = strtod(text, &end);
+    uselocale(previous);
+#endif
+    if (end != text + length || !jb_finite(value))
         die("invalid numeric result field");
     return value;
 }
@@ -10027,6 +10089,13 @@ static void dg_test_locale_numbers(void) {
 }
 
 static int selftest(void) {
+    uint64_t clock_previous = now_ns();
+    for (int i = 0; i < 1000; i++) {
+        uint64_t clock_current = now_ns();
+        if (clock_current < clock_previous)
+            die("monotonic clock self-test failed");
+        clock_previous = clock_current;
+    }
     size_t arena_bytes = 0;
     jb_workspace_plan(&arena_bytes, 7, sizeof(char));
     jb_workspace_plan(&arena_bytes, 3, sizeof(uint32_t));
@@ -10196,6 +10265,10 @@ static int selftest(void) {
         public_result->prefill_tokens != 3 || public_result->total_ms != 2.5)
         die("public result self-test failed");
     jb_result_free(public_result);
+    jb_model *missing_model = NULL;
+    if (jb_model_load("__jev_bush_missing_model__", &missing_model) != JB_ERROR_IO ||
+        missing_model)
+        die("public I/O status self-test failed");
     jb_model dummy_model = {0};
     jb_session *public_session = NULL;
     if (jb_session_create_json(&dummy_model, "[]", 2, &public_session) != JB_ERROR_REQUEST ||

@@ -958,8 +958,15 @@ K/V and scratch state, and the model is immutable and shareable.
 
 Release validation consists of hosted compiler, sanitizer, fuzz, hardening and
 kernel jobs plus the manual model-backed golden check on the benchmark rigs.
+The golden manifest pins the request, tokenizer, configuration and model-shard
+hashes; its typed-library run must reproduce the JSON API probabilities. The
+40-row release gate additionally covers cached, monolithic, microbatched,
+sequential-canvas and, when supplied, strict CUDA execution. Every published
+measurement carries the manifest emitted by `tools/capture_run_manifest.py`.
 Future arithmetic or layout changes need a profile demonstrating a dominant
 cost, bitwise strict fixtures, the model golden hashes, and refreshed benchmark
 numbers. New models, generic formats, servers, additional GPU APIs and broad
 framework abstractions remain outside v0 rather than accumulating behind the
-frozen interface.
+frozen interface. v0 promises source compatibility when application and
+library use the same header; a stable cross-release binary ABI and runtime CPU
+multiversioning are post-v0 library work, not claims made by this freeze.

@@ -126,7 +126,7 @@ jobs:
           ./library missing-model 2>err.txt || rc=$?
           cat err.txt
           test "$rc" -eq 1
-          grep -q '^jev-bush: model error: open: ' err.txt
+          grep -q '^jev-bush: I/O error: open: ' err.txt
 
   # GitHub's x86 runners may lack AVX-512, so run those kernels under Intel's
   # Software Development Emulator, pinned by URL and checksum.
@@ -243,8 +243,19 @@ jobs:
           ./library-asan missing-model 2>err.txt || rc=$?
           cat err.txt
           test "$rc" -eq 1
-          grep -q '^jev-bush: model error: open: ' err.txt
+          grep -q '^jev-bush: I/O error: open: ' err.txt
           ! grep -q Sanitizer err.txt
+
+  fixture-manifest:
+    name: Golden fixture manifest
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify request fixture and shared-library ABI surface
+        run: |
+          echo '7eebd20b705f1f644adf6ee56148f753a46f8ceba75cc0f5a3e2d3c8951c76b0  examples/request.json' | sha256sum -c -
+          cc -O2 -std=c11 -Wall -Wextra -pedantic -Werror -fPIC -shared -DJB_NO_MAIN -DJB_SHARED -DJB_BUILD_SHARED jb.c -lm -o libjb.so
+          nm -D --defined-only libjb.so | grep -q ' jb_api_version$'
 
   hardening:
     name: Hardened Linux build

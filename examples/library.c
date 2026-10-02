@@ -3,6 +3,10 @@
 #include <stdio.h>
 
 int main(int argc, char **argv) {
+    if (jb_api_version() != JB_API_VERSION) {
+        fprintf(stderr, "jev-bush: incompatible library API\n");
+        return 1;
+    }
     if (argc != 2) {
         fprintf(stderr, "usage: %s MODEL_DIR\n", argv[0]);
         return 2;

@@ -1,0 +1,20 @@
+{
+  "schema_version": 1,
+  "request": {
+    "path": "examples/request.json",
+    "sha256": "7eebd20b705f1f644adf6ee56148f753a46f8ceba75cc0f5a3e2d3c8951c76b0"
+  },
+  "model": {
+    "id": "nvidia/DiffusionGemma-26B-A4B-IT-NVFP4",
+    "files": {
+      "config.json": "b4f650bd55f6c6ccd55656e27a7967c72ac28f1f3e315edaa29d6f5eebd05fde",
+      "tokenizer.json": "cc8d3a0ce36466ccc1278bf987df5f71db1719b9ca6b4118264f45cb627bfe0f",
+      "model-00001-of-00002.safetensors": "24f1257810848d296cc42fd2f6186c8dd6c2a562482c4c1bc8463a087a2c6554",
+      "model-00002-of-00002.safetensors": "5015731988fbfc21042032ed9ea4c9af335bfe70bcd7529d09b8f2438d5fdd0e"
+    }
+  },
+  "result": {
+    "answers": "c1c71b45ed93789f35bc2621bae9f3c06abd7ea89f7e1483500a9cc2d28391b2",
+    "usage": "eda840cf5b7aabc1065507c1c5bc64581504b4c489f7d8fa87355e6f970e3318"
+  }
+}
