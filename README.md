@@ -34,10 +34,10 @@ flowchart LR
 - Be a small, readable, educational implementation of direct probabilistic
   decisions on a real diffusion language model.
 - Run inference on CPUs, with the portable scalar build as the reference that
-  defines every result. One optional accelerator, CUDA, reproduces that
-  reference exactly in strict builds and, like the CPU, trades exactness for
-  speed in fast-math builds; other GPU backends (Metal, Vulkan, WebGPU, ROCm)
-  remain out of scope. Why CUDA is the exception is explained below.
+  defines every result. Strict AVX-512 and one optional accelerator, CUDA,
+  reproduce that reference exactly; fast-math and AVX2 trade exactness for
+  speed. Other GPU backends (Metal, Vulkan, WebGPU, ROCm) remain out of scope.
+  Why CUDA is the exception is explained below.
 - Make the CPU path correct and fast through model-specific data layouts,
   vectorization, and OpenMP without turning `jb.c` into a generic framework.
 - Remain compatible with OpenJev's bounded decision semantics and public
@@ -107,6 +107,14 @@ cc -O3 -march=native -std=c11 -Wall -Wextra -pedantic \
   -fopenmp jb.c -lm -o jb
 ```
 
+On AVX-512, this strict build repacks BF16 and NVFP4 matrices once at model
+load into a row-lane image and reports `avx512-exact`. Each vector lane owns
+one output row and accumulates in the scalar reference order, so model results
+are bit-identical to `-DJB_SCALAR`. The current in-memory image favors a simple
+kernel: on the 27B NVFP4 model it raises peak resident memory from about 17 GB
+to about 41 GB. Add `-ffast-math` to retain the compact model mapping and the
+faster reduction-order AVX-512 kernels when exactness is not required.
+
 `eval` keeps one immutable, exact-match schema-prefix K/V entry. The first row
 for a schema is a cache miss and uses ordinary monolithic prefill; later exact token-prefix matches evaluate only the document-dependent
 suffix. `decide` is always monolithic. Output reports `prefix_cache` as
@@ -114,11 +122,11 @@ suffix. `decide` is always monolithic. Output reports `prefix_cache` as
 evaluated as `usage.prefill_tokens`.
 
 Strict arithmetic defines canonical Jev Bush semantics: reproducible output
-must not depend on batching or temporary-buffer shape. It does not depend on
-the platform either: strict builds compute `expf`, `tanhf` and the router's
-double `exp` with their own portable implementations instead of the C
-library's, so every strict build and the CUDA accelerator produce the same
-bits, which the self-test checks with recorded hashes.
+must not depend on batching or temporary-buffer shape. Scalar, NEON, exact
+AVX-512 and strict CUDA reproduce the same bits. AVX2 remains deterministic
+but uses a different reduction order. All strict builds compute `expf`,
+`tanhf` and the router's double `exp` with portable implementations instead of
+the C library; the self-test checks those functions with recorded hashes.
 
 Linux, approximate highest-throughput experiment:
 
@@ -357,7 +365,8 @@ $ ./jb --selftest
 
 The selftest also checks every compute kernel, both the portable reference and
 the one selected for the build, against a double-precision oracle on random
-data, and reports which set it tested: `scalar`, `avx2`, or `avx512`. CI runs
+data, and reports which set it tested: `scalar`, `avx2`, `avx512-exact`, or
+`avx512`. CI runs
 it natively on x86-64 (scalar and AVX2) and ARM64, and under Intel's Software
 Development Emulator for the AVX-512 kernels. `jb --bench-kernels` reports
 kernel throughput at model shapes next to a memory-read baseline, for comparing

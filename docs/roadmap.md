@@ -319,9 +319,28 @@ partly fits the 64 MB L3, so that figure may be cache-assisted. Every multi-toke
 compute-bound far below the CPU's roughly 1.9 TFLOP/s FP32 FMA peak, and the
 NVFP4 expert path, the largest share of model time in the profiles above,
 streams weights at under a tenth of the available bandwidth even for one token.
-Strict output is deterministic for each selected backend. The AVX2 and AVX-512
-tiers use their own FP32 reduction orders and are therefore not promised to be
-byte-identical to the reference; the NEON tier is.
+Strict output is deterministic for each selected backend. AVX2 uses its own
+FP32 reduction order and is therefore not promised to be byte-identical to the
+reference; the NEON and strict AVX-512 tiers are.
+
+### AVX-512: exact row-lane execution
+
+Strict AVX-512 now transforms matrices once at load. BF16 is stored as
+`[row-tile][column][16 rows]`; NVFP4 keeps eight packed bytes per column for
+16 rows and expands E4M3 block scales to 16 FP32 lane scales. A vector lane
+therefore owns one output row, and separate multiply and add instructions
+reproduce the scalar accumulation order. Fast-math keeps the original compact
+weights and horizontal-reduction kernels.
+
+Randomized transformed-kernel fixtures are bit-identical to the scalar BF16
+and NVFP4 references. On one real 486-token row, all five answer objects also
+matched the scalar build exactly (zero total variation and zero maximum
+probability difference). On the 9980X at 32 threads, strict transformed BF16
+reached 3.55 TFLOP/s at 256 tokens and NVFP4 reached 2.26 TFLOP/s at 64 tokens.
+The complete row took 3.16 s internally versus 3.07 s for the previous
+non-exact strict AVX-512 path, while scalar took 37.94 s. This first simple
+image increases peak RSS from about 16.9 GB to 41.4 GB; reducing that footprint
+without changing the arithmetic is future work.
 
 ### NEON: bit-identical to the reference
 
