@@ -39,7 +39,7 @@
  * reference kernels on any CPU: the oracle build other backends are checked
  * against. */
 #if defined(JB_SCALAR)
-#elif defined(__AVX512F__) && defined(__AVX512DQ__)
+#elif defined(__AVX2__) && defined(__AVX512F__) && defined(__AVX512DQ__) && defined(__AVX512BW__)
 #define JB_AVX512 1
 #include <immintrin.h>
 #elif defined(__AVX2__) && (defined(__FMA__) || (defined(_MSC_VER) && !defined(__clang__)))
@@ -575,9 +575,20 @@ JB_PRINTF(3, 4) static void jb_path(char *out, size_t cap, const char *fmt, ...)
 }
 
 static uint64_t now_ns(void) {
+#if defined(_WIN32)
+    LARGE_INTEGER counter, frequency;
+    if (QueryPerformanceCounter(&counter) && QueryPerformanceFrequency(&frequency) &&
+        frequency.QuadPart > 0)
+        return (uint64_t)((long double)counter.QuadPart * 1000000000.0L /
+                          (long double)frequency.QuadPart);
+#else
     struct timespec t;
-    timespec_get(&t, TIME_UTC);
-    return (uint64_t)t.tv_sec * 1000000000ull + t.tv_nsec;
+    if (!clock_gettime(CLOCK_MONOTONIC, &t))
+        return (uint64_t)t.tv_sec * 1000000000ull + (uint64_t)t.tv_nsec;
+#endif
+    struct timespec fallback;
+    timespec_get(&fallback, TIME_UTC);
+    return (uint64_t)fallback.tv_sec * 1000000000ull + (uint64_t)fallback.tv_nsec;
 }
 
 static void map_file(FileMap *m, const char *path) {
@@ -1000,7 +1011,7 @@ typedef struct {
 typedef struct {
     const uint8_t *w, *s;
     const uint8_t *exact_w;
-    const float *exact_s;
+    const uint8_t *exact_s;
     float global;
 } DGNvMatrix;
 
@@ -1989,9 +2000,7 @@ static void dg_exact_pack_bf16(DGTensor *t) {
                        t->data + ((size_t)(r + lane) * cols + c) * 2, 2);
 }
 
-static void dg_exact_pack_nvfp4(DGTensor *w, DGTensor *s, const DGTensor *g, int rows, int cols) {
-    float global;
-    memcpy(&global, g->data, sizeof global);
+static void dg_exact_pack_nvfp4(DGTensor *w, DGTensor *s, int rows, int cols) {
     for (int r = 0; r < rows; r += DG_EXACT_ROWS) {
         for (int c = 0; c < cols; c++)
             for (int lane = 0; lane < DG_EXACT_ROWS / 2; lane++) {
@@ -2005,9 +2014,9 @@ static void dg_exact_pack_nvfp4(DGTensor *w, DGTensor *s, const DGTensor *g, int
             }
         for (int b = 0; b < cols / 16; b++)
             for (int lane = 0; lane < DG_EXACT_ROWS; lane++)
-                ((float *)s->exact)[((size_t)r / DG_EXACT_ROWS * (cols / 16) + b) * DG_EXACT_ROWS +
-                                    lane] =
-                    dg_f8e4m3(s->data[(size_t)(r + lane) * cols / 16 + b]) * global;
+                ((uint8_t *)
+                     s->exact)[((size_t)r / DG_EXACT_ROWS * (cols / 16) + b) * DG_EXACT_ROWS +
+                               lane] = s->data[(size_t)(r + lane) * cols / 16 + b];
     }
 }
 
@@ -2027,7 +2036,7 @@ static void dg_prepare_exact_model(DGModel *m) {
         int rows[3] = {DG_MOE, DG_MOE, DG_H}, cols[3] = {DG_H, DG_H, DG_MOE};
         for (int k = 0; k < 3; k++) {
             size_t wp = dg_exact_place(&bytes, (size_t)rows[k] * cols[k] / 2),
-                   sp = dg_exact_place(&bytes, (size_t)rows[k] * cols[k] / 16 * sizeof(float));
+                   sp = dg_exact_place(&bytes, (size_t)rows[k] * cols[k] / 16);
             w[k]->exact_offset = wp + 1;
             s[k]->exact_offset = sp + 1;
         }
@@ -2049,9 +2058,9 @@ static void dg_prepare_exact_model(DGModel *m) {
 #endif
         for (i = 0; i < DG_L * DG_EXPERTS; i++) {
             DGNvExpert *v = &m->nvexpert[i];
-            dg_exact_pack_nvfp4(v->wg, v->sg, v->gg, DG_MOE, DG_H);
-            dg_exact_pack_nvfp4(v->wu, v->su, v->gu, DG_MOE, DG_H);
-            dg_exact_pack_nvfp4(v->wd, v->sd, v->gd, DG_H, DG_MOE);
+            dg_exact_pack_nvfp4(v->wg, v->sg, DG_MOE, DG_H);
+            dg_exact_pack_nvfp4(v->wu, v->su, DG_MOE, DG_H);
+            dg_exact_pack_nvfp4(v->wd, v->sd, DG_H, DG_MOE);
         }
     }
 }
@@ -2340,7 +2349,7 @@ static DGNvMatrix dg_nvfp4_matrix(const DGTensor *w, const DGTensor *s, const DG
         s->shape[0] != (uint64_t)rows || s->shape[1] != (uint64_t)cols / 16 || g->dtype != DG_F32 ||
         g->nd != 0 || g->bytes != 4 || cols % 32 || rows % 2)
         die2("bad NVFP4 expert tensor", w->name);
-    DGNvMatrix m = {w->data, s->data, w->exact, (const float *)s->exact, 0};
+    DGNvMatrix m = {w->data, s->data, w->exact, s->exact, 0};
     memcpy(&m.global, g->data, 4);
     return m;
 }
@@ -2348,15 +2357,15 @@ static DGNvMatrix dg_nvfp4_matrix(const DGTensor *w, const DGTensor *s, const DG
 #if defined(JB_AVX512) && JB_STRICT_MATH
 static void dg_mm_exact_avx512(const uint8_t *data, const float *x, float *y, int tokens, int rows,
                                int cols);
-static void dg_nvfp4_exact_avx512(const uint8_t *wd, const float *sd, const float *x, float *y,
-                                  int tokens, int rows, int cols);
+static void dg_nvfp4_exact_avx512(const uint8_t *wd, const uint8_t *sd, float global,
+                                  const float *x, float *y, int tokens, int rows, int cols);
 #endif
 
 static void dg_nvfp4_product(const DGNvMatrix *m, const float *x, float *y, int tokens, int rows,
                              int cols) {
 #if defined(JB_AVX512) && JB_STRICT_MATH
     if (m->exact_w && m->exact_s) {
-        dg_nvfp4_exact_avx512(m->exact_w, m->exact_s, x, y, tokens, rows, cols);
+        dg_nvfp4_exact_avx512(m->exact_w, m->exact_s, m->global, x, y, tokens, rows, cols);
         return;
     }
 #endif
@@ -2804,8 +2813,25 @@ static __m512i dg_nvfp4_exact_codes(const uint8_t *p) {
     return _mm512_inserti64x4(_mm512_castsi256_si512(lo), hi, 1);
 }
 
-static void dg_nvfp4_exact_avx512(const uint8_t *wd, const float *sd, const float *x, float *y,
-                                  int tokens, int rows, int cols) {
+/* Decode 16 transposed E4M3 scale bytes without expanding them in the model
+ * image. The integer bit construction and the subnormal multiply reproduce
+ * dg_f8e4m3, lane for lane. */
+static __m512 dg_f8e4m3x16(const uint8_t *p) {
+    __m512i code = _mm512_cvtepu8_epi32(_mm_loadu_si128((const __m128i *)p));
+    __m512i exponent = _mm512_and_si512(_mm512_srli_epi32(code, 3), _mm512_set1_epi32(15));
+    __m512i mantissa = _mm512_and_si512(code, _mm512_set1_epi32(7));
+    __m512 normal = _mm512_castsi512_ps(
+        _mm512_or_si512(_mm512_slli_epi32(_mm512_add_epi32(exponent, _mm512_set1_epi32(120)), 23),
+                        _mm512_slli_epi32(mantissa, 20)));
+    __m512 subnormal = _mm512_mul_ps(_mm512_cvtepi32_ps(mantissa), _mm512_set1_ps(0x1p-9f));
+    __mmask16 is_subnormal = _mm512_cmpeq_epi32_mask(exponent, _mm512_setzero_si512());
+    __m512 magnitude = _mm512_mask_blend_ps(is_subnormal, normal, subnormal);
+    __m512i sign = _mm512_slli_epi32(_mm512_and_si512(code, _mm512_set1_epi32(128)), 24);
+    return _mm512_castsi512_ps(_mm512_xor_si512(_mm512_castps_si512(magnitude), sign));
+}
+
+static void dg_nvfp4_exact_avx512(const uint8_t *wd, const uint8_t *sd, float global,
+                                  const float *x, float *y, int tokens, int rows, int cols) {
     static const float lut[16] = {0, .5f, 1, 1.5f, 2, 3, 4, 6, 0, -.5f, -1, -1.5f, -2, -3, -4, -6};
     __m512 table = _mm512_loadu_ps(lut);
     int rt;
@@ -2821,7 +2847,9 @@ static void dg_nvfp4_exact_avx512(const uint8_t *wd, const float *sd, const floa
             for (int q = 0; q < n; q++)
                 sum[q] = _mm512_setzero_ps();
             for (int b = 0; b < cols / 16; b++) {
-                __m512 scale = _mm512_loadu_ps(sd + (tile * (cols / 16) + b) * DG_EXACT_ROWS);
+                __m512 scale =
+                    _mm512_mul_ps(dg_f8e4m3x16(sd + (tile * (cols / 16) + b) * DG_EXACT_ROWS),
+                                  _mm512_set1_ps(global));
                 for (int k = 0; k < 8; k++) {
                     int c = b * 16 + k * 2;
                     __m512 we = _mm512_permutexvar_ps(
@@ -9047,6 +9075,19 @@ static void dg_test_nvfp4(uint64_t *rs) {
                                    {6, 64, 2}, {16, 704, 17}, {32, 2816, 3}};
     static const float mag4[8] = {0, .5f, 1, 1.5f, 2, 3, 4, 6};
     const float global = 0.01f, base = 0.02f;
+#if defined(JB_AVX512) && JB_STRICT_MATH
+    for (int first = 0; first < 256; first += DG_EXACT_ROWS) {
+        uint8_t code[DG_EXACT_ROWS];
+        float got[DG_EXACT_ROWS], want[DG_EXACT_ROWS];
+        for (int i = 0; i < DG_EXACT_ROWS; i++) {
+            code[i] = (uint8_t)(first + i);
+            want[i] = dg_f8e4m3(code[i]);
+        }
+        _mm512_storeu_ps(got, dg_f8e4m3x16(code));
+        if (memcmp(got, want, sizeof got))
+            die("kernel self-test failed: exact AVX-512 E4M3 decoder differs from reference");
+    }
+#endif
     for (size_t k = 0; k < sizeof shape / sizeof *shape; k++) {
         int rows = shape[k][0], cols = shape[k][1], tokens = shape[k][2];
         uint8_t *wd = xmalloc((size_t)rows * cols / 2), *sd = xmalloc((size_t)rows * cols / 16);
@@ -9084,15 +9125,14 @@ static void dg_test_nvfp4(uint64_t *rs) {
         memcpy(yref, y, (size_t)tokens * rows * 4);
 #if defined(JB_AVX512) && JB_STRICT_MATH
         if (rows % DG_EXACT_ROWS == 0) {
-            DGTensor tw = {0}, ts = {0}, tg = {0};
+            DGTensor tw = {0}, ts = {0};
             tw.data = wd;
             ts.data = sd;
-            tg.data = (const uint8_t *)&global;
             tw.exact = xmalloc((size_t)rows * cols / 2);
-            ts.exact = xmalloc((size_t)rows * cols / 16 * sizeof(float));
-            dg_exact_pack_nvfp4(&tw, &ts, &tg, rows, cols);
+            ts.exact = xmalloc((size_t)rows * cols / 16);
+            dg_exact_pack_nvfp4(&tw, &ts, rows, cols);
             jb_poison(y, (size_t)tokens * rows);
-            dg_nvfp4_exact_avx512(tw.exact, (const float *)ts.exact, xq, y, tokens, rows, cols);
+            dg_nvfp4_exact_avx512(tw.exact, ts.exact, global, xq, y, tokens, rows, cols);
             if (memcmp(y, yref, (size_t)tokens * rows * 4))
                 die("kernel self-test failed: exact AVX-512 NVFP4 differs from reference");
             jb_release((void *)tw.exact);
@@ -9900,18 +9940,17 @@ static int bench_kernels(void) {
     dg_nvfp4_qdq_ref(xq, xr, 64, nc, 0.02f);
     dg_nvfp4_qdq(xs, xr, 64, nc, 0.02f);
 #if defined(JB_AVX512) && JB_STRICT_MATH
-    size_t exact_sbytes = (size_t)nr * nc / 16 * sizeof(float);
+    size_t exact_sbytes = (size_t)nr * nc / 16;
     uint8_t *exact_w = xmalloc(wbytes * experts);
-    float *exact_s = xmalloc(exact_sbytes * experts);
+    uint8_t *exact_s = xmalloc(exact_sbytes * experts);
     const float exact_global = 0.01f;
     for (int e = 0; e < experts; e++) {
-        DGTensor tw = {0}, ts = {0}, tg = {0};
+        DGTensor tw = {0}, ts = {0};
         tw.data = wd + wbytes * e;
         tw.exact = exact_w + wbytes * e;
         ts.data = sd + sbytes * e;
-        ts.exact = (const uint8_t *)(exact_s + exact_sbytes / sizeof(float) * e);
-        tg.data = (const uint8_t *)&exact_global;
-        dg_exact_pack_nvfp4(&tw, &ts, &tg, nr, nc);
+        ts.exact = exact_s + exact_sbytes * e;
+        dg_exact_pack_nvfp4(&tw, &ts, nr, nc);
     }
 #endif
     for (size_t k = 0; k < sizeof nv_tokens / sizeof *nv_tokens; k++) {
@@ -9926,9 +9965,8 @@ static int bench_kernels(void) {
                 for (int e = 0; e < experts; e++) {
                     if (kernel) {
 #if defined(JB_AVX512) && JB_STRICT_MATH
-                        dg_nvfp4_exact_avx512(exact_w + wbytes * e,
-                                              exact_s + exact_sbytes / sizeof(float) * e, xq, yo,
-                                              tokens, nr, nc);
+                        dg_nvfp4_exact_avx512(exact_w + wbytes * e, exact_s + exact_sbytes * e,
+                                              exact_global, xq, yo, tokens, nr, nc);
 #else
                         dg_kernels()->nvfp4_mm(wd + wbytes * e, sd + sbytes * e, 0.01f, xs, yo,
                                                tokens, nr, nc);

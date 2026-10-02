@@ -139,8 +139,10 @@ jobs:
         include:
           - math: strict
             flags: ""
+            kernels: avx512-exact
           - math: fast
             flags: "-ffast-math"
+            kernels: avx512
     env:
       SDE_URL: https://downloadmirror.intel.com/924984/sde-external-10.13.1-2026-07-28-lin.tar.xz
       SDE_SHA256: 94e97d623fec54385686e1e7ba65ebc9941748c05ee451423948334892bf2b50
@@ -163,7 +165,7 @@ jobs:
       - name: Selftest
         run: |
           sde/sde64 -skx -- ./jb-avx512 --selftest | tee selftest.json
-          grep -q '"kernels":"avx512"' selftest.json
+          grep -q '"kernels":"${{ matrix.kernels }}"' selftest.json
 
   # GitHub's x86 runners have AVX2, so those kernels run natively. OpenMP
   # makes the kernels' parallel paths, including error reporting, run too.

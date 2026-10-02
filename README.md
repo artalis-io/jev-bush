@@ -112,7 +112,8 @@ load into a row-lane image and reports `avx512-exact`. Each vector lane owns
 one output row and accumulates in the scalar reference order, so model results
 are bit-identical to `-DJB_SCALAR`. The current in-memory image favors a simple
 kernel: on the 27B NVFP4 model it raises peak resident memory from about 17 GB
-to about 41 GB. Add `-ffast-math` to retain the compact model mapping and the
+to about 37.2 GB. NVFP4 weights and E4M3 scales remain packed; only their row
+order changes. Add `-ffast-math` to retain the original model mapping and the
 faster reduction-order AVX-512 kernels when exactness is not required.
 
 `eval` keeps one immutable, exact-match schema-prefix K/V entry. The first row
@@ -390,6 +391,18 @@ answer object matches:
 python3 tools/check_strict_invariance.py ./jb MODEL_DIR requests.jsonl --sequential ./jb-seq
 ```
 
+For a machine with the model, the manual model-backed regression runs the
+checked-in request and verifies canonical SHA-256 hashes for both its answer
+objects and token accounting:
+
+```sh
+tools/check_model_golden.py ./jb MODEL_DIR
+```
+
+This deliberately stays out of hosted CI: downloading and executing a 27B
+model for every source change is disproportionate. Run it on the self-hosted
+CPU/GPU benchmark machines before a release.
+
 [`fuzz/fuzz_json.c`](fuzz/fuzz_json.c) is a libFuzzer target for the JSON
 reader and request validation. Besides sanitizer findings, it checks that
 canonical JSON output re-parses to identical bytes. CI fuzzes it for two
@@ -631,11 +644,11 @@ The trusted reference is OpenJev commit `91d5005` with patched vLLM commit
 | Jev Bush NVFP4, fast-math CUDA, tensor cores, automatic reads | 66.70% | 1.4398 | 0.3164 | 0.2409 | 0.4353 |
 | Jev Bush NVFP4, fast-math CUDA, tensor cores, one read | 66.65% | 1.5191 | 0.3261 | 0.2484 | 0.4359 |
 
-The strict portable row is the current strict build, whose output is the same
-on every platform, and the last row the fast CUDA build with prefix reuse on a
-DGX Spark. Both ran the requests as published, without `samples`, so OpenJev's
-entropy rule chose four reads for 366 of the 400 rows; the row after them is the
-same fast CUDA build with `samples: 1`; earlier versions of
+The strict portable row defines the canonical result reproduced by scalar,
+NEON, exact AVX-512 and strict CUDA builds. The last row is the fast CUDA build
+with prefix reuse on a DGX Spark. Both ran the requests as published, without
+`samples`, so OpenJev's entropy rule chose four reads for 366 of the 400 rows;
+the row after them is the same fast CUDA build with `samples: 1`; earlier versions of
 this table mislabeled them as one read. The Jev Bush rows above them are
 recorded as one read a row, with the C library's `expf` and `tanhf` at earlier
 commits. On the same code and machine, switching to the
@@ -672,8 +685,10 @@ The recommended fast-math build with two concurrent 32-thread workers averaged
 5.49 s per row (p95 8.66 s), 121.88 prefill tokens/s per worker, and 0.911
 decisions/s per worker. Candidate projection averaged 0.025 ms per decision;
 transformer execution dominates. The strict build scored better log loss and
-Brier, while fast-math improved accuracy, ECE, and throughput. Resident memory
-is about 14.8 GB per process.
+Brier, while fast-math improved accuracy, ECE, and throughput. The compact
+fast-math mapping uses about 14.8--17 GB per process depending on what the OS
+keeps resident; strict AVX-512's transformed exact image peaked at 37.2 GB in
+the recorded run.
 
 OpenJev on an RTX PRO 6000 Blackwell averaged 54.2 ms per one-read row. On a
 DGX Spark, the fast CUDA build averages 268 ms per one-read row, one request at
@@ -684,9 +699,11 @@ implementation whose optional CUDA path is bit-identical to the CPU reference
 in strict builds, and whose fast-math CUDA build trades that for speed as the
 CPU's fast-math build does.
 
-Current limits are one request per process, 4,096 prompt tokens, 64 tokens per
-answer canvas, 4,096 total batched canvas tokens, and one denoising step. The
-hypothesis is deliberately narrow:
+Current limits are one active call per session, batches of at most 16 requests,
+4,096 prompt tokens, 64 tokens per answer canvas, 4,096 total batched canvas
+tokens, and one denoising step. Separate sessions may share one immutable model;
+CPU callers should avoid OpenMP oversubscription, and CUDA sessions currently
+share the legacy default stream. The hypothesis is deliberately narrow:
 bounded typed decisions should read candidate logits instead of paying for
 autoregressive JSON generation.
 

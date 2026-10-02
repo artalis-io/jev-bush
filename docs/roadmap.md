@@ -337,10 +337,13 @@ and NVFP4 references. On one real 486-token row, all five answer objects also
 matched the scalar build exactly (zero total variation and zero maximum
 probability difference). On the 9980X at 32 threads, strict transformed BF16
 reached 3.55 TFLOP/s at 256 tokens and NVFP4 reached 2.26 TFLOP/s at 64 tokens.
-The complete row took 3.16 s internally versus 3.07 s for the previous
-non-exact strict AVX-512 path, while scalar took 37.94 s. This first simple
-image increases peak RSS from about 16.9 GB to 41.4 GB; reducing that footprint
-without changing the arithmetic is future work.
+The complete row initially took 3.16 s internally versus 3.07 s for the previous
+non-exact strict AVX-512 path, while scalar took 37.94 s. Transposing E4M3 scale
+bytes instead of expanding every scale to 16 FP32 lanes reduced peak RSS from
+41.4 GB to 37.2 GB. The kernel decodes those bytes with AVX-512 integer bit
+construction. It remained bit-identical, cost about 12% at one token and less
+than 2% at 16--64 tokens in the isolated NVFP4 benchmark, and took 3.23 s for
+the complete measured row. The smaller exact image is retained.
 
 ### NEON: bit-identical to the reference
 
@@ -944,3 +947,19 @@ The result keeps NVFP4 plus BF16 as canonical CPU execution formats for this
 model. A persistent transformed cache is deferred until a representation shows
 both meaningful kernel speedup and acceptable primitive accuracy; storage
 compactness alone is not sufficient.
+
+## 10. v0 freeze
+
+The v0 execution architecture is frozen after the exact AVX-512 image and its
+compact-scale pass. Scalar defines the arithmetic; strict NEON, AVX-512 and
+CUDA reproduce it; AVX2 and fast builds are deterministic performance tiers.
+The CLI and `jb.h` expose the same typed decision engine, sessions own reusable
+K/V and scratch state, and the model is immutable and shareable.
+
+Release validation consists of hosted compiler, sanitizer, fuzz, hardening and
+kernel jobs plus the manual model-backed golden check on the benchmark rigs.
+Future arithmetic or layout changes need a profile demonstrating a dominant
+cost, bitwise strict fixtures, the model golden hashes, and refreshed benchmark
+numbers. New models, generic formats, servers, additional GPU APIs and broad
+framework abstractions remain outside v0 rather than accumulating behind the
+frozen interface.
