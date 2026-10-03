@@ -82,21 +82,21 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          cl /nologo /O2 /std:c11 /W4 /Fe:jb.exe jb.c
+          cl /nologo /O2 /std:c11 /experimental:c11atomics /W4 /Fe:jb.exe jb.c
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           .\jb.exe --selftest
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           # MSVC implements OpenMP 2.0; keep the parallel loops in its form.
-          cl /nologo /O2 /std:c11 /W4 /openmp /arch:AVX2 /Fe:jb-openmp.exe jb.c
+          cl /nologo /O2 /std:c11 /experimental:c11atomics /W4 /openmp /arch:AVX2 /Fe:jb-openmp.exe jb.c
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           $env:OMP_NUM_THREADS = "4"
           $out = .\jb-openmp.exe --selftest
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           $out
           if ($out -notmatch '"kernels":"avx2"') { exit 1 }
-          cl /nologo /O2 /std:c11 /W4 /LD /DJB_NO_MAIN /DJB_SHARED /DJB_BUILD_SHARED /Fe:jb.dll jb.c
+          cl /nologo /O2 /std:c11 /experimental:c11atomics /W4 /LD /DJB_NO_MAIN /DJB_SHARED /DJB_BUILD_SHARED /Fe:jb.dll jb.c
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          cl /nologo /O2 /std:c11 /W4 /DJB_SHARED /I. test/installed_consumer.c jb.lib /Fe:installed-consumer.exe
+          cl /nologo /O2 /std:c11 /experimental:c11atomics /W4 /DJB_SHARED /I. test/installed_consumer.c jb.lib /Fe:installed-consumer.exe
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           .\installed-consumer.exe
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
@@ -212,7 +212,7 @@ jobs:
 
       - name: Build
         run: |
-          gcc -O2 -mavx2 -mfma -mno-avx512f -std=c11 -Wall -Wextra -pedantic -Wshadow -Wformat=2 -Werror \
+          gcc -O2 -mavx2 -mfma -mno-avx512f -DJB_AVX2_ONLY -std=c11 -Wall -Wextra -pedantic -Wshadow -Wformat=2 -Werror \
             ${{ matrix.flags }} -fopenmp jb.c -lm -o jb-avx2
 
       - name: Selftest

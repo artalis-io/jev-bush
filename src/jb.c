@@ -1,5 +1,7 @@
 /* Canonical modular translation unit. The public distribution is ../jb.c. */
 #include "foundation.inc"
+#include "json.inc"
+#include "model.inc"
 #include "kernels_scalar.inc"
 #include "kernels_avx2.inc"
 #include "kernels_avx512.inc"
@@ -7,5 +9,6 @@
 #include "kernels_dispatch.inc"
 #include "cuda.inc"
 #include "engine.inc"
+#include "decision.inc"
 #include "api.inc"
 #include "cli_tests.inc"

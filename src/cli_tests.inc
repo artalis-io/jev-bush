@@ -1261,8 +1261,7 @@ static void dg_test_locale_numbers(void) {
         db_number(&b, 0.25);
         db_ch(&b, ' ');
         db_millis(&b, 1.5);
-        JTok t = {JT_PRIMITIVE, 0, 4, -1, 0};
-        int ok = !strcmp(b.p, "0.25 1.500") && jb_token_double("0.25", &t) == 0.25;
+        int ok = !strcmp(b.p, "0.25 1.500");
         jb_release(b.p);
         setlocale(LC_NUMERIC, restore);
         if (!ok)
@@ -1437,18 +1436,6 @@ static int selftest(void) {
         tokens[candidates].type != JT_ARRAY || tokens[candidates].size != 2)
         die("JSON self-test failed");
     jb_release(tokens);
-    static const char result_json[] =
-        "{\"answers\":{\"ok\":{\"type\":\"noul\",\"probabilities\":{\"true\":0.75,"
-        "\"false\":0.25},\"confidence\":0.5}},\"usage\":{\"input_tokens\":7,"
-        "\"prefill_tokens\":3},\"timing_ms\":{\"total\":2.5,\"prefill\":1.5,"
-        "\"candidates\":0.25}}";
-    jb_result *public_result = jb_result_parse(result_json, sizeof result_json - 1);
-    if (public_result->answer_count != 1 || public_result->answers[0].probability_count != 2 ||
-        public_result->answers[0].probabilities[0].probability != 0.75 ||
-        public_result->answers[0].selected_candidate != 0 || public_result->input_tokens != 7 ||
-        public_result->prefill_tokens != 3 || public_result->total_ms != 2.5)
-        die("public result self-test failed");
-    jb_result_free(public_result);
     jb_model *missing_model = NULL;
     if (jb_model_load("__jev_bush_missing_model__", &missing_model) != JB_ERROR_IO || missing_model)
         die("public I/O status self-test failed");

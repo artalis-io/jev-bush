@@ -37,9 +37,10 @@ endif
 JB_CFLAGS = $(CFLAGS) $(WARNFLAGS) $(HARDEN_CFLAGS)
 LDFLAGS += $(HARDEN_LDFLAGS)
 
-JB_MODULES = src/jb.c src/foundation.inc src/kernels_scalar.inc src/kernels_avx2.inc \
+JB_MODULES = src/jb.c src/foundation.inc src/json.inc src/model.inc \
+	src/kernels_scalar.inc src/kernels_avx2.inc \
 	src/kernels_avx512.inc src/kernels_neon.inc src/kernels_dispatch.inc src/cuda.inc \
-	src/engine.inc src/api.inc src/cli_tests.inc
+	src/engine.inc src/decision.inc src/api.inc src/cli_tests.inc
 
 .PHONY: all clean check check-amalgamation debug format install install-hooks lint sanitize \
 	thread-sanitize uninstall FORCE

@@ -222,24 +222,28 @@ def typed_answers(library, model_path, request):
             output[key][name] = probability.probability
     lib.jb_result_free(result)
     batch = ctypes.POINTER(ctypes.POINTER(Result))()
-    status = lib.jb_session_decide_batch(session, ctypes.byref(item), 1, ctypes.byref(batch))
+    batch_inputs = (Input * 2)(item, item)
+    status = lib.jb_session_decide_batch(session, batch_inputs, 2, ctypes.byref(batch))
     if status:
         lib.jb_session_free(session)
         lib.jb_model_free(model)
         raise SystemExit(f"typed C batch API failed with status {status}")
-    batched = {}
-    for index in range(batch[0].contents.answer_count):
-        answer = batch[0].contents.answers[index]
-        key = ctypes.string_at(answer.id.data, answer.id.length).decode()
-        batched[key] = {}
-        for candidate_index in range(answer.probability_count):
-            probability = answer.probabilities[candidate_index]
-            name = ctypes.string_at(probability.candidate.data,
-                                    probability.candidate.length).decode()
-            batched[key][name] = probability.probability
-    lib.jb_results_free(batch, 1)
-    if batched != output:
-        raise SystemExit("typed batch probabilities differ from typed single-call probabilities")
+    for row in range(2):
+        batched = {}
+        for index in range(batch[row].contents.answer_count):
+            answer = batch[row].contents.answers[index]
+            key = ctypes.string_at(answer.id.data, answer.id.length).decode()
+            batched[key] = {}
+            for candidate_index in range(answer.probability_count):
+                probability = answer.probabilities[candidate_index]
+                name = ctypes.string_at(probability.candidate.data,
+                                        probability.candidate.length).decode()
+                batched[key][name] = probability.probability
+        if batched != output:
+            raise SystemExit(
+                "typed batch probabilities differ from typed single-call probabilities"
+            )
+    lib.jb_results_free(batch, 2)
     lib.jb_session_free(session)
     lib.jb_model_free(model)
     return output

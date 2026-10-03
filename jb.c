@@ -41,15 +41,22 @@
 /* GCC and clang build x86 ISA variants as function-level multiversions, so a
  * single baseline binary safely selects scalar, AVX2 or AVX-512 at runtime.
  * MSVC emits the variants enabled by /arch and still checks the host before
- * selecting one. -DJB_SCALAR remains the portable oracle. */
+ * selecting one. -DJB_SCALAR remains the portable oracle;
+ * -DJB_AVX2_ONLY builds the AVX2 tier without AVX-512 variants. */
 #if defined(JB_SCALAR)
 #define JB_TARGET_AVX2
 #define JB_TARGET_AVX512
 #elif (defined(__x86_64__) || defined(__i386__)) && (defined(__GNUC__) || defined(__clang__))
 #define JB_HAVE_AVX2 1
+#if !defined(JB_AVX2_ONLY)
 #define JB_HAVE_AVX512 1
+#endif
 #define JB_TARGET_AVX2 __attribute__((target("avx2,fma")))
+#if !defined(JB_AVX2_ONLY)
 #define JB_TARGET_AVX512 __attribute__((target("avx2,fma,avx512f,avx512dq,avx512bw")))
+#else
+#define JB_TARGET_AVX512
+#endif
 #include <immintrin.h>
 #elif defined(_MSC_VER) && defined(_M_X64) && defined(__AVX2__)
 #define JB_HAVE_AVX2 1
@@ -235,11 +242,22 @@ typedef union JBAllocation {
     JBMaxAlign align;
 } JBAllocation;
 
+typedef void (*JBCleanupFn)(void *context);
+
+typedef struct {
+    JBCleanupFn function;
+    void *context;
+} JBCleanup;
+
+#define JB_CLEANUP_MAX 16
+
 typedef struct JBErrorFrame {
     jmp_buf jump;
     struct JBErrorFrame *previous;
     uint64_t mark;
     jb_status previous_status;
+    JBCleanup cleanup[JB_CLEANUP_MAX];
+    unsigned cleanup_count;
 } JBErrorFrame;
 
 static _Thread_local JBErrorFrame *jb_error_frame;
@@ -477,13 +495,38 @@ static void jb_frame_enter(JBErrorFrame *f, jb_status status) {
     f->previous = jb_error_frame;
     f->previous_status = jb_error_status;
     f->mark = jb_allocation_sequence;
+    f->cleanup_count = 0;
     jb_error_status = status;
     jb_error_frame = f;
+}
+
+static void jb_cleanup_push(JBErrorFrame *frame, JBCleanupFn function, void *context) {
+    if (!frame || frame != jb_error_frame || !function || frame->cleanup_count == JB_CLEANUP_MAX)
+        die_status(JB_ERROR_INTERNAL, "invalid error cleanup registration");
+    frame->cleanup[frame->cleanup_count++] = (JBCleanup){function, context};
+}
+
+static void jb_cleanup_disarm(JBErrorFrame *frame, JBCleanupFn function, void *context) {
+    if (!frame || frame != jb_error_frame || !frame->cleanup_count)
+        die_status(JB_ERROR_INTERNAL, "invalid error cleanup removal");
+    JBCleanup *cleanup = &frame->cleanup[frame->cleanup_count - 1];
+    if (cleanup->function != function || cleanup->context != context)
+        die_status(JB_ERROR_INTERNAL, "error cleanups removed out of order");
+    frame->cleanup_count--;
+}
+
+static void jb_cleanup_run(JBErrorFrame *frame) {
+    while (frame->cleanup_count) {
+        JBCleanup cleanup = frame->cleanup[--frame->cleanup_count];
+        cleanup.function(cleanup.context);
+    }
 }
 
 /* Successful return: the outermost frame hands every allocation it made to
  * its owner (caller or session). */
 static void jb_frame_leave(JBErrorFrame *f) {
+    if (f->cleanup_count)
+        die_status(JB_ERROR_INTERNAL, "armed cleanup on successful return");
     jb_error_frame = f->previous;
     jb_error_status = f->previous_status;
     if (!jb_error_frame)
@@ -498,6 +541,7 @@ static void jb_frame_leave(JBErrorFrame *f) {
 /* Failed return, including an inner call's failure: release everything
  * allocated since the frame was entered. */
 static void jb_frame_abandon(JBErrorFrame *f) {
+    jb_cleanup_run(f);
     for (JBAllocation *a = jb_tracked, *next; a; a = next) {
         next = a->link.next;
         if (a->link.sequence > f->mark) {
@@ -800,7 +844,6 @@ static uint32_t next_cp(const unsigned char *s, size_t n, size_t *i) {
         die("invalid UTF-8");
     return v;
 }
-
 enum { JT_UNDEF, JT_OBJECT, JT_ARRAY, JT_STRING, JT_PRIMITIVE };
 
 typedef struct {
@@ -815,6 +858,7 @@ typedef struct {
 } JParser;
 
 static char *jt_string(const char *j, const JTok *t);
+static size_t jt_string_copy(const char *j, const JTok *t, char *out);
 
 static int jt_new(JParser *p, int type, int start, int parent) {
     if (p->nt == p->cap) {
@@ -960,6 +1004,7 @@ static void json_check_keys(const char *s, const JTok *t, int nt) {
         if (t[obj].type != JT_OBJECT || t[obj].size < 4)
             continue;
         int nk = 0;
+        size_t slab_bytes = 0;
         for (int i = obj + 1; i < nt && t[i].parent >= obj; i++)
             if (t[i].parent == obj) {
                 if (nk == cap) {
@@ -968,7 +1013,19 @@ static void json_check_keys(const char *s, const JTok *t, int nt) {
                     cap = cap ? cap * 2 : 64;
                     keys = xrealloc(keys, (size_t)cap * sizeof *keys);
                 }
-                keys[nk++] = jt_string(s, &t[i]);
+                slab_bytes =
+                    jb_size_add(slab_bytes, jb_size_add((size_t)(t[i].end - t[i].start) * 3, 1));
+                nk++;
+                i++;
+            }
+        char local_slab[4096];
+        char *slab = slab_bytes <= sizeof local_slab ? local_slab : xmalloc(slab_bytes);
+        char *cursor = slab;
+        nk = 0;
+        for (int i = obj + 1; i < nt && t[i].parent >= obj; i++)
+            if (t[i].parent == obj) {
+                keys[nk++] = cursor;
+                cursor += jt_string_copy(s, &t[i], cursor) + 1;
                 i++;
             }
         if (nk > 1)
@@ -977,14 +1034,14 @@ static void json_check_keys(const char *s, const JTok *t, int nt) {
             if (i && !strcmp(keys[i - 1], keys[i])) {
                 char message[256];
                 snprintf(message, sizeof message, "duplicate JSON object key: %s", keys[i]);
-                for (int k = 0; k < nk; k++)
-                    jb_release(keys[k]);
+                if (slab != local_slab)
+                    jb_release(slab);
                 jb_release(keys);
                 die(message);
             }
         }
-        for (int i = 0; i < nk; i++)
-            jb_release(keys[i]);
+        if (slab != local_slab)
+            jb_release(slab);
     }
     jb_release(keys);
 }
@@ -1049,9 +1106,85 @@ static int jt_nonnegative_int(const char *j, const JTok *t, const char *name) {
     return v;
 }
 
+static unsigned hex4(const char *s) {
+    unsigned v = 0;
+    for (int i = 0; i < 4; i++) {
+        v <<= 4;
+        v += (unsigned)(s[i] <= '9' ? s[i] - '0' : (tolower((unsigned char)s[i]) - 'a' + 10));
+    }
+    return v;
+}
+
+static size_t jt_string_copy(const char *j, const JTok *t, char *out) {
+    char *o = out;
+    if (t->type != JT_STRING) {
+        size_t n = (size_t)(t->end - t->start);
+        memcpy(out, j + t->start, n);
+        out[n] = 0;
+        return n;
+    }
+    for (int i = t->start; i < t->end; i++) {
+        unsigned c = (unsigned char)j[i];
+        if (c != '\\') {
+            *o++ = (char)c;
+            continue;
+        }
+        c = (unsigned char)j[++i];
+        if (c == 'u') {
+            uint32_t u = hex4(j + i + 1);
+            i += 4;
+            if (u >= 0xd800 && u <= 0xdbff) {
+                if (i + 6 >= t->end || j[i + 1] != '\\' || j[i + 2] != 'u')
+                    die("unpaired JSON surrogate");
+                uint32_t v = hex4(j + i + 3);
+                if (v < 0xdc00 || v > 0xdfff)
+                    die("unpaired JSON surrogate");
+                u = 0x10000 + ((u - 0xd800) << 10) + (v - 0xdc00);
+                i += 6;
+            } else if (u >= 0xdc00 && u <= 0xdfff)
+                die("unpaired JSON surrogate");
+            else if (!u)
+                die("NUL in JSON string is unsupported");
+            o += put_utf8(u, o);
+        } else {
+            switch (c) {
+            case 'b':
+                *o++ = '\b';
+                break;
+            case 'f':
+                *o++ = '\f';
+                break;
+            case 'n':
+                *o++ = '\n';
+                break;
+            case 'r':
+                *o++ = '\r';
+                break;
+            case 't':
+                *o++ = '\t';
+                break;
+            default:
+                *o++ = (char)c;
+            }
+        }
+    }
+    *o = 0;
+    size_t at = 0, zn = (size_t)(o - out);
+    while (at < zn)
+        (void)next_cp((const unsigned char *)out, zn, &at);
+    return zn;
+}
+
+static char *jt_string(const char *j, const JTok *t) {
+    size_t capacity = (size_t)(t->end - t->start) * 3 + 1;
+    char *z = xmalloc(capacity);
+    (void)jt_string_copy(j, t, z);
+    return z;
+}
 typedef struct {
     FileMap file;
     char path[768];
+    char *names;
 } DGShard;
 
 typedef struct {
@@ -1226,6 +1359,7 @@ typedef struct {
     Vocab *vocab, **by_id;
     Merge *merge;
     Vocab **special;
+    char *vocab_data;
     uint32_t nv, nm, ns, maxlen;
     uint8_t special_first[256];
 } DGTokenizer;
@@ -1285,13 +1419,22 @@ static void dg_parse_shard(DGModel *m, int si, const char *dir) {
     JTok *tok = json_tokens(j, (size_t)hn, &nt);
     if (!nt || tok[0].type != JT_OBJECT)
         die2("invalid safetensors JSON", s->path);
+    size_t names_bytes = 0;
+    for (int key = 1; key < nt; key++)
+        if (tok[key].parent == 0 && tok[key].type == JT_STRING) {
+            names_bytes = jb_size_add(names_bytes,
+                                      jb_size_add((size_t)(tok[key].end - tok[key].start) * 3, 1));
+            key++;
+        }
+    s->names = xmalloc(names_bytes ? names_bytes : 1);
+    char *name_cursor = s->names;
     for (int key = 1; key < nt; key++) {
         if (tok[key].parent != 0 || tok[key].type != JT_STRING)
             continue;
-        char *name = jt_string(j, &tok[key]);
+        char *name = name_cursor;
+        name_cursor += jt_string_copy(j, &tok[key], name_cursor) + 1;
         int obj = key + 1;
         if (!strcmp(name, "__metadata__")) {
-            jb_release(name);
             continue;
         }
         if (obj >= nt || tok[obj].type != JT_OBJECT)
@@ -1302,21 +1445,19 @@ static void dg_parse_shard(DGModel *m, int si, const char *dir) {
         if (dtype < 0 || shape < 0 || offsets < 0 || tok[shape].type != JT_ARRAY ||
             tok[offsets].type != JT_ARRAY)
             die2("incomplete safetensors descriptor", name);
-        char *dt = jt_string(j, &tok[dtype]);
         DGTensor t = {0};
         t.name = name;
         t.dtype = DG_UNKNOWN;
-        if (!strcmp(dt, "BF16"))
+        if (jt_eq(j, &tok[dtype], "BF16"))
             t.dtype = DG_BF16;
-        else if (!strcmp(dt, "U8"))
+        else if (jt_eq(j, &tok[dtype], "U8"))
             t.dtype = DG_U8;
-        else if (!strcmp(dt, "F8_E4M3"))
+        else if (jt_eq(j, &tok[dtype], "F8_E4M3"))
             t.dtype = DG_F8E4M3;
-        else if (!strcmp(dt, "F32"))
+        else if (jt_eq(j, &tok[dtype], "F32"))
             t.dtype = DG_F32;
         else if (dg_is_text(name))
             die2("unsupported DiffusionGemma text dtype", name);
-        jb_release(dt);
         if (dg_is_text(name) && t.dtype != DG_BF16 &&
             !(m->nvfp4 && strstr(name, ".experts.") &&
               (t.dtype == DG_U8 || t.dtype == DG_F8E4M3 || t.dtype == DG_F32)))
@@ -1630,8 +1771,8 @@ static void dg_upload_model(DGModel *m) {
 static void dg_free(DGModel *m) {
     dg_release_accel(m);
     jb_release(m->exact_weights);
-    for (size_t i = 0; i < m->nt; i++)
-        jb_release(m->tensor[i].name);
+    for (int i = 0; i < m->nshard; i++)
+        jb_release(m->shard[i].names);
     jb_release(m->tensor);
     jb_release(m->nvexpert);
     dg_unmap_shards(m);
@@ -1687,6 +1828,18 @@ static void dgt_load(DGTokenizer *d, const char *dir) {
         die("unexpected DiffusionGemma vocabulary size");
     d->vocab = xcalloc(nv, sizeof *d->vocab);
     d->nv = nv;
+    size_t vocab_bytes = 0;
+    for (int i = vocab + 1; i + 1 < nt; i++) {
+        if (t[i].parent < vocab)
+            break;
+        if (t[i].parent == vocab) {
+            vocab_bytes =
+                jb_size_add(vocab_bytes, jb_size_add((size_t)(t[i].end - t[i].start) * 3, 1));
+            i++;
+        }
+    }
+    d->vocab_data = xmalloc(vocab_bytes ? vocab_bytes : 1);
+    char *vocab_cursor = d->vocab_data;
     uint32_t vi = 0;
     for (int i = vocab + 1; i + 1 < nt; i++) {
         if (t[i].parent < vocab)
@@ -1695,8 +1848,12 @@ static void dgt_load(DGTokenizer *d, const char *dir) {
             continue;
         if (vi == d->nv)
             die("too many DiffusionGemma vocabulary entries");
-        d->vocab[vi].s = jt_string(j, &t[i]);
-        d->vocab[vi].n = (uint32_t)strlen(d->vocab[vi].s);
+        d->vocab[vi].s = vocab_cursor;
+        size_t token_length = jt_string_copy(j, &t[i], vocab_cursor);
+        if (token_length > UINT32_MAX)
+            die("DiffusionGemma vocabulary token is too large");
+        d->vocab[vi].n = (uint32_t)token_length;
+        vocab_cursor += token_length + 1;
         if (d->vocab[vi].n > d->maxlen)
             d->maxlen = d->vocab[vi].n;
         d->vocab[vi].id = jt_nonnegative_int(j, &t[i + 1], "vocabulary id");
@@ -1715,6 +1872,8 @@ static void dgt_load(DGTokenizer *d, const char *dir) {
     }
     d->nm = (uint32_t)t[merges].size;
     d->merge = xcalloc(d->nm, sizeof *d->merge);
+    char *merge_text = NULL;
+    size_t merge_capacity = 0;
     uint32_t mi = 0;
     for (int i = merges + 1; i < nt; i++) {
         if (t[i].parent < merges)
@@ -1733,10 +1892,16 @@ static void dgt_load(DGTokenizer *d, const char *dir) {
             }
         if (t[i].type != JT_ARRAY || a < 0 || b < 0)
             die("bad tokenizer merge");
-        char *sa = jt_string(j, &t[a]), *sb = jt_string(j, &t[b]);
-        Vocab *va = dgt_vfind(d, sa, strlen(sa)), *vb = dgt_vfind(d, sb, strlen(sb));
-        jb_release(sa);
-        jb_release(sb);
+        size_t a_capacity = jb_size_add((size_t)(t[a].end - t[a].start) * 3, 1);
+        size_t b_capacity = jb_size_add((size_t)(t[b].end - t[b].start) * 3, 1);
+        size_t needed = jb_size_add(a_capacity, b_capacity);
+        if (needed > merge_capacity) {
+            merge_text = xrealloc(merge_text, needed);
+            merge_capacity = needed;
+        }
+        char *sa = merge_text, *sb = merge_text + a_capacity;
+        size_t na = jt_string_copy(j, &t[a], sa), nb = jt_string_copy(j, &t[b], sb);
+        Vocab *va = dgt_vfind(d, sa, na), *vb = dgt_vfind(d, sb, nb);
         if (!va || !vb || mi == d->nm)
             die("tokenizer merge references absent token");
         d->merge[mi] = (Merge){(uint32_t)va->id, (uint32_t)vb->id, mi};
@@ -1744,6 +1909,7 @@ static void dgt_load(DGTokenizer *d, const char *dir) {
     }
     if (mi != d->nm)
         die("incomplete tokenizer merges");
+    jb_release(merge_text);
     qsort(d->merge, d->nm, sizeof *d->merge, cmp_merge);
     d->ns = (uint32_t)t[added].size;
     d->special = xcalloc(d->ns, sizeof *d->special);
@@ -1757,8 +1923,10 @@ static void dgt_load(DGTokenizer *d, const char *dir) {
         int special = jt_obj_get(j, t, nt, i, "special");
         if (content < 0 || special < 0 || !jt_literal(j, &t[special], "true"))
             die("unsupported added token");
-        char *s = jt_string(j, &t[content]);
-        Vocab *v = dgt_vfind(d, s, strlen(s));
+        size_t content_capacity = jb_size_add((size_t)(t[content].end - t[content].start) * 3, 1);
+        char *s = xmalloc(content_capacity);
+        size_t sn = jt_string_copy(j, &t[content], s);
+        Vocab *v = dgt_vfind(d, s, sn);
         jb_release(s);
         if (!v)
             die("added token absent from vocabulary");
@@ -1773,8 +1941,7 @@ static void dgt_load(DGTokenizer *d, const char *dir) {
 }
 
 static void dgt_free(DGTokenizer *d) {
-    for (uint32_t i = 0; d->vocab && i < d->nv; i++)
-        jb_release(d->vocab[i].s);
+    jb_release(d->vocab_data);
     jb_release(d->vocab);
     jb_release(d->by_id);
     jb_release(d->merge);
@@ -6908,80 +7075,6 @@ static void dg_prefix_free(DGPrefixCache *c) {
         jb_arena_free(&c->metadata);
     memset(c, 0, sizeof *c);
 }
-
-static char *jt_raw(const char *j, const JTok *t) {
-    size_t n = (size_t)(t->end - t->start);
-    char *z = xmalloc(n + 1);
-    memcpy(z, j + t->start, n);
-    z[n] = 0;
-    return z;
-}
-
-static unsigned hex4(const char *s) {
-    unsigned v = 0;
-    for (int i = 0; i < 4; i++) {
-        v <<= 4;
-        v += (unsigned)(s[i] <= '9' ? s[i] - '0' : (tolower((unsigned char)s[i]) - 'a' + 10));
-    }
-    return v;
-}
-
-static char *jt_string(const char *j, const JTok *t) {
-    if (t->type != JT_STRING)
-        return jt_raw(j, t);
-    char *z = xmalloc((size_t)(t->end - t->start) * 3 + 1), *o = z;
-    for (int i = t->start; i < t->end; i++) {
-        unsigned c = (unsigned char)j[i];
-        if (c != '\\') {
-            *o++ = (char)c;
-            continue;
-        }
-        c = (unsigned char)j[++i];
-        if (c == 'u') {
-            uint32_t u = hex4(j + i + 1);
-            i += 4;
-            if (u >= 0xd800 && u <= 0xdbff) {
-                if (i + 6 >= t->end || j[i + 1] != '\\' || j[i + 2] != 'u')
-                    die("unpaired JSON surrogate");
-                uint32_t v = hex4(j + i + 3);
-                if (v < 0xdc00 || v > 0xdfff)
-                    die("unpaired JSON surrogate");
-                u = 0x10000 + ((u - 0xd800) << 10) + (v - 0xdc00);
-                i += 6;
-            } else if (u >= 0xdc00 && u <= 0xdfff)
-                die("unpaired JSON surrogate");
-            else if (!u)
-                die("NUL in JSON string is unsupported");
-            o += put_utf8(u, o);
-        } else {
-            switch (c) {
-            case 'b':
-                *o++ = '\b';
-                break;
-            case 'f':
-                *o++ = '\f';
-                break;
-            case 'n':
-                *o++ = '\n';
-                break;
-            case 'r':
-                *o++ = '\r';
-                break;
-            case 't':
-                *o++ = '\t';
-                break;
-            default:
-                *o++ = (char)c;
-            }
-        }
-    }
-    *o = 0;
-    size_t at = 0, zn = (size_t)(o - z);
-    while (at < zn)
-        (void)next_cp((const unsigned char *)z, zn, &at);
-    return z;
-}
-
 typedef struct {
     char *p;
     size_t n, cap;
@@ -7617,10 +7710,81 @@ static char *dg_format_answers(const char *qj, JTok *qt, int qnt, DecisionWork *
     return out.p;
 }
 
+/* Build the public typed result directly from the engine's decision state.
+ * JSON formatting is an adapter for JSON callers, not the typed API's
+ * intermediate representation. */
+static jb_result *dg_typed_answers(const char *qj, JTok *qt, DecisionWork *w, int nq,
+                                   uint32_t input_tokens, uint32_t prefill_tokens, double total_ms,
+                                   double prefill_ms, double candidate_ms) {
+    size_t probability_count = 0, string_bytes = 0;
+    for (int x = 0; x < nq; x++) {
+        char *id = jt_string(qj, &qt[w[x].key]);
+        string_bytes = jb_size_add(string_bytes, strlen(id) + 1);
+        jb_release(id);
+        probability_count = jb_size_add(probability_count, (size_t)w[x].nc);
+        for (int c = 0; c < w[x].nc; c++)
+            string_bytes = jb_size_add(string_bytes, strlen(w[x].cand[c]) + 1);
+    }
+    size_t bytes = sizeof(jb_result);
+    bytes = jb_align_up(bytes, _Alignof(jb_answer));
+    size_t answers_offset = bytes;
+    bytes = jb_size_add(bytes, jb_size_mul((size_t)nq, sizeof(jb_answer)));
+    bytes = jb_align_up(bytes, _Alignof(jb_probability));
+    size_t probabilities_offset = bytes;
+    bytes = jb_size_add(bytes, jb_size_mul(probability_count, sizeof(jb_probability)));
+    size_t strings_offset = bytes;
+    bytes = jb_size_add(bytes, string_bytes);
+    jb_result *result = xcalloc(bytes, 1);
+    jb_answer *answers = (jb_answer *)((unsigned char *)result + answers_offset);
+    jb_probability *probability =
+        (jb_probability *)((unsigned char *)result + probabilities_offset);
+    char *strings = (char *)result + strings_offset;
+    result->answers = answers;
+    result->answer_count = (size_t)nq;
+    result->input_tokens = input_tokens;
+    result->prefill_tokens = prefill_tokens;
+    result->total_ms = total_ms;
+    result->prefill_ms = prefill_ms;
+    result->candidate_ms = candidate_ms;
+    for (int x = 0; x < nq; x++) {
+        DecisionWork *decision = &w[x];
+        jb_answer *answer = &answers[x];
+        char *id = jt_string(qj, &qt[decision->key]);
+        size_t id_length = strlen(id);
+        memcpy(strings, id, id_length + 1);
+        answer->id = (jb_string){strings, id_length};
+        strings += id_length + 1;
+        jb_release(id);
+        answer->type = !strcmp(decision->kind, "noul")     ? JB_DECISION_BOOLEAN
+                       : !strcmp(decision->kind, "choice") ? JB_DECISION_CHOICE
+                                                           : JB_DECISION_SCORE;
+        answer->probabilities = probability;
+        answer->probability_count = (size_t)decision->nc;
+        double best = -1.0;
+        for (int c = 0; c < decision->nc; c++) {
+            size_t candidate_length = strlen(decision->cand[c]);
+            memcpy(strings, decision->cand[c], candidate_length + 1);
+            probability[c].candidate = (jb_string){strings, candidate_length};
+            probability[c].probability = decision->prob[c];
+            strings += candidate_length + 1;
+            if (decision->prob[c] > best) {
+                best = decision->prob[c];
+                answer->selected_candidate = (size_t)c;
+            }
+            if (answer->type == JB_DECISION_SCORE)
+                answer->expected_score += c * decision->prob[c];
+        }
+        answer->confidence = confidence(decision->prob, decision->nc);
+        probability += decision->nc;
+    }
+    return result;
+}
+
 typedef struct {
     const char *j, *qj;
     JTok *t, *qt;
     int nt, qnt, si, qroot, requested;
+    int separate_qtokens;
     char *state, *reqid, *qowned;
 } DGRequest;
 
@@ -7665,13 +7829,41 @@ static void dg_request_parse(DGRequest *r, const char *j, size_t len) {
     }
 }
 
+static void dg_request_parts(DGRequest *r, const char *state_json, size_t state_length,
+                             const char *id, size_t id_length, const char *questions_json,
+                             size_t questions_length, uint32_t samples) {
+    memset(r, 0, sizeof *r);
+    if (samples > 32)
+        die("samples must be 1..32");
+    r->j = state_json;
+    r->t = json_tokens(state_json, state_length, &r->nt);
+    if (!r->nt || r->t[0].parent != -1)
+        die("state_json must contain exactly one JSON value");
+    r->si = 0;
+    r->state = r->t[0].type == JT_STRING ? jt_string(state_json, &r->t[0])
+                                         : dg_json_canonical(state_json, r->t, r->nt, 0, 0, 0);
+    if (id_length) {
+        r->reqid = xmalloc(id_length + 1);
+        memcpy(r->reqid, id, id_length);
+        r->reqid[id_length] = 0;
+    }
+    r->qj = questions_json;
+    r->qt = json_tokens(questions_json, questions_length, &r->qnt);
+    r->qroot = 0;
+    r->separate_qtokens = 1;
+    r->requested = (int)samples;
+    if (!r->qnt || r->qt[0].type != JT_OBJECT)
+        die("session schema must be a JSON object");
+}
+
 static void dg_request_free(DGRequest *r) {
     jb_release(r->state);
     jb_release(r->reqid);
     if (r->qowned) {
         jb_release(r->qt);
         jb_release(r->qowned);
-    }
+    } else if (r->separate_qtokens)
+        jb_release(r->qt);
     jb_release(r->t);
 }
 
@@ -7790,9 +7982,7 @@ typedef struct {
     uint64_t candidate_ns;
 } DGJob;
 
-static void dg_job_prepare(DGJob *g, DGTokenizer *tok, const char *j, size_t len) {
-    memset(g, 0, sizeof *g);
-    dg_request_parse(&g->rq, j, len);
+static void dg_job_prepare_request(DGJob *g, DGTokenizer *tok) {
     g->requested = g->rq.requested;
     g->seed = dg_request_seed(&g->rq);
     char *choice[DG_CHOICE_LABELS];
@@ -7883,6 +8073,22 @@ static void dg_job_prepare(DGJob *g, DGTokenizer *tok, const char *j, size_t len
         memset(g->w[x].prob, 0, (size_t)g->w[x].nc * sizeof *g->w[x].prob);
     g->active = 1;
     jb_release(zero);
+}
+
+static void dg_job_prepare(DGJob *g, DGTokenizer *tok, const char *j, size_t len) {
+    memset(g, 0, sizeof *g);
+    dg_request_parse(&g->rq, j, len);
+    dg_job_prepare_request(g, tok);
+}
+
+static void dg_job_prepare_parts(DGJob *g, DGTokenizer *tok, const char *state_json,
+                                 size_t state_length, const char *id, size_t id_length,
+                                 const char *questions_json, size_t questions_length,
+                                 uint32_t samples) {
+    memset(g, 0, sizeof *g);
+    dg_request_parts(&g->rq, state_json, state_length, id, id_length, questions_json,
+                     questions_length, samples);
+    dg_job_prepare_request(g, tok);
 }
 
 static void dg_job_free(DGJob *g) {
@@ -8018,16 +8224,19 @@ static void dg_job_normalize(DGJob *g) {
             g->w[x].prob[c] /= g->reads;
 }
 
-static int dg_systemone(DGModel *m, DGTokenizer *tok, const char *j, size_t len,
-                        DGPrefixCache *prefix_cache, DGWorkspace *workspace, char **output,
-                        size_t *output_length) {
+static int dg_systemone_execute(DGModel *m, DGTokenizer *tok, DGJob *prepared,
+                                DGPrefixCache *prefix_cache, DGWorkspace *workspace, char **output,
+                                size_t *output_length, jb_result **typed_result) {
+#ifndef JB_PROFILE
+    (void)tok;
+#endif
 #ifdef JB_PROFILE
     JBProfile *profile = &workspace->profile, *previous_profile = jb_profile_active;
     memset(profile, 0, sizeof *profile);
     jb_profile_active = profile;
 #endif
-    DGJob job;
-    dg_job_prepare(&job, tok, j, len);
+    DGJob job = *prepared;
+    memset(prepared, 0, sizeof *prepared);
     DGRequest *rq = &job.rq;
     DGTensor *emb = dg_tensor(m, "model.decoder.embed_tokens.weight");
 #ifdef JB_PROFILE
@@ -8154,9 +8363,13 @@ static int dg_systemone(DGModel *m, DGTokenizer *tok, const char *j, size_t len,
     dg_job_normalize(&job);
     double cand_ms = job.candidate_ns / 1e6, ms = (now_ns() - start) / 1e6;
     uint32_t billed = job.pt.n * (job.requested ? job.reads : 1);
-    *output = dg_format_answers(rq->qj, rq->qt, rq->qnt, job.w, job.nq, rq->reqid, billed, ms,
-                                prefill_ns / 1e6, cand_ms, job.reads, job.groups, cache_state,
-                                cache_tokens, processed_tokens, 1, output_length);
+    if (typed_result)
+        *typed_result = dg_typed_answers(rq->qj, rq->qt, job.w, job.nq, billed,
+                                         (uint32_t)processed_tokens, ms, prefill_ns / 1e6, cand_ms);
+    else
+        *output = dg_format_answers(rq->qj, rq->qt, rq->qnt, job.w, job.nq, rq->reqid, billed, ms,
+                                    prefill_ns / 1e6, cand_ms, job.reads, job.groups, cache_state,
+                                    cache_tokens, processed_tokens, 1, output_length);
 #ifdef JB_PROFILE
     uint64_t detailed =
         profile->moe_input_qdq + profile->moe_gated + profile->moe_hidden_qdq + profile->moe_down;
@@ -8198,17 +8411,35 @@ static int dg_systemone(DGModel *m, DGTokenizer *tok, const char *j, size_t len,
     return 0;
 }
 
+static int dg_systemone(DGModel *m, DGTokenizer *tok, const char *j, size_t len,
+                        DGPrefixCache *prefix_cache, DGWorkspace *workspace, char **output,
+                        size_t *output_length, jb_result **typed_result) {
+    DGJob job;
+    dg_job_prepare(&job, tok, j, len);
+    return dg_systemone_execute(m, tok, &job, prefix_cache, workspace, output, output_length,
+                                typed_result);
+}
+
+static int dg_systemone_parts(DGModel *m, DGTokenizer *tok, const char *state_json,
+                              size_t state_length, const char *id, size_t id_length,
+                              const char *questions_json, size_t questions_length, uint32_t samples,
+                              DGPrefixCache *prefix_cache, DGWorkspace *workspace,
+                              jb_result **typed_result) {
+    DGJob job;
+    dg_job_prepare_parts(&job, tok, state_json, state_length, id, id_length, questions_json,
+                         questions_length, samples);
+    return dg_systemone_execute(m, tok, &job, prefix_cache, workspace, NULL, NULL, typed_result);
+}
+
 /* Returns zero when the rows do not all hit the current exact schema entry;
  * the caller then executes them sequentially, allowing normal cache replace. */
-static int dg_system_batch(DGModel *m, DGTokenizer *tok, const char *const *row, const size_t *len,
-                           int batch, DGPrefixCache *prefix, DGWorkspace *workspace, char **output,
-                           size_t *output_length) {
+static int dg_system_batch_execute(DGModel *m, int batch, DGPrefixCache *prefix,
+                                   DGWorkspace *workspace, DGJob *g, char **output,
+                                   size_t *output_length, jb_result **typed_result) {
     if (batch < 2 || !prefix || !prefix->schema)
         return 0;
-    DGJob *g = xcalloc((size_t)batch, sizeof *g);
     int ok = 1;
     for (int b = 0; b < batch; b++) {
-        dg_job_prepare(&g[b], tok, row[b], len[b]);
         if (strcmp(g[b].sys, prefix->schema) || prefix->n > (int)g[b].pt.n ||
             memcmp(prefix->ids, g[b].pt.v, (size_t)prefix->n * sizeof *prefix->ids))
             ok = 0;
@@ -8325,14 +8556,46 @@ static int dg_system_batch(DGModel *m, DGTokenizer *tok, const char *const *row,
     for (int b = 0; b < batch; b++) {
         dg_job_normalize(&g[b]);
         uint32_t billed = g[b].pt.n * (g[b].requested ? g[b].reads : 1);
-        output[b] = dg_format_answers(
-            g[b].rq.qj, g[b].rq.qt, g[b].rq.qnt, g[b].w, g[b].nq, g[b].rq.reqid, billed,
-            total_ns / 1e6, prefill_ns / 1e6, g[b].candidate_ns / 1e6, g[b].reads, g[b].groups,
-            "hit", prefix->n, (int)g[b].pt.n - prefix->n, batch, &output_length[b]);
+        if (typed_result)
+            typed_result[b] =
+                dg_typed_answers(g[b].rq.qj, g[b].rq.qt, g[b].w, g[b].nq, billed,
+                                 (uint32_t)((int)g[b].pt.n - prefix->n), total_ns / 1e6,
+                                 prefill_ns / 1e6, g[b].candidate_ns / 1e6);
+        else
+            output[b] = dg_format_answers(
+                g[b].rq.qj, g[b].rq.qt, g[b].rq.qnt, g[b].w, g[b].nq, g[b].rq.reqid, billed,
+                total_ns / 1e6, prefill_ns / 1e6, g[b].candidate_ns / 1e6, g[b].reads, g[b].groups,
+                "hit", prefix->n, (int)g[b].pt.n - prefix->n, batch, &output_length[b]);
         dg_job_free(&g[b]);
     }
     jb_release(g);
     return 1;
+}
+
+static int dg_system_batch(DGModel *m, DGTokenizer *tok, const char *const *row, const size_t *len,
+                           int batch, DGPrefixCache *prefix, DGWorkspace *workspace, char **output,
+                           size_t *output_length, jb_result **typed_result) {
+    if (batch < 2 || !prefix || !prefix->schema)
+        return 0;
+    DGJob *job = xcalloc((size_t)batch, sizeof *job);
+    for (int b = 0; b < batch; b++)
+        dg_job_prepare(&job[b], tok, row[b], len[b]);
+    return dg_system_batch_execute(m, batch, prefix, workspace, job, output, output_length,
+                                   typed_result);
+}
+
+static int dg_system_batch_parts(DGModel *m, DGTokenizer *tok, const jb_input *input, int batch,
+                                 const char *questions_json, size_t questions_length,
+                                 DGPrefixCache *prefix, DGWorkspace *workspace,
+                                 jb_result **typed_result) {
+    if (batch < 2 || !prefix || !prefix->schema)
+        return 0;
+    DGJob *job = xcalloc((size_t)batch, sizeof *job);
+    for (int b = 0; b < batch; b++)
+        dg_job_prepare_parts(&job[b], tok, input[b].state_json.data, input[b].state_json.length,
+                             input[b].id.data, input[b].id.length, questions_json, questions_length,
+                             input[b].samples);
+    return dg_system_batch_execute(m, batch, prefix, workspace, job, NULL, NULL, typed_result);
 }
 struct jb_model {
     DGModel model;
@@ -8354,6 +8617,26 @@ struct jb_session {
     /* The most recent call's error, readable from any thread. */
     char error[sizeof jb_error_message];
 };
+
+typedef struct {
+    jb_session *session;
+    int accelerator_locked;
+} JBCallCleanup;
+
+static void jb_call_cleanup(void *context) {
+    volatile JBCallCleanup *cleanup = context;
+#ifdef JB_PROFILE
+    jb_profile_active = NULL;
+#endif
+    jb_session *session = cleanup->session;
+    if (session->workspace.active || session->workspace.kv_active ||
+        session->workspace.control_active)
+        session->poisoned = 1;
+    session->workspace.active = 0;
+    session->workspace.kv_active = 0;
+    session->workspace.control_active = 0;
+    jb_accel_call_unlock(cleanup->accelerator_locked);
+}
 
 static void jb_log_message(const jb_model *model, jb_log_level level, const char *message) {
     if (model && model->log)
@@ -8406,6 +8689,12 @@ static int jb_allocator_valid(const jb_allocator *allocator) {
            allocator->reallocate && allocator->release;
 }
 
+static void jb_model_load_cleanup(void *context) {
+    jb_model *model = context;
+    dg_release_accel(&model->model);
+    dg_unmap_shards(&model->model);
+}
+
 static jb_status jb_model_load_impl(const char *model_directory, jb_model **out_model,
                                     jb_allocator allocator, void *log_context, jb_log_fn log) {
     const jb_allocator *previous_allocator = jb_active_allocator;
@@ -8414,12 +8703,6 @@ static jb_status jb_model_load_impl(const char *model_directory, jb_model **out_
     JBErrorFrame frame;
     jb_frame_enter(&frame, JB_ERROR_MODEL);
     if (setjmp(frame.jump)) {
-        /* Memory is released with the frame; mapped shards and accelerator
-         * memory are not host memory. */
-        if (model) {
-            dg_release_accel(&model->model);
-            dg_unmap_shards(&model->model);
-        }
         jb_status status = jb_frame_fail(&frame);
         jb_active_allocator = previous_allocator;
         if (log)
@@ -8431,10 +8714,12 @@ static jb_status jb_model_load_impl(const char *model_directory, jb_model **out_
     model->log_context = log_context;
     model->log = log;
     atomic_init(&model->references, 1);
+    jb_cleanup_push(&frame, jb_model_load_cleanup, model);
     dg_load(&model->model, model_directory);
     dgt_load(&model->tokenizer, model_directory);
     dg_upload_model(&model->model);
     dg_prepare_exact_model(&model->model);
+    jb_cleanup_disarm(&frame, jb_model_load_cleanup, model);
     jb_frame_leave(&frame);
     jb_active_allocator = previous_allocator;
     jb_error_message[0] = 0;
@@ -8706,28 +8991,20 @@ static jb_status jb_session_decide_json_call(jb_session *session, const char *re
         return jb_invalid("request JSON is too large");
     const jb_allocator *previous_allocator = jb_active_allocator;
     jb_active_allocator = &session->model->allocator;
-    volatile int accel_locked = 0;
+    volatile JBCallCleanup cleanup = {session, 0};
     JBErrorFrame frame;
     jb_frame_enter(&frame, JB_ERROR_REQUEST);
     if (setjmp(frame.jump)) {
-#ifdef JB_PROFILE
-        jb_profile_active = NULL;
-#endif
-        if (session->workspace.active || session->workspace.kv_active ||
-            session->workspace.control_active)
-            session->poisoned = 1;
-        session->workspace.active = 0;
-        session->workspace.kv_active = 0;
-        session->workspace.control_active = 0;
-        jb_accel_call_unlock(accel_locked);
         jb_status status = jb_frame_fail(&frame);
         jb_active_allocator = previous_allocator;
         return status;
     }
-    accel_locked = jb_accel_call_lock(&session->model->model);
+    jb_cleanup_push(&frame, jb_call_cleanup, (void *)&cleanup);
+    cleanup.accelerator_locked = jb_accel_call_lock(&session->model->model);
     dg_systemone(&session->model->model, &session->model->tokenizer, request_json, request_length,
-                 &session->prefix, &session->workspace, out_json, out_length);
-    jb_accel_call_unlock(accel_locked);
+                 &session->prefix, &session->workspace, out_json, out_length, NULL);
+    jb_cleanup_disarm(&frame, jb_call_cleanup, (void *)&cleanup);
+    jb_accel_call_unlock(cleanup.accelerator_locked);
     jb_frame_leave(&frame);
     jb_active_allocator = previous_allocator;
     jb_error_message[0] = 0;
@@ -8748,25 +9025,16 @@ static jb_status jb_session_decide_json_batch_call(jb_session *session,
         return jb_invalid("batch arguments are invalid");
     const jb_allocator *previous_allocator = jb_active_allocator;
     jb_active_allocator = &session->model->allocator;
-    volatile int accel_locked = 0;
+    volatile JBCallCleanup cleanup = {session, 0};
     JBErrorFrame frame;
     jb_frame_enter(&frame, JB_ERROR_REQUEST);
     if (setjmp(frame.jump)) {
-#ifdef JB_PROFILE
-        jb_profile_active = NULL;
-#endif
-        if (session->workspace.active || session->workspace.kv_active ||
-            session->workspace.control_active)
-            session->poisoned = 1;
-        session->workspace.active = 0;
-        session->workspace.kv_active = 0;
-        session->workspace.control_active = 0;
-        jb_accel_call_unlock(accel_locked);
         jb_status status = jb_frame_fail(&frame);
         jb_active_allocator = previous_allocator;
         return status;
     }
-    accel_locked = jb_accel_call_lock(&session->model->model);
+    jb_cleanup_push(&frame, jb_call_cleanup, (void *)&cleanup);
+    cleanup.accelerator_locked = jb_accel_call_lock(&session->model->model);
     char **output = xcalloc(request_count, sizeof *output);
     size_t *length = xcalloc(request_count, sizeof *length);
     for (size_t i = 0; i < request_count; i++) {
@@ -8775,16 +9043,17 @@ static jb_status jb_session_decide_json_batch_call(jb_session *session,
         if (request_lengths[i] > JB_MAX_JSON)
             die("batch request JSON is too large");
     }
-    int batched =
-        request_count > 1 && dg_system_batch(&session->model->model, &session->model->tokenizer,
-                                             request_json, request_lengths, (int)request_count,
-                                             &session->prefix, &session->workspace, output, length);
+    int batched = request_count > 1 &&
+                  dg_system_batch(&session->model->model, &session->model->tokenizer, request_json,
+                                  request_lengths, (int)request_count, &session->prefix,
+                                  &session->workspace, output, length, NULL);
     if (!batched)
         for (size_t i = 0; i < request_count; i++)
             dg_systemone(&session->model->model, &session->model->tokenizer, request_json[i],
                          request_lengths[i], &session->prefix, &session->workspace, &output[i],
-                         &length[i]);
-    jb_accel_call_unlock(accel_locked);
+                         &length[i], NULL);
+    jb_cleanup_disarm(&frame, jb_call_cleanup, (void *)&cleanup);
+    jb_accel_call_unlock(cleanup.accelerator_locked);
     jb_frame_leave(&frame);
     jb_active_allocator = previous_allocator;
     *out_json = output;
@@ -8797,179 +9066,6 @@ void jb_free(void *allocation) {
     jb_release(allocation);
 }
 
-/* Parse the JSON number grammar directly, independent of the process locale. */
-static double jb_token_double(const char *json, const JTok *token) {
-    if (token->type != JT_PRIMITIVE || token->end <= token->start || token->end - token->start > 32)
-        die("invalid numeric result field");
-    char text[33], *end = NULL;
-    size_t length = (size_t)(token->end - token->start);
-    memcpy(text, json + token->start, length);
-    text[length] = 0;
-#if defined(_WIN32)
-    _locale_t locale = jb_numeric_locale();
-    double value = _strtod_l(text, &end, locale);
-#else
-    locale_t locale = jb_numeric_locale();
-    locale_t previous = uselocale(locale);
-    double value = strtod(text, &end);
-    uselocale(previous);
-#endif
-    if (end != text + length || !jb_finite(value))
-        die("invalid numeric result field");
-    return value;
-}
-
-static uint32_t jb_token_u32(const char *json, const JTok *token) {
-    double value = jb_token_double(json, token);
-    if (value < 0 || value > UINT32_MAX || value != floor(value))
-        die("invalid integer result field");
-    return (uint32_t)value;
-}
-
-static jb_string jb_result_string(const char *json, const JTok *token, char **cursor) {
-    char *decoded = jt_string(json, token);
-    size_t length = strlen(decoded);
-    memcpy(*cursor, decoded, length + 1);
-    jb_string result = {*cursor, length};
-    *cursor += length + 1;
-    jb_release(decoded);
-    return result;
-}
-
-static jb_result *jb_result_parse(const char *json, size_t length) {
-    int nt = 0;
-    JTok *tokens = json_tokens(json, length, &nt);
-    int answers_at = jt_obj_get(json, tokens, nt, 0, "answers");
-    if (!nt || tokens[0].type != JT_OBJECT || answers_at < 0 ||
-        tokens[answers_at].type != JT_OBJECT)
-        die("invalid Jev Bush result");
-    int answer_keys[DG_MAX_QUESTIONS];
-    int answer_count = direct_keys(tokens, nt, answers_at, answer_keys, DG_MAX_QUESTIONS);
-    size_t probability_count = 0, string_bytes = 0;
-    for (int a = 0; a < answer_count; a++) {
-        int object = answer_keys[a] + 1;
-        int probabilities = jt_obj_get(json, tokens, nt, object, "probabilities");
-        if (probabilities < 0 || tokens[probabilities].type != JT_OBJECT)
-            die("result answer lacks probabilities");
-        string_bytes = jb_size_add(
-            string_bytes, (size_t)(tokens[answer_keys[a]].end - tokens[answer_keys[a]].start) + 1);
-        for (int i = probabilities + 1; i < nt && tokens[i].parent >= probabilities; i++)
-            if (tokens[i].parent == probabilities && tokens[i].type == JT_STRING) {
-                probability_count++;
-                string_bytes =
-                    jb_size_add(string_bytes, (size_t)(tokens[i].end - tokens[i].start) + 1);
-                i++;
-            }
-    }
-    size_t bytes = sizeof(jb_result);
-    bytes = jb_align_up(bytes, _Alignof(jb_answer));
-    size_t answers_offset = bytes;
-    bytes = jb_size_add(bytes, jb_size_mul((size_t)answer_count, sizeof(jb_answer)));
-    bytes = jb_align_up(bytes, _Alignof(jb_probability));
-    size_t probabilities_offset = bytes;
-    bytes = jb_size_add(bytes, jb_size_mul(probability_count, sizeof(jb_probability)));
-    size_t strings_offset = bytes;
-    bytes = jb_size_add(bytes, string_bytes);
-    jb_result *result = xcalloc(bytes, 1);
-    jb_answer *answers = (jb_answer *)((unsigned char *)result + answers_offset);
-    jb_probability *probability =
-        (jb_probability *)((unsigned char *)result + probabilities_offset);
-    char *strings = (char *)result + strings_offset;
-    result->answers = answers;
-    result->answer_count = (size_t)answer_count;
-    for (int a = 0; a < answer_count; a++) {
-        int object = answer_keys[a] + 1;
-        jb_answer *answer = &answers[a];
-        answer->id = jb_result_string(json, &tokens[answer_keys[a]], &strings);
-        int type = jt_obj_get(json, tokens, nt, object, "type");
-        char *type_name = type >= 0 ? jt_string(json, &tokens[type]) : NULL;
-        if (!type_name)
-            die("result answer lacks type");
-        answer->type = !strcmp(type_name, "noul")     ? JB_DECISION_BOOLEAN
-                       : !strcmp(type_name, "choice") ? JB_DECISION_CHOICE
-                                                      : JB_DECISION_SCORE;
-        jb_release(type_name);
-        int probabilities = jt_obj_get(json, tokens, nt, object, "probabilities");
-        answer->probabilities = probability;
-        size_t count = 0, selected = 0;
-        double best = -1, expected = 0;
-        for (int i = probabilities + 1; i < nt && tokens[i].parent >= probabilities; i++)
-            if (tokens[i].parent == probabilities && tokens[i].type == JT_STRING) {
-                probability[count].candidate = jb_result_string(json, &tokens[i], &strings);
-                probability[count].probability = jb_token_double(json, &tokens[i + 1]);
-                expected += count * probability[count].probability;
-                if (probability[count].probability > best) {
-                    best = probability[count].probability;
-                    selected = count;
-                }
-                count++;
-                i++;
-            }
-        answer->probability_count = count;
-        answer->selected_candidate = selected;
-        answer->expected_score = expected;
-        int confidence_at = jt_obj_get(json, tokens, nt, object, "confidence");
-        if (confidence_at >= 0)
-            answer->confidence = jb_token_double(json, &tokens[confidence_at]);
-        probability += count;
-    }
-    int usage = jt_obj_get(json, tokens, nt, 0, "usage");
-    int timing = jt_obj_get(json, tokens, nt, 0, "timing_ms");
-    if (usage >= 0) {
-        int input = jt_obj_get(json, tokens, nt, usage, "input_tokens");
-        int prefill = jt_obj_get(json, tokens, nt, usage, "prefill_tokens");
-        if (input >= 0)
-            result->input_tokens = jb_token_u32(json, &tokens[input]);
-        if (prefill >= 0)
-            result->prefill_tokens = jb_token_u32(json, &tokens[prefill]);
-    }
-    if (timing >= 0) {
-        int total = jt_obj_get(json, tokens, nt, timing, "total");
-        int prefill = jt_obj_get(json, tokens, nt, timing, "prefill");
-        int candidates = jt_obj_get(json, tokens, nt, timing, "candidates");
-        if (total >= 0)
-            result->total_ms = jb_token_double(json, &tokens[total]);
-        if (prefill >= 0)
-            result->prefill_ms = jb_token_double(json, &tokens[prefill]);
-        if (candidates >= 0)
-            result->candidate_ms = jb_token_double(json, &tokens[candidates]);
-    }
-    jb_release(tokens);
-    return result;
-}
-
-static char *jb_typed_request(const jb_session *session, const jb_input *input, size_t *length) {
-    if (!session->questions_json)
-        die("typed inference requires a typed or JSON session schema");
-    if (!input || !input->state_json.data || !input->state_json.length)
-        die("typed input needs state_json");
-    if (input->state_json.length > JB_MAX_JSON || input->id.length > JB_MAX_JSON)
-        die("typed input is too large");
-    int nt = 0;
-    JTok *state = json_tokens(input->state_json.data, input->state_json.length, &nt);
-    if (!nt || state[0].parent != -1)
-        die("state_json must contain exactly one JSON value");
-    jb_release(state);
-    DGBuf request = {0};
-    db_ch(&request, '{');
-    if (input->id.length) {
-        char *id = jb_counted_string(input->id, "input id", 0);
-        db_mem(&request, "\"id\":", 5);
-        db_json_string(&request, id, 0);
-        db_ch(&request, ',');
-        jb_release(id);
-    }
-    db_mem(&request, "\"state\":", 8);
-    db_mem(&request, input->state_json.data, input->state_json.length);
-    db_mem(&request, ",\"questions\":", 13);
-    db_mem(&request, session->questions_json, session->questions_length);
-    if (input->samples)
-        db_fmt(&request, ",\"samples\":%u", input->samples);
-    db_ch(&request, '}');
-    *length = request.n;
-    return request.p;
-}
-
 static jb_status jb_session_decide_call(jb_session *session, const jb_input *input,
                                         jb_result **out_result) {
     if (out_result)
@@ -8978,6 +9074,7 @@ static jb_status jb_session_decide_call(jb_session *session, const jb_input *inp
         return jb_invalid("session, input, and output pointer are required");
     const jb_allocator *previous_allocator = jb_active_allocator;
     jb_active_allocator = &session->model->allocator;
+    volatile JBCallCleanup cleanup = {session, 0};
     JBErrorFrame frame;
     jb_frame_enter(&frame, JB_ERROR_REQUEST);
     if (setjmp(frame.jump)) {
@@ -8985,18 +9082,22 @@ static jb_status jb_session_decide_call(jb_session *session, const jb_input *inp
         jb_active_allocator = previous_allocator;
         return status;
     }
-    size_t request_length = 0, output_length = 0;
-    char *request = jb_typed_request(session, input, &request_length), *output = NULL;
-    jb_status status =
-        jb_session_decide_json_call(session, request, request_length, &output, &output_length);
-    jb_release(request);
-    if (status != JB_OK) {
-        jb_frame_abandon(&frame);
-        jb_active_allocator = previous_allocator;
-        return status;
-    }
-    jb_result *result = jb_result_parse(output, output_length);
-    jb_release(output);
+    if (!session->questions_json)
+        die("typed inference requires a typed or JSON session schema");
+    if (!input->state_json.data || !input->state_json.length ||
+        input->state_json.length > JB_MAX_JSON || input->id.length > JB_MAX_JSON ||
+        (input->id.length && !input->id.data) ||
+        (input->id.length && memchr(input->id.data, 0, input->id.length)))
+        die("typed input is invalid");
+    jb_result *result = NULL;
+    jb_cleanup_push(&frame, jb_call_cleanup, (void *)&cleanup);
+    cleanup.accelerator_locked = jb_accel_call_lock(&session->model->model);
+    dg_systemone_parts(&session->model->model, &session->model->tokenizer, input->state_json.data,
+                       input->state_json.length, input->id.data, input->id.length,
+                       session->questions_json, session->questions_length, input->samples,
+                       &session->prefix, &session->workspace, &result);
+    jb_cleanup_disarm(&frame, jb_call_cleanup, (void *)&cleanup);
+    jb_accel_call_unlock(cleanup.accelerator_locked);
     jb_frame_leave(&frame);
     jb_active_allocator = previous_allocator;
     *out_result = result;
@@ -9011,6 +9112,7 @@ static jb_status jb_session_decide_batch_call(jb_session *session, const jb_inpu
         return jb_invalid("typed batch arguments are invalid");
     const jb_allocator *previous_allocator = jb_active_allocator;
     jb_active_allocator = &session->model->allocator;
+    volatile JBCallCleanup cleanup = {session, 0};
     JBErrorFrame frame;
     jb_frame_enter(&frame, JB_ERROR_REQUEST);
     if (setjmp(frame.jump)) {
@@ -9018,31 +9120,31 @@ static jb_status jb_session_decide_batch_call(jb_session *session, const jb_inpu
         jb_active_allocator = previous_allocator;
         return status;
     }
-    char **request = xcalloc(input_count, sizeof *request);
-    size_t *request_length = xcalloc(input_count, sizeof *request_length);
-    for (size_t i = 0; i < input_count; i++)
-        request[i] = jb_typed_request(session, &inputs[i], &request_length[i]);
-    char **output = NULL;
-    size_t *output_length = NULL;
-    jb_status status =
-        jb_session_decide_json_batch_call(session, (const char *const *)request, request_length,
-                                          input_count, &output, &output_length);
-    for (size_t i = 0; i < input_count; i++)
-        jb_release(request[i]);
-    jb_release(request_length);
-    jb_release(request);
-    if (status != JB_OK) {
-        jb_frame_abandon(&frame);
-        jb_active_allocator = previous_allocator;
-        return status;
-    }
     jb_result **result = xcalloc(input_count, sizeof *result);
     for (size_t i = 0; i < input_count; i++) {
-        result[i] = jb_result_parse(output[i], output_length[i]);
-        jb_release(output[i]);
+        const jb_input *input = &inputs[i];
+        if (!session->questions_json || !input->state_json.data || !input->state_json.length ||
+            input->state_json.length > JB_MAX_JSON || input->id.length > JB_MAX_JSON ||
+            (input->id.length && !input->id.data) ||
+            (input->id.length && memchr(input->id.data, 0, input->id.length)))
+            die("typed input is invalid");
     }
-    jb_release(output_length);
-    jb_release(output);
+    jb_cleanup_push(&frame, jb_call_cleanup, (void *)&cleanup);
+    cleanup.accelerator_locked = jb_accel_call_lock(&session->model->model);
+    int batched =
+        dg_system_batch_parts(&session->model->model, &session->model->tokenizer, inputs,
+                              (int)input_count, session->questions_json, session->questions_length,
+                              &session->prefix, &session->workspace, result);
+    if (!batched)
+        for (size_t i = 0; i < input_count; i++) {
+            const jb_input *input = &inputs[i];
+            dg_systemone_parts(&session->model->model, &session->model->tokenizer,
+                               input->state_json.data, input->state_json.length, input->id.data,
+                               input->id.length, session->questions_json, session->questions_length,
+                               input->samples, &session->prefix, &session->workspace, &result[i]);
+        }
+    jb_cleanup_disarm(&frame, jb_call_cleanup, (void *)&cleanup);
+    jb_accel_call_unlock(cleanup.accelerator_locked);
     jb_frame_leave(&frame);
     jb_active_allocator = previous_allocator;
     *out_results = result;
@@ -10420,8 +10522,7 @@ static void dg_test_locale_numbers(void) {
         db_number(&b, 0.25);
         db_ch(&b, ' ');
         db_millis(&b, 1.5);
-        JTok t = {JT_PRIMITIVE, 0, 4, -1, 0};
-        int ok = !strcmp(b.p, "0.25 1.500") && jb_token_double("0.25", &t) == 0.25;
+        int ok = !strcmp(b.p, "0.25 1.500");
         jb_release(b.p);
         setlocale(LC_NUMERIC, restore);
         if (!ok)
@@ -10596,18 +10697,6 @@ static int selftest(void) {
         tokens[candidates].type != JT_ARRAY || tokens[candidates].size != 2)
         die("JSON self-test failed");
     jb_release(tokens);
-    static const char result_json[] =
-        "{\"answers\":{\"ok\":{\"type\":\"noul\",\"probabilities\":{\"true\":0.75,"
-        "\"false\":0.25},\"confidence\":0.5}},\"usage\":{\"input_tokens\":7,"
-        "\"prefill_tokens\":3},\"timing_ms\":{\"total\":2.5,\"prefill\":1.5,"
-        "\"candidates\":0.25}}";
-    jb_result *public_result = jb_result_parse(result_json, sizeof result_json - 1);
-    if (public_result->answer_count != 1 || public_result->answers[0].probability_count != 2 ||
-        public_result->answers[0].probabilities[0].probability != 0.75 ||
-        public_result->answers[0].selected_candidate != 0 || public_result->input_tokens != 7 ||
-        public_result->prefill_tokens != 3 || public_result->total_ms != 2.5)
-        die("public result self-test failed");
-    jb_result_free(public_result);
     jb_model *missing_model = NULL;
     if (jb_model_load("__jev_bush_missing_model__", &missing_model) != JB_ERROR_IO || missing_model)
         die("public I/O status self-test failed");

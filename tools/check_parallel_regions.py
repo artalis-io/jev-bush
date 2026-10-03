@@ -19,6 +19,14 @@ FAILS = {"die", "die2", "xmalloc", "xcalloc", "xrealloc", "xstrdup", "jb_allocat
          "jb_size_add", "jb_align_up"}
 KEYWORDS = {"if", "for", "while", "switch", "return", "sizeof", "defined", "_Pragma"}
 
+# Calls through DGKernelOps are invisible to the regex call graph. These are
+# the CPU callbacks reachable from parallel transformer regions and therefore
+# must themselves remain allocation- and failure-free.
+INDIRECT_PARALLEL_CALLBACKS = {
+    "dg_dot_avx2", "dg_dot_avx512", "dg_dot_ref", "dg_dots_each", "dg_dots_neon",
+    "dg_rms_avx2", "dg_rms_avx512", "dg_rms_neon", "dg_rms_ref",
+}
+
 
 def strip(source):
     """Blank comments and string/char literals, keeping offsets and lines."""
@@ -86,6 +94,13 @@ def main():
                     break
 
     findings = 0
+    for callback in sorted(INDIRECT_PARALLEL_CALLBACKS):
+        if callback not in functions:
+            continue
+        if callback in reach:
+            findings += 1
+            print(f"{path}: indirect parallel callback can fail or allocate: "
+                  f"{' -> '.join(reach[callback])}")
     for m in re.finditer(r"#\s*pragma\s+omp\s+parallel\b[^\n]*", text):
         i = m.end()
         # The governed statement follows any preprocessor lines, such as the

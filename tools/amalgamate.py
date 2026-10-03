@@ -10,6 +10,8 @@ ROOT = Path(__file__).resolve().parents[1]
 OUTPUT = ROOT / "jb.c"
 PARTS = (
     "foundation.inc",
+    "json.inc",
+    "model.inc",
     "kernels_scalar.inc",
     "kernels_avx2.inc",
     "kernels_avx512.inc",
@@ -17,6 +19,7 @@ PARTS = (
     "kernels_dispatch.inc",
     "cuda.inc",
     "engine.inc",
+    "decision.inc",
     "api.inc",
     "cli_tests.inc",
 )

@@ -171,7 +171,7 @@ To build specifically for an AVX2/FMA machine while keeping the binary free of
 AVX-512 instructions:
 
 ```sh
-cc -O3 -mavx2 -mfma -mno-avx512f -std=c11 -Wall -Wextra -pedantic \
+cc -O3 -mavx2 -mfma -mno-avx512f -DJB_AVX2_ONLY -std=c11 -Wall -Wextra -pedantic \
   -fopenmp jb.c -lm -o jb
 ```
 
@@ -299,9 +299,10 @@ The normal `jb.c` build still contains the CLI, but the CLI is itself a client
 of `jb_model_load()`, `jb_session_create_json()`, and the session JSON decision
 calls. There is no separate privileged inference route.
 
-The maintained implementation is split into focused `src/*.inc` modules. The
-portable/reference kernels, AVX2, AVX-512, NEON, runtime dispatch, and CUDA
-backend each have their own source module.
+The maintained implementation is split into focused `src/*.inc` modules for
+platform/ownership primitives, JSON, model/tokenizer loading, transformer
+execution, decision semantics, the public API, CLI/tests, and each CPU or CUDA
+backend.
 `tools/amalgamate.py` deterministically produces the self-contained `jb.c`
 distribution; `make check-amalgamation` rejects a stale or hand-edited copy.
 Run `make format` with clang-format 18 or newer and `make lint` before
@@ -339,6 +340,11 @@ returns its deterministic machine-readable result. Batch variants preserve
 input order and use the existing cross-document microbatch path when the exact
 schema prefix permits it. See [`examples/library.c`](examples/library.c)
 for a complete typed example.
+
+Typed calls enter the decision engine directly and construct their contiguous
+`jb_result` directly from candidate probabilities. They do not serialize a
+complete request or result and parse it back; JSON calls are a compatibility
+adapter around the same engine.
 
 Call `jb_api_version()` before using a dynamically loaded library and require
 `JB_API_VERSION`; `jb_get_abi_info()` additionally reports every public
@@ -436,13 +442,13 @@ gcc -O3 -std=c11 -Wall -Wextra -pedantic -fopenmp jb.c -lm -o jb.exe
 Windows with MSVC, which implements OpenMP 2.0:
 
 ```bat
-cl /O2 /std:c11 /W4 /openmp /arch:AVX2 jb.c
+cl /O2 /std:c11 /experimental:c11atomics /W4 /openmp /arch:AVX2 jb.c
 ```
 
 An MSVC DLL and import library can be built without the CLI:
 
 ```bat
-cl /O2 /std:c11 /W4 /LD /DJB_NO_MAIN /DJB_SHARED /DJB_BUILD_SHARED jb.c /Fe:jb.dll
+cl /O2 /std:c11 /experimental:c11atomics /W4 /LD /DJB_NO_MAIN /DJB_SHARED /DJB_BUILD_SHARED jb.c /Fe:jb.dll
 ```
 
 Any of these with `-DJB_SCALAR` forces the portable reference kernels whatever

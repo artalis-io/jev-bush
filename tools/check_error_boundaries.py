@@ -88,6 +88,19 @@ def main():
     unexpected = framed - expected_frames
     if unexpected:
         findings.append("unreviewed error frames: " + ", ".join(sorted(unexpected)))
+
+    cleanup_frames = {
+        "jb_model_load_impl": "jb_model_load_cleanup",
+        "jb_session_decide_batch_call": "jb_call_cleanup",
+        "jb_session_decide_call": "jb_call_cleanup",
+        "jb_session_decide_json_batch_call": "jb_call_cleanup",
+        "jb_session_decide_json_call": "jb_call_cleanup",
+    }
+    for name, cleanup in cleanup_frames.items():
+        body = bodies.get(name, "")
+        if not (re.search(rf"\bjb_cleanup_push\s*\([^;]*\b{cleanup}\b", body) and
+                re.search(rf"\bjb_cleanup_disarm\s*\([^;]*\b{cleanup}\b", body)):
+            findings.append(f"{name} does not arm and disarm {cleanup}")
     if findings:
         print("\n".join(f"{source_path}: {finding}" for finding in findings))
         return 1
