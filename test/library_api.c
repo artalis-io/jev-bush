@@ -22,8 +22,8 @@ int main(void) {
           abi.model_info_size == sizeof(jb_model_info);
 
     jb_model_info model_info = {.struct_size = sizeof model_info};
-    ok &= expect(jb_model_get_info(NULL, &model_info), JB_ERROR_INVALID_ARGUMENT,
-                 "NULL model info");
+    ok &=
+        expect(jb_model_get_info(NULL, &model_info), JB_ERROR_INVALID_ARGUMENT, "NULL model info");
     ok &= model_info.model_family == NULL;
 
     jb_model *model = (jb_model *)(uintptr_t)1;

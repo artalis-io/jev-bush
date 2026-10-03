@@ -1495,7 +1495,7 @@ static int finish_output(int rc) {
     return rc;
 }
 
-int main(int ac, char **av) {
+static int jb_cli_main(int ac, char **av) {
     if (ac == 2 && !strcmp(av[1], "--selftest"))
         return finish_output(selftest());
     if (ac == 2 && !strcmp(av[1], "--bench-kernels"))
@@ -1512,5 +1512,23 @@ int main(int ac, char **av) {
         return finish_output(dg_eval_file(av[1], av[3]));
     usage();
     return 2;
+}
+
+/* CLI code uses the same tracked cleanup as the library. This is the one
+ * root frame for commands and self-tests; leaf helpers never terminate the
+ * process directly during ordinary execution. */
+int main(int ac, char **av) {
+    JBErrorFrame frame;
+    jb_frame_enter(&frame, JB_ERROR_INTERNAL);
+    if (setjmp(frame.jump)) {
+        char message[sizeof jb_error_message];
+        memcpy(message, jb_error_message, sizeof message);
+        jb_frame_abandon(&frame);
+        fprintf(stderr, "jb: %s\n", message);
+        return 2;
+    }
+    int status = jb_cli_main(ac, av);
+    jb_frame_leave(&frame);
+    return status;
 }
 #endif

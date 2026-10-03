@@ -37,9 +37,12 @@ endif
 JB_CFLAGS = $(CFLAGS) $(WARNFLAGS) $(HARDEN_CFLAGS)
 LDFLAGS += $(HARDEN_LDFLAGS)
 
-JB_MODULES = src/jb.c src/foundation.inc src/cuda.inc src/engine.inc src/api.inc src/cli_tests.inc
+JB_MODULES = src/jb.c src/foundation.inc src/kernels_scalar.inc src/kernels_avx2.inc \
+	src/kernels_avx512.inc src/kernels_neon.inc src/kernels_dispatch.inc src/cuda.inc \
+	src/engine.inc src/api.inc src/cli_tests.inc
 
-.PHONY: all clean check check-amalgamation debug sanitize thread-sanitize install uninstall FORCE
+.PHONY: all clean check check-amalgamation debug format install install-hooks lint sanitize \
+	thread-sanitize uninstall FORCE
 
 FORCE:
 
@@ -65,6 +68,17 @@ jb.c: $(JB_MODULES) tools/amalgamate.py
 
 check-amalgamation:
 	python3 tools/amalgamate.py --check
+	python3 tools/check_error_boundaries.py jb.c jb.h
+	python3 tools/check_parallel_regions.py jb.c
+
+format:
+	tools/format.sh
+
+lint:
+	tools/lint.sh
+
+install-hooks:
+	git config core.hooksPath .githooks
 
 jb: jb.c jb.h .build/config
 	$(CC) $(CPPFLAGS) $(JB_CFLAGS) $(OMPFLAGS) jb.c $(LDFLAGS) $(OMPFLAGS) $(LDLIBS) -o $@

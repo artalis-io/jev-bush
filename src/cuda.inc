@@ -2151,4 +2151,3 @@ static const char *dg_accel_failure(const char **log) {
 }
 #endif
 #endif
-

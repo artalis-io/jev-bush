@@ -136,8 +136,6 @@ static void dg_workspace_end(DGWorkspace *workspace) {
 }
 
 static void dg_workspace_destroy(DGWorkspace *workspace) {
-    if (workspace->active || workspace->kv_active || workspace->control_active)
-        die_status(JB_ERROR_INTERNAL, "destroying active inference workspace");
     if (workspace->arena.allocation)
         jb_arena_free(&workspace->arena);
     if (workspace->kv_arena.allocation)
@@ -387,14 +385,11 @@ static void dg_worker_kv_end(DGWorkspace *workspace, DGKV *kv, int documents) {
     JB_TO(kv_free, kv_free_start);
 }
 
-static void dg_kv_free(JBArena *storage, DGKV *kv, int documents) {
+static void dg_kv_free(JBArena *storage) {
     JB_TICK(kv_free_start);
     if (!storage->allocation)
         return;
-    if (storage->used != storage->size || storage->peak != storage->size)
-        die("corrupt K/V storage ownership");
     jb_arena_free(storage);
-    memset(kv, 0, jb_size_mul(jb_size_mul((size_t)documents, DG_L), sizeof *kv));
     JB_TO(kv_free, kv_free_start);
 }
 
@@ -1258,7 +1253,7 @@ static void dg_decode_end(DGWorkspace *workspace) {
 static void dg_prefix_free(DGPrefixCache *c) {
     if (!c)
         return;
-    dg_kv_free(&c->kv_storage, c->kv, 1);
+    dg_kv_free(&c->kv_storage);
     if (c->metadata.allocation)
         jb_arena_free(&c->metadata);
     memset(c, 0, sizeof *c);
@@ -2689,4 +2684,3 @@ static int dg_system_batch(DGModel *m, DGTokenizer *tok, const char *const *row,
     jb_release(g);
     return 1;
 }
-

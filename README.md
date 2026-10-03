@@ -79,6 +79,14 @@ needs: no contraction into FMAs, correctly rounded division and square root,
 and denormals kept. Another GPU API would have to prove the same before it
 could join, which is why the others remain out of scope.
 
+The optional CUDA implementation has process lifetime. It retains CUDA's
+primary context, its compiled module, and the dynamically loaded driver/NVRTC
+libraries until process exit. Consequently a `-DJB_CUDA` shared library must
+not be unloaded with `dlclose`; use the default CPU library when unloadability
+is required. Model-specific device allocations are still released by
+`jb_model_free()`. This narrow lifetime contract avoids a global shutdown API
+and races between shutdown and sessions in other threads.
+
 Exactness has a price. The exact kernels give up tensor cores, split sums and
 FP32 attention scores, so the GPU runs roughly an order of magnitude below a
 non-exact engine on the same hardware. Even so, the full 400-row benchmark
@@ -291,9 +299,15 @@ The normal `jb.c` build still contains the CLI, but the CLI is itself a client
 of `jb_model_load()`, `jb_session_create_json()`, and the session JSON decision
 calls. There is no separate privileged inference route.
 
-The maintained implementation is split into focused `src/*.inc` modules.
+The maintained implementation is split into focused `src/*.inc` modules. The
+portable/reference kernels, AVX2, AVX-512, NEON, runtime dispatch, and CUDA
+backend each have their own source module.
 `tools/amalgamate.py` deterministically produces the self-contained `jb.c`
 distribution; `make check-amalgamation` rejects a stale or hand-edited copy.
+Run `make format` with clang-format 18 or newer and `make lint` before
+committing. `make install-hooks` enables the repository's linting pre-commit
+hook; the included `.pre-commit-config.yaml` provides the same check for users
+of the `pre-commit` tool.
 
 A `jb_model` is immutable after loading and may be shared by multiple sessions.
 Sessions retain their model, so the caller may release its model reference as

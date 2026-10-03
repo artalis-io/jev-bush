@@ -163,8 +163,7 @@ void jb_model_retain(jb_model *model) {
      * instead of allowing wraparound and premature destruction. */
     while (references != UINT_MAX &&
            !atomic_compare_exchange_weak_explicit(&model->references, &references, references + 1,
-                                                  memory_order_relaxed,
-                                                  memory_order_relaxed)) {
+                                                  memory_order_relaxed, memory_order_relaxed)) {
     }
 }
 
@@ -409,8 +408,7 @@ static jb_status jb_session_decide_json_batch_call(jb_session *session,
     if (out_lengths)
         *out_lengths = NULL;
     if (!session || !request_json || !request_lengths || !request_count ||
-        request_count > JB_MAX_BATCH_INPUTS ||
-        !out_json || !out_lengths)
+        request_count > JB_MAX_BATCH_INPUTS || !out_json || !out_lengths)
         return jb_invalid("batch arguments are invalid");
     const jb_allocator *previous_allocator = jb_active_allocator;
     jb_active_allocator = &session->model->allocator;

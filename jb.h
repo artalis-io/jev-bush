@@ -29,6 +29,7 @@ typedef struct jb_session jb_session;
 /* Public discriminants have a fixed representation across C compilers and
  * foreign-function interfaces. Their values are part of the ABI. */
 typedef uint32_t jb_status;
+
 enum {
     JB_OK = 0,
     JB_ERROR_INVALID_ARGUMENT = 1,
@@ -40,6 +41,7 @@ enum {
 };
 
 typedef uint32_t jb_log_level;
+
 enum { JB_LOG_ERROR = 0, JB_LOG_WARNING = 1, JB_LOG_INFO = 2 };
 
 typedef void *(*jb_allocate_fn)(void *context, size_t size);
@@ -98,11 +100,8 @@ typedef struct {
 } jb_string;
 
 typedef uint32_t jb_decision_type;
-enum {
-    JB_DECISION_BOOLEAN = 0,
-    JB_DECISION_CHOICE = 1,
-    JB_DECISION_SCORE = 2
-};
+
+enum { JB_DECISION_BOOLEAN = 0, JB_DECISION_CHOICE = 1, JB_DECISION_SCORE = 2 };
 
 typedef struct {
     size_t struct_size;

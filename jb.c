@@ -209,7 +209,10 @@ static uint64_t now_ns(void);
  * long-lived object partway through a call (session arenas, the prefix
  * cache) is detached with jb_untrack() so a later failure cannot free it.
  * Tracked allocations are released only by the thread that made them; OpenMP
- * workers allocate untracked. Without a frame (the CLI), die() exits. */
+ * workers allocate untracked. Every fallible public entry crosses a frame,
+ * the CLI installs one root frame, and destructors are non-failing. CI checks
+ * those call-graph invariants as well as every OpenMP region. Reaching die()
+ * without a frame therefore means an internal call-contract violation. */
 /* max_align_t is missing from MSVC's C mode; align the header for the
  * strictest standard types instead so every allocation stays aligned. */
 typedef union {
@@ -277,8 +280,8 @@ static int jb_in_parallel(void) {
 }
 
 /* die() must never run inside an OpenMP parallel region: workers have no
- * error frame, so it would exit the host process, and a longjmp out of the
- * region is undefined. Reaching it there is an engine bug; stop loudly. */
+ * error frame, and a longjmp out of the region is undefined. Reaching it
+ * there is an engine bug; stop loudly. */
 static void jb_forbid_parallel(const char *a, const char *b) {
     if (jb_in_parallel()) {
         fprintf(stderr, "jb: internal error: failure inside a parallel region: %s%s%s\n", a,
@@ -2032,101 +2035,6 @@ static float dg_f8e4m3(uint8_t u) {
         x = (float)m * 0x1p-9f;
     return u >> 7 ? -x : x;
 }
-
-/* Strict AVX-512 assigns one output row to each vector lane. Columns are
- * consequently accumulated in exactly the scalar reference order. These
- * load-time images make the 16 rows contiguous for every column; NVFP4
- * keeps its nibbles packed and expands its block scales to lane vectors. */
-#if defined(JB_HAVE_AVX512) && JB_STRICT_MATH
-enum { DG_EXACT_ROWS = 16 };
-
-static size_t dg_exact_place(size_t *at, size_t bytes) {
-    *at = jb_align_up(*at, 64);
-    size_t p = *at;
-    *at = jb_size_add(*at, bytes);
-    return p;
-}
-
-static void dg_exact_pack_bf16(DGTensor *t) {
-    int rows = (int)t->shape[0], cols = (int)t->shape[1];
-    for (int r = 0; r < rows; r += DG_EXACT_ROWS)
-        for (int c = 0; c < cols; c++)
-            for (int lane = 0; lane < DG_EXACT_ROWS; lane++)
-                memcpy((uint8_t *)t->exact +
-                           (((size_t)r / DG_EXACT_ROWS * cols + c) * DG_EXACT_ROWS + lane) * 2,
-                       t->data + ((size_t)(r + lane) * cols + c) * 2, 2);
-}
-
-static void dg_exact_pack_nvfp4(DGTensor *w, DGTensor *s, int rows, int cols) {
-    for (int r = 0; r < rows; r += DG_EXACT_ROWS) {
-        for (int c = 0; c < cols; c++)
-            for (int lane = 0; lane < DG_EXACT_ROWS / 2; lane++) {
-                int r0 = r + lane, r1 = r + lane + DG_EXACT_ROWS / 2;
-                uint8_t a = w->data[(size_t)r0 * cols / 2 + c / 2],
-                        b = w->data[(size_t)r1 * cols / 2 + c / 2];
-                a = (uint8_t)(c & 1 ? a >> 4 : a & 15);
-                b = (uint8_t)(c & 1 ? b >> 4 : b & 15);
-                ((uint8_t *)w->exact)[((size_t)r / DG_EXACT_ROWS * cols + c) * 8 + lane] =
-                    (uint8_t)(a | b << 4);
-            }
-        for (int b = 0; b < cols / 16; b++)
-            for (int lane = 0; lane < DG_EXACT_ROWS; lane++)
-                ((uint8_t *)
-                     s->exact)[((size_t)r / DG_EXACT_ROWS * (cols / 16) + b) * DG_EXACT_ROWS +
-                               lane] = s->data[(size_t)(r + lane) * cols / 16 + b];
-    }
-}
-
-static void dg_prepare_exact_model(DGModel *m) {
-    if (m->accel || strcmp(dg_kernels()->name, "avx512-exact"))
-        return;
-    size_t bytes = 0;
-    for (size_t i = 0; i < m->nt; i++) {
-        DGTensor *t = &m->tensor[i];
-        if (t->dtype == DG_BF16 && t->nd == 2 && t->shape[0] % DG_EXACT_ROWS == 0) {
-            t->exact_offset = dg_exact_place(&bytes, (size_t)t->bytes) + 1;
-        }
-    }
-    for (int i = 0; m->nvfp4 && i < DG_L * DG_EXPERTS; i++) {
-        DGNvExpert *v = &m->nvexpert[i];
-        DGTensor *w[3] = {v->wg, v->wu, v->wd}, *s[3] = {v->sg, v->su, v->sd};
-        int rows[3] = {DG_MOE, DG_MOE, DG_H}, cols[3] = {DG_H, DG_H, DG_MOE};
-        for (int k = 0; k < 3; k++) {
-            size_t wp = dg_exact_place(&bytes, (size_t)rows[k] * cols[k] / 2),
-                   sp = dg_exact_place(&bytes, (size_t)rows[k] * cols[k] / 16);
-            w[k]->exact_offset = wp + 1;
-            s[k]->exact_offset = sp + 1;
-        }
-    }
-    m->exact_weights = xmalloc(bytes);
-    for (size_t i = 0; i < m->nt; i++)
-        if (m->tensor[i].exact_offset)
-            m->tensor[i].exact = m->exact_weights + m->tensor[i].exact_offset - 1;
-    for (size_t i = 0; i < m->nt; i++) {
-        DGTensor *t = &m->tensor[i];
-        if (t->dtype == DG_BF16 && t->nd == 2 && t->exact)
-            dg_exact_pack_bf16(t);
-    }
-    if (m->nvfp4) {
-        int i;
-#ifdef _OPENMP
-        JB_OMP();
-#pragma omp parallel for schedule(dynamic)
-#endif
-        for (i = 0; i < DG_L * DG_EXPERTS; i++) {
-            DGNvExpert *v = &m->nvexpert[i];
-            dg_exact_pack_nvfp4(v->wg, v->sg, DG_MOE, DG_H);
-            dg_exact_pack_nvfp4(v->wu, v->su, DG_MOE, DG_H);
-            dg_exact_pack_nvfp4(v->wd, v->sd, DG_H, DG_MOE);
-        }
-    }
-}
-#else
-static void dg_prepare_exact_model(DGModel *m) {
-    (void)m;
-}
-#endif
-
 static float dg_f8e4m3_round(float x) {
     if (!(x > 0))
         return 0;
@@ -2677,7 +2585,6 @@ static void dg_dots_each(const float *a, const float *b, size_t stride, int keys
 static void dg_dots(const float *a, const float *b, size_t stride, int keys, int n, float *out) {
     dg_kernels()->dots(a, b, stride, keys, n, out);
 }
-
 /* AVX2 backend. */
 #if defined(JB_HAVE_AVX2)
 static JB_TARGET_AVX2 __m256 dg_bf16x8(const uint8_t *p) {
@@ -2828,6 +2735,99 @@ static JB_TARGET_AVX2 double dg_dot_avx2(const float *a, const float *b, int n) 
     for (; i < n; i++)
         s += (double)a[i] * b[i];
     return s;
+}
+#endif
+/* Strict AVX-512 assigns one output row to each vector lane. Columns are
+ * consequently accumulated in exactly the scalar reference order. These
+ * load-time images make the 16 rows contiguous for every column; NVFP4
+ * keeps its nibbles packed and expands its block scales to lane vectors. */
+#if defined(JB_HAVE_AVX512) && JB_STRICT_MATH
+enum { DG_EXACT_ROWS = 16 };
+
+static size_t dg_exact_place(size_t *at, size_t bytes) {
+    *at = jb_align_up(*at, 64);
+    size_t p = *at;
+    *at = jb_size_add(*at, bytes);
+    return p;
+}
+
+static void dg_exact_pack_bf16(DGTensor *t) {
+    int rows = (int)t->shape[0], cols = (int)t->shape[1];
+    for (int r = 0; r < rows; r += DG_EXACT_ROWS)
+        for (int c = 0; c < cols; c++)
+            for (int lane = 0; lane < DG_EXACT_ROWS; lane++)
+                memcpy((uint8_t *)t->exact +
+                           (((size_t)r / DG_EXACT_ROWS * cols + c) * DG_EXACT_ROWS + lane) * 2,
+                       t->data + ((size_t)(r + lane) * cols + c) * 2, 2);
+}
+
+static void dg_exact_pack_nvfp4(DGTensor *w, DGTensor *s, int rows, int cols) {
+    for (int r = 0; r < rows; r += DG_EXACT_ROWS) {
+        for (int c = 0; c < cols; c++)
+            for (int lane = 0; lane < DG_EXACT_ROWS / 2; lane++) {
+                int r0 = r + lane, r1 = r + lane + DG_EXACT_ROWS / 2;
+                uint8_t a = w->data[(size_t)r0 * cols / 2 + c / 2],
+                        b = w->data[(size_t)r1 * cols / 2 + c / 2];
+                a = (uint8_t)(c & 1 ? a >> 4 : a & 15);
+                b = (uint8_t)(c & 1 ? b >> 4 : b & 15);
+                ((uint8_t *)w->exact)[((size_t)r / DG_EXACT_ROWS * cols + c) * 8 + lane] =
+                    (uint8_t)(a | b << 4);
+            }
+        for (int b = 0; b < cols / 16; b++)
+            for (int lane = 0; lane < DG_EXACT_ROWS; lane++)
+                ((uint8_t *)
+                     s->exact)[((size_t)r / DG_EXACT_ROWS * (cols / 16) + b) * DG_EXACT_ROWS +
+                               lane] = s->data[(size_t)(r + lane) * cols / 16 + b];
+    }
+}
+
+static void dg_prepare_exact_model(DGModel *m) {
+    if (m->accel || strcmp(dg_kernels()->name, "avx512-exact"))
+        return;
+    size_t bytes = 0;
+    for (size_t i = 0; i < m->nt; i++) {
+        DGTensor *t = &m->tensor[i];
+        if (t->dtype == DG_BF16 && t->nd == 2 && t->shape[0] % DG_EXACT_ROWS == 0) {
+            t->exact_offset = dg_exact_place(&bytes, (size_t)t->bytes) + 1;
+        }
+    }
+    for (int i = 0; m->nvfp4 && i < DG_L * DG_EXPERTS; i++) {
+        DGNvExpert *v = &m->nvexpert[i];
+        DGTensor *w[3] = {v->wg, v->wu, v->wd}, *s[3] = {v->sg, v->su, v->sd};
+        int rows[3] = {DG_MOE, DG_MOE, DG_H}, cols[3] = {DG_H, DG_H, DG_MOE};
+        for (int k = 0; k < 3; k++) {
+            size_t wp = dg_exact_place(&bytes, (size_t)rows[k] * cols[k] / 2),
+                   sp = dg_exact_place(&bytes, (size_t)rows[k] * cols[k] / 16);
+            w[k]->exact_offset = wp + 1;
+            s[k]->exact_offset = sp + 1;
+        }
+    }
+    m->exact_weights = xmalloc(bytes);
+    for (size_t i = 0; i < m->nt; i++)
+        if (m->tensor[i].exact_offset)
+            m->tensor[i].exact = m->exact_weights + m->tensor[i].exact_offset - 1;
+    for (size_t i = 0; i < m->nt; i++) {
+        DGTensor *t = &m->tensor[i];
+        if (t->dtype == DG_BF16 && t->nd == 2 && t->exact)
+            dg_exact_pack_bf16(t);
+    }
+    if (m->nvfp4) {
+        int i;
+#ifdef _OPENMP
+        JB_OMP();
+#pragma omp parallel for schedule(dynamic)
+#endif
+        for (i = 0; i < DG_L * DG_EXPERTS; i++) {
+            DGNvExpert *v = &m->nvexpert[i];
+            dg_exact_pack_nvfp4(v->wg, v->sg, DG_MOE, DG_H);
+            dg_exact_pack_nvfp4(v->wu, v->su, DG_MOE, DG_H);
+            dg_exact_pack_nvfp4(v->wd, v->sd, DG_H, DG_MOE);
+        }
+    }
+}
+#else
+static void dg_prepare_exact_model(DGModel *m) {
+    (void)m;
 }
 #endif
 
@@ -3122,7 +3122,6 @@ static JB_TARGET_AVX512 double dg_dot_avx512(const float *a, const float *b, int
     return s;
 }
 #endif
-
 /* NEON backend (AArch64). Each vector lane computes one output row (or one
  * attention key), and each lane accumulates in the reference kernels' order
  * with a separate multiply and add. Strict builds therefore match the
@@ -3406,7 +3405,6 @@ static void dg_rms_neon(float *y, const float *x, const DGTensor *scale, int n) 
         y[i] = x[i] * q * (scale ? dg_at(scale, i) : 1.0f);
 }
 #endif
-
 #if defined(JB_HAVE_AVX2)
 static int jb_cpu_has_avx2(void) {
 #if defined(JB_SCALAR)
@@ -5650,7 +5648,6 @@ static const char *dg_accel_failure(const char **log) {
 }
 #endif
 #endif
-
 static DGTensor *dg_layer_tensor(DGModel *m, int l, const char *tail) {
     char n[192];
     snprintf(n, sizeof n, "model.decoder.layers.%d.%s", l, tail);
@@ -5789,8 +5786,6 @@ static void dg_workspace_end(DGWorkspace *workspace) {
 }
 
 static void dg_workspace_destroy(DGWorkspace *workspace) {
-    if (workspace->active || workspace->kv_active || workspace->control_active)
-        die_status(JB_ERROR_INTERNAL, "destroying active inference workspace");
     if (workspace->arena.allocation)
         jb_arena_free(&workspace->arena);
     if (workspace->kv_arena.allocation)
@@ -6040,14 +6035,11 @@ static void dg_worker_kv_end(DGWorkspace *workspace, DGKV *kv, int documents) {
     JB_TO(kv_free, kv_free_start);
 }
 
-static void dg_kv_free(JBArena *storage, DGKV *kv, int documents) {
+static void dg_kv_free(JBArena *storage) {
     JB_TICK(kv_free_start);
     if (!storage->allocation)
         return;
-    if (storage->used != storage->size || storage->peak != storage->size)
-        die("corrupt K/V storage ownership");
     jb_arena_free(storage);
-    memset(kv, 0, jb_size_mul(jb_size_mul((size_t)documents, DG_L), sizeof *kv));
     JB_TO(kv_free, kv_free_start);
 }
 
@@ -6911,7 +6903,7 @@ static void dg_decode_end(DGWorkspace *workspace) {
 static void dg_prefix_free(DGPrefixCache *c) {
     if (!c)
         return;
-    dg_kv_free(&c->kv_storage, c->kv, 1);
+    dg_kv_free(&c->kv_storage);
     if (c->metadata.allocation)
         jb_arena_free(&c->metadata);
     memset(c, 0, sizeof *c);
@@ -8342,7 +8334,6 @@ static int dg_system_batch(DGModel *m, DGTokenizer *tok, const char *const *row,
     jb_release(g);
     return 1;
 }
-
 struct jb_model {
     DGModel model;
     DGTokenizer tokenizer;
@@ -8508,8 +8499,7 @@ void jb_model_retain(jb_model *model) {
      * instead of allowing wraparound and premature destruction. */
     while (references != UINT_MAX &&
            !atomic_compare_exchange_weak_explicit(&model->references, &references, references + 1,
-                                                  memory_order_relaxed,
-                                                  memory_order_relaxed)) {
+                                                  memory_order_relaxed, memory_order_relaxed)) {
     }
 }
 
@@ -8754,8 +8744,7 @@ static jb_status jb_session_decide_json_batch_call(jb_session *session,
     if (out_lengths)
         *out_lengths = NULL;
     if (!session || !request_json || !request_lengths || !request_count ||
-        request_count > JB_MAX_BATCH_INPUTS ||
-        !out_json || !out_lengths)
+        request_count > JB_MAX_BATCH_INPUTS || !out_json || !out_lengths)
         return jb_invalid("batch arguments are invalid");
     const jb_allocator *previous_allocator = jb_active_allocator;
     jb_active_allocator = &session->model->allocator;
@@ -10665,7 +10654,7 @@ static int finish_output(int rc) {
     return rc;
 }
 
-int main(int ac, char **av) {
+static int jb_cli_main(int ac, char **av) {
     if (ac == 2 && !strcmp(av[1], "--selftest"))
         return finish_output(selftest());
     if (ac == 2 && !strcmp(av[1], "--bench-kernels"))
@@ -10682,5 +10671,23 @@ int main(int ac, char **av) {
         return finish_output(dg_eval_file(av[1], av[3]));
     usage();
     return 2;
+}
+
+/* CLI code uses the same tracked cleanup as the library. This is the one
+ * root frame for commands and self-tests; leaf helpers never terminate the
+ * process directly during ordinary execution. */
+int main(int ac, char **av) {
+    JBErrorFrame frame;
+    jb_frame_enter(&frame, JB_ERROR_INTERNAL);
+    if (setjmp(frame.jump)) {
+        char message[sizeof jb_error_message];
+        memcpy(message, jb_error_message, sizeof message);
+        jb_frame_abandon(&frame);
+        fprintf(stderr, "jb: %s\n", message);
+        return 2;
+    }
+    int status = jb_cli_main(ac, av);
+    jb_frame_leave(&frame);
+    return status;
 }
 #endif

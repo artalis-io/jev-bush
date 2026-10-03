@@ -105,14 +105,17 @@ jobs:
   # die() there exits the host from a worker thread, and allocations escape
   # the error frame's cleanup.
   parallel-regions:
-    name: Parallel-region check
+    name: Source lint and invariants
     runs-on: ubuntu-latest
 
     steps:
       - uses: actions/checkout@v4
 
       - name: Check
-        run: python3 tools/check_parallel_regions.py jb.c
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang-format-18
+          make lint
 
   # The README's Windows build. Errors unwind with longjmp, which MinGW's
   # default SEH setjmp crashed on at -O2, so exercise an error path directly.
@@ -245,11 +248,10 @@ jobs:
           ./jb-asan --selftest
           ./jb-asan --check-request examples/request.json
 
-      # Rejected requests exit through die() with allocations still live, so
-      # leak reports there are expected; memory errors still fail the run.
-      - name: Malformed requests
+      # The CLI root frame releases tracked allocations on rejected requests.
+      - name: Malformed requests (leak-checked)
         env:
-          ASAN_OPTIONS: detect_leaks=0
+          ASAN_OPTIONS: detect_leaks=1
         run: sh tools/check_requests.sh ./jb-asan
 
       # The library releases a failed call's allocations; check that

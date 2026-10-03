@@ -1,0 +1,8 @@
+repos:
+  - repo: local
+    hooks:
+      - id: jev-bush-lint
+        name: Jev Bush C formatting and lint
+        entry: tools/lint.sh
+        language: system
+        pass_filenames: false
