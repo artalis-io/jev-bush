@@ -153,10 +153,11 @@ the fast CUDA build and on 98% (0.026) for fast-math NEON, less than fast
 math's own distance from the strict build. Use the strict build where results must not depend on cache
 state.
 
-Output also records `"kernels"`: `"avx512"` when the build targets AVX-512F
-and AVX-512DQ, `"avx2"` when it targets AVX2 and FMA without AVX-512, and
-otherwise `"scalar"`. Dispatch is compile-time and ordered AVX-512, AVX2,
-scalar. `"threads"` records the OpenMP thread count the process ran with.
+Output also records `"kernels"`: `"avx512"` or `"avx512-exact"` when the
+running x86 CPU supports the required AVX-512 features, `"avx2"` when it
+supports AVX2 and FMA, and otherwise `"scalar"`. GCC/Clang x86 dispatch is
+runtime and ordered AVX-512, AVX2, scalar. `"threads"` records the OpenMP
+thread count the process ran with.
 
 To build specifically for an AVX2/FMA machine while keeping the binary free of
 AVX-512 instructions:
@@ -206,6 +207,11 @@ checks each GPU operation against the reference's bits and reports
 the build runs on the CPU kernels alone. So it does when the kernels fail to
 compile or load; the library stays silent, and the CLI says why on stderr,
 with NVRTC's log.
+
+CUDA sessions are isolated but currently serialized around a complete decision
+because the narrow backend uses the context's legacy default stream. CPU-only
+sessions remain concurrent. Per-session CUDA streams are deferred until they
+can preserve strict bit identity and demonstrate useful throughput.
 
 Fast-math builds keep the same layout but give up bit-identity on the GPU as
 they do on the CPU:
@@ -268,15 +274,33 @@ cc -O3 -march=native -std=c11 -Wall -Wextra -pedantic -fopenmp \
   examples/library.c libjb.a -lm -o jb-library-example
 ```
 
+Or use the supported build surface:
+
+```sh
+make OMPFLAGS=-fopenmp
+make check
+make install PREFIX=/usr/local
+pkg-config --cflags --libs jev-bush
+```
+
+`make` produces the CLI, `libjb.a`, and `libjb.so` (or `libjb.dylib` on
+macOS). Shared builds hide every internal symbol; only the `jb_` API is
+exported. `DESTDIR` is supported for packaging.
+
 The normal `jb.c` build still contains the CLI, but the CLI is itself a client
 of `jb_model_load()`, `jb_session_create_json()`, and the session JSON decision
 calls. There is no separate privileged inference route.
 
 A `jb_model` is immutable after loading and may be shared by multiple sessions.
+Sessions retain their model, so the caller may release its model reference as
+soon as all sessions have been created. `jb_model_retain()` creates another
+direct reference; each direct reference is paired with `jb_model_free()`.
 A `jb_session` owns one worker's schema-prefix cache, inference workspace, K/V
 storage, and microbatch controls. A session is deliberately single-threaded;
-create one session per concurrent worker. Inputs are borrowed for the duration
-of a call. Typed results use one contiguous library allocation and are released
+create one session per concurrent worker. Concurrent use of the same session is
+rejected, rather than corrupting its workspace. Freeing a session concurrently
+with a call remains invalid. Inputs are borrowed for the duration of a call.
+Typed results use one contiguous library allocation and are released
 with `jb_result_free()`. JSON buffers and JSON batch arrays are released with
 `jb_free()`.
 
@@ -299,14 +323,35 @@ schema prefix permits it. See [`examples/library.c`](examples/library.c)
 for a complete typed example.
 
 Call `jb_api_version()` before using a dynamically loaded library and require
-`JB_API_VERSION`. `JB_SHARED` declares the public symbol visibility;
+`JB_API_VERSION`; `jb_get_abi_info()` additionally reports every frozen public
+value-structure size. Existing public layouts and enum values are permanent:
+future revisions add entry points or new versioned option structures instead
+of extending them in place. `JB_SHARED` declares public symbol visibility;
 `JB_BUILD_SHARED` additionally exports symbols when building a Windows DLL.
-The v0 API is source-stable, not a promise of binary compatibility across
-different v0 releases: public value structs are intentionally small but are
-not size-versioned. Compile the application and library from the same header.
-CPU ISA selection is likewise a build property in v0. A binary built with
-`-march=native` must only run on compatible CPUs; build separate scalar, AVX2,
-AVX-512, or NEON artifacts where deployment portability matters.
+
+`jb_model_load_ex()` accepts a versioned options structure with an allocator
+and logger. Allocator callbacks own all library heap objects associated with
+that model, its sessions, and returned results. They must be safe for the
+application's concurrent sessions. The logger receives model lifecycle and
+failure messages; the library never writes diagnostics on a successful API
+call. Recoverable public-API failures return a status and never terminate the
+embedding process. As in ordinary C libraries, invalid pointers, concurrent
+destruction, allocator contract violations, and detected internal corruption
+are outside that guarantee.
+
+Logger callbacks are reentrant and may release the model or session associated
+with the message; message storage is borrowed only for the callback. Malformed
+caller input and allocation failures before execution starts leave a session
+reusable. If a failure occurs after workspace execution has begun, the session
+is intentionally poisoned rather than risking reuse of partially staged K/V or
+accelerator state: later decisions return `JB_ERROR_INTERNAL`, while
+`jb_session_free()` remains safe.
+
+On GCC and Clang x86, one ordinary build contains scalar, AVX2/FMA, and
+AVX-512 kernels and selects the best supported tier at runtime. `-DJB_SCALAR`
+builds only the reference path. AArch64 selects NEON at compile time. Using
+`-march=native` may still let the compiler use a host ISA in shared non-kernel
+code, so omit it when producing a portable distributable library.
 
 The API deliberately exposes no thread-count, workspace-budget, or memory-size
 controls. OpenMP policy belongs to the embedding process, and session scratch
@@ -316,8 +361,8 @@ isolation should enforce it at the process boundary.
 Internally, model execution uses one small `DGKernelOps` table for BF16 GEMM,
 NVFP4 quantization/GEMM, RMS normalization, and attention dots. Scalar, AVX2,
 AVX-512, and NEON differ only behind that boundary; inference, validation, benchmarks,
-and JSON output contain no ISA dispatch branches. Selection remains compile-time
-so the portable build does not require runtime CPU detection.
+and JSON output contain no ISA dispatch branches. Selection occurs once through
+compiler-supported runtime CPU detection on x86; AArch64 selects NEON directly.
 
 Weights stay memory-mapped. Each evaluation worker owns one checked,
 64-byte-aligned, grow-only inference workspace. Prefill, cached suffixes,
@@ -370,6 +415,12 @@ Windows with MSVC, which implements OpenMP 2.0:
 
 ```bat
 cl /O2 /std:c11 /W4 /openmp /arch:AVX2 jb.c
+```
+
+An MSVC DLL and import library can be built without the CLI:
+
+```bat
+cl /O2 /std:c11 /W4 /LD /DJB_NO_MAIN /DJB_SHARED /DJB_BUILD_SHARED jb.c /Fe:jb.dll
 ```
 
 Any of these with `-DJB_SCALAR` forces the portable reference kernels whatever

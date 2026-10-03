@@ -948,13 +948,24 @@ model. A persistent transformed cache is deferred until a representation shows
 both meaningful kernel speedup and acceptable primitive accuracy; storage
 compactness alone is not sufficient.
 
-## 10. v0 freeze
+## 10. Embeddable library hardening
 
-The v0 execution architecture is frozen after the exact AVX-512 image and its
-compact-scale pass. Scalar defines the arithmetic; strict NEON, AVX-512 and
-CUDA reproduce it; AVX2 and fast builds are deterministic performance tiers.
-The CLI and `jb.h` expose the same typed decision engine, sessions own reusable
-K/V and scratch state, and the model is immutable and shareable.
+The execution architecture is stable, but the v0 freeze remains deliberately
+pending while the C embedding boundary is hardened. Scalar defines the
+arithmetic; strict NEON, AVX-512 and CUDA reproduce it; AVX2 and fast builds are
+deterministic performance tiers. GCC/Clang x86 builds now contain scalar, AVX2
+and AVX-512 function variants and dispatch at runtime. The CLI and `jb.h` use
+the same typed decision engine, sessions own reusable K/V and scratch state,
+and reference-counted immutable models are shareable across sessions.
+
+API version 2 freezes existing public value layouts and enum values, exposes
+ABI-size introspection, and adds versioned load options for application
+allocators and logging. All recoverable API failures unwind to status returns.
+Concurrent sessions are supported; concurrent calls on one session are
+rejected. CUDA decisions are isolated by a whole-decision lock while that
+narrow backend uses the legacy default stream. The supported Makefile produces
+the CLI plus static and versioned shared libraries, installs `jb.h` and a
+relocatable pkg-config file, and keeps internal symbols hidden.
 
 Release validation consists of hosted compiler, sanitizer, fuzz, hardening and
 kernel jobs plus the manual model-backed golden check on the benchmark rigs.
@@ -967,6 +978,6 @@ Future arithmetic or layout changes need a profile demonstrating a dominant
 cost, bitwise strict fixtures, the model golden hashes, and refreshed benchmark
 numbers. New models, generic formats, servers, additional GPU APIs and broad
 framework abstractions remain outside v0 rather than accumulating behind the
-frozen interface. v0 promises source compatibility when application and
-library use the same header; a stable cross-release binary ABI and runtime CPU
-multiversioning are post-v0 library work, not claims made by this freeze.
+interface. A manual self-hosted release workflow now runs the authenticated
+model golden, strict invariance, shared-model concurrency, and manifest capture.
+The freeze can follow after that gate passes on the release CPU and CUDA rigs.

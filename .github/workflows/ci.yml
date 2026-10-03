@@ -61,6 +61,16 @@ jobs:
           ./jb-cuda-fast --selftest | tee cuda-fast.json
           ! grep -q accelerator cuda-fast.json
 
+      - name: Build and consume macOS library
+        if: runner.os == 'macOS'
+        run: |
+          make clean
+          make
+          make install DESTDIR="$PWD/stage" PREFIX=/usr/local
+          cc -O2 -std=c11 -I"$PWD/stage/usr/local/include" test/installed_consumer.c \
+            "$PWD/stage/usr/local/lib/libjb.dylib" -lm -o installed-consumer
+          DYLD_LIBRARY_PATH="$PWD/stage/usr/local/lib" ./installed-consumer
+
       - name: Build and test
         if: runner.os == 'Windows'
         shell: pwsh
@@ -77,6 +87,12 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           $out
           if ($out -notmatch '"kernels":"avx2"') { exit 1 }
+          cl /nologo /O2 /std:c11 /W4 /LD /DJB_NO_MAIN /DJB_SHARED /DJB_BUILD_SHARED /Fe:jb.dll jb.c
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cl /nologo /O2 /std:c11 /W4 /DJB_SHARED /I. test/installed_consumer.c jb.lib /Fe:installed-consumer.exe
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          .\installed-consumer.exe
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
   # Nothing reachable from an OpenMP parallel region may fail or allocate:
   # die() there exits the host from a worker thread, and allocations escape
@@ -256,6 +272,20 @@ jobs:
           echo '7eebd20b705f1f644adf6ee56148f753a46f8ceba75cc0f5a3e2d3c8951c76b0  examples/request.json' | sha256sum -c -
           cc -O2 -std=c11 -Wall -Wextra -pedantic -Werror -fPIC -shared -DJB_NO_MAIN -DJB_SHARED -DJB_BUILD_SHARED jb.c -lm -o libjb.so
           nm -D --defined-only libjb.so | grep -q ' jb_api_version$'
+          cc -O2 -std=c11 -Wall -Wextra -pedantic -Werror -I. test/library_faults.c \
+            -L. -Wl,-rpath,'$ORIGIN' -ljb -lm -o library-faults
+          ./library-faults
+          test "$(nm -D --defined-only libjb.so | awk '$2 ~ /^[TDBR]$/ {print $3}' | grep -vc '^jb_')" -eq 0
+
+      - name: Install and consume the packaged library
+        run: |
+          make clean
+          make CFLAGS='-O2 -std=c11 -Wall -Wextra -pedantic -Werror'
+          make install DESTDIR="$PWD/stage" PREFIX=/usr
+          PKG_CONFIG_PATH="$PWD/stage/usr/lib/pkgconfig" cc -O2 -std=c11 \
+            test/installed_consumer.c $(PKG_CONFIG_PATH="$PWD/stage/usr/lib/pkgconfig" pkg-config --cflags --libs jev-bush) \
+            -Wl,-rpath,"$PWD/stage/usr/lib" -o installed-consumer
+          ./installed-consumer
 
   hardening:
     name: Hardened Linux build
@@ -279,6 +309,12 @@ jobs:
           readelf -W -d jb-hardened | grep -q 'BIND_NOW'
           nm -u jb-hardened | grep -q '__stack_chk_fail'
           nm -u jb-hardened | grep -q '_chk@'
+          make clean
+          make libjb.so
+          readelf -W -l libjb.so | grep 'GNU_STACK' | grep -q ' RW '
+          readelf -W -l libjb.so | grep -q 'GNU_RELRO'
+          readelf -W -d libjb.so | grep -q 'BIND_NOW'
+          nm -u libjb.so | grep -q '__stack_chk_fail'
 
   fuzz:
     name: Fuzz JSON reader

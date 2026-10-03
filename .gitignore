@@ -3,6 +3,11 @@
 /jb.exe
 /*.o
 /*.obj
+/*.a
+/*.so
+/*.so.*
+/*.dylib
+/test-library-*
 /*.dSYM/
 /gmon.out
 /*.plist

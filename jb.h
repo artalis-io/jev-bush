@@ -20,7 +20,7 @@
 extern "C" {
 #endif
 
-#define JB_API_VERSION 1u
+#define JB_API_VERSION 2u
 
 typedef struct jb_model jb_model;
 typedef struct jb_session jb_session;
@@ -35,6 +35,57 @@ typedef enum {
     JB_ERROR_OUT_OF_MEMORY = 5,
     JB_ERROR_INTERNAL = 6
 } jb_status;
+
+typedef enum { JB_LOG_ERROR = 0, JB_LOG_WARNING = 1, JB_LOG_INFO = 2 } jb_log_level;
+
+typedef void *(*jb_allocate_fn)(void *context, size_t size);
+typedef void *(*jb_reallocate_fn)(void *context, void *allocation, size_t size);
+typedef void (*jb_release_fn)(void *context, void *allocation);
+/* Log callbacks may call back into Jev Bush, including releasing the object
+ * whose operation produced the message. The message is borrowed and valid
+ * only for the callback. */
+typedef void (*jb_log_fn)(void *context, jb_log_level level, const char *message);
+
+/* Allocator callbacks follow malloc/realloc/free semantics, including
+ * alignment suitable for every C type. They may be called concurrently by
+ * separate sessions and must remain valid until the last model/session/result
+ * allocation using them is released. */
+typedef struct {
+    size_t struct_size;
+    void *context;
+    jb_allocate_fn allocate;
+    jb_reallocate_fn reallocate;
+    jb_release_fn release;
+} jb_allocator;
+
+typedef struct {
+    size_t struct_size;
+    uint32_t api_version;
+    jb_allocator allocator;
+    void *log_context;
+    jb_log_fn log;
+} jb_model_options;
+
+#define JB_MODEL_OPTIONS_INIT                                                                      \
+    {                                                                                              \
+        sizeof(jb_model_options), JB_API_VERSION, {sizeof(jb_allocator), NULL, NULL, NULL, NULL},  \
+            NULL, NULL                                                                             \
+    }
+
+/* Existing public value layouts are permanent. Future API revisions add new
+ * types or entry points instead of changing these sizes. */
+typedef struct {
+    size_t struct_size;
+    uint32_t api_version;
+    size_t string_size;
+    size_t candidate_size;
+    size_t question_size;
+    size_t schema_size;
+    size_t input_size;
+    size_t probability_size;
+    size_t answer_size;
+    size_t result_size;
+} jb_abi_info;
 
 typedef struct {
     /* Strings are counted byte spans and need not be NUL-terminated. */
@@ -100,6 +151,7 @@ typedef struct {
 
 JB_API const char *jb_version(void);
 JB_API uint32_t jb_api_version(void);
+JB_API jb_status jb_get_abi_info(jb_abi_info *info);
 JB_API const char *jb_status_string(jb_status status);
 /* Describes the calling thread's most recent failure, including calls that
  * have no session: jb_model_load and session creation. On failure, every
@@ -107,14 +159,20 @@ JB_API const char *jb_status_string(jb_status status);
 JB_API const char *jb_last_error(void);
 
 /* A model is immutable once loaded and may be shared by sessions on any
- * threads. */
+ * threads. Each successful session creation retains it. Call retain when
+ * keeping another direct reference; every direct reference is released by
+ * exactly one model_free. */
 JB_API jb_status jb_model_load(const char *model_directory, jb_model **out_model);
-/* All sessions referring to a model must be freed before the model. */
+JB_API jb_status jb_model_load_ex(const char *model_directory, const jb_model_options *options,
+                                  jb_model **out_model);
+JB_API void jb_model_retain(jb_model *model);
 JB_API void jb_model_free(jb_model *model);
 
 /* A session owns reusable scratch, K/V, and exact schema-prefix state. It is
  * not thread-safe: one call at a time per session. Separate sessions may
- * share the same immutable model. */
+ * share the same immutable model. Invalid requests leave a session reusable.
+ * A failure after inference workspace execution begins poisons it: later
+ * decisions return JB_ERROR_INTERNAL, and session_free remains valid. */
 JB_API jb_status jb_session_create(jb_model *model, const jb_schema *schema,
                                    jb_session **out_session);
 /* Passing NULL with length zero creates a dynamic JSON-only session for full
@@ -140,13 +198,10 @@ JB_API jb_status jb_session_decide_batch(jb_session *session, const jb_input *in
  * is released with jb_free: one buffer for a single call; each string, then
  * the string array and the length array, for a batch of 1 to 16 requests. */
 JB_API jb_status jb_session_decide_json(jb_session *session, const char *request_json,
-                                        size_t request_length, char **out_json,
-                                        size_t *out_length);
-JB_API jb_status jb_session_decide_json_batch(jb_session *session,
-                                              const char *const *request_json,
-                                              const size_t *request_lengths,
-                                              size_t request_count, char ***out_json,
-                                              size_t **out_lengths);
+                                        size_t request_length, char **out_json, size_t *out_length);
+JB_API jb_status jb_session_decide_json_batch(jb_session *session, const char *const *request_json,
+                                              const size_t *request_lengths, size_t request_count,
+                                              char ***out_json, size_t **out_lengths);
 
 JB_API void jb_result_free(jb_result *result);
 JB_API void jb_results_free(jb_result **results, size_t count);

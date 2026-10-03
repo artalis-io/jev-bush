@@ -36,22 +36,34 @@
 #pragma STDC FP_CONTRACT OFF
 #endif
 
-/* Kernel backend, chosen at compile time. -DJB_SCALAR forces the portable
- * reference kernels on any CPU: the oracle build other backends are checked
- * against. */
+/* GCC and clang build x86 ISA variants as function-level multiversions, so a
+ * single baseline binary safely selects scalar, AVX2 or AVX-512 at runtime.
+ * MSVC emits the variants enabled by /arch and still checks the host before
+ * selecting one. -DJB_SCALAR remains the portable oracle. */
 #if defined(JB_SCALAR)
-#elif defined(__AVX2__) && defined(__AVX512F__) && defined(__AVX512DQ__) && defined(__AVX512BW__)
-#define JB_AVX512 1
+#define JB_TARGET_AVX2
+#define JB_TARGET_AVX512
+#elif (defined(__x86_64__) || defined(__i386__)) && (defined(__GNUC__) || defined(__clang__))
+#define JB_HAVE_AVX2 1
+#define JB_HAVE_AVX512 1
+#define JB_TARGET_AVX2 __attribute__((target("avx2,fma")))
+#define JB_TARGET_AVX512 __attribute__((target("avx2,fma,avx512f,avx512dq,avx512bw")))
 #include <immintrin.h>
-#elif defined(__AVX2__) && (defined(__FMA__) || (defined(_MSC_VER) && !defined(__clang__)))
-/* The AVX2 kernels use FMA. MSVC's /arch:AVX2 enables FMA code generation
- * but does not define __FMA__. */
-#define JB_AVX2 1
+#elif defined(_MSC_VER) && defined(_M_X64) && defined(__AVX2__)
+#define JB_HAVE_AVX2 1
+#define JB_TARGET_AVX2
+#define JB_TARGET_AVX512
+#include <intrin.h>
 #include <immintrin.h>
 #elif defined(__aarch64__) && defined(__ARM_NEON) && !defined(__AARCH64EB__)
 /* Little-endian only: the kernels load BF16 bytes in little-endian order. */
 #define JB_NEON 1
 #include <arm_neon.h>
+#define JB_TARGET_AVX2
+#define JB_TARGET_AVX512
+#else
+#define JB_TARGET_AVX2
+#define JB_TARGET_AVX512
 #endif
 #ifdef _OPENMP
 /* Parallel loops declare a signed index before the loop, each in its own
@@ -80,7 +92,7 @@
 #define JB_PRINTF(f, a)
 #endif
 
-#define JB_VERSION "0.1.0"
+#define JB_VERSION "0.2.0"
 #define JB_MAX_CTX 4096
 #define JB_MAX_CAND 255
 #define JB_MAX_JSON (64u * 1024u * 1024u)
@@ -209,6 +221,8 @@ typedef union {
 typedef union JBAllocation {
     struct {
         union JBAllocation *previous, *next;
+        jb_allocator allocator;
+        size_t size;
         uint64_t sequence;
         int tracked;
     } link;
@@ -228,6 +242,29 @@ static _Thread_local jb_status jb_error_status;
 static _Thread_local char jb_error_message[256];
 static _Thread_local JBAllocation *jb_tracked;
 static _Thread_local uint64_t jb_allocation_sequence;
+static _Thread_local const jb_allocator *jb_active_allocator;
+
+static void *jb_system_allocate(void *context, size_t size) {
+    (void)context;
+    return malloc(size);
+}
+
+static void *jb_system_reallocate(void *context, void *allocation, size_t size) {
+    (void)context;
+    return realloc(allocation, size);
+}
+
+static void jb_system_release(void *context, void *allocation) {
+    (void)context;
+    free(allocation);
+}
+
+static const jb_allocator jb_system_allocator = {sizeof(jb_allocator), NULL, jb_system_allocate,
+                                                 jb_system_reallocate, jb_system_release};
+
+static const jb_allocator *jb_allocator_current(void) {
+    return jb_active_allocator ? jb_active_allocator : &jb_system_allocator;
+}
 
 static int jb_in_parallel(void) {
 #ifdef _OPENMP
@@ -318,7 +355,8 @@ static void *jb_try_allocate(size_t n, int clear) {
 #ifdef JB_PROFILE
     uint64_t start = now_ns();
 #endif
-    JBAllocation *a = clear ? calloc(1, sizeof *a + n) : malloc(sizeof *a + n);
+    const jb_allocator *allocator = jb_allocator_current();
+    JBAllocation *a = allocator->allocate(allocator->context, sizeof *a + n);
 #ifdef JB_PROFILE
     if (jb_profile_active) {
         jb_profile_active->alloc_ns += now_ns() - start;
@@ -328,6 +366,10 @@ static void *jb_try_allocate(size_t n, int clear) {
 #endif
     if (!a)
         return NULL;
+    if (clear)
+        memset(a, 0, sizeof *a + n);
+    a->link.allocator = *allocator;
+    a->link.size = n;
     a->link.sequence = ++jb_allocation_sequence;
 #ifndef NDEBUG
     /* Allocations inside parallel regions stay untracked, so a later failure
@@ -384,7 +426,7 @@ static void *xrealloc(void *p, size_t n) {
 #ifdef JB_PROFILE
     uint64_t start = now_ns();
 #endif
-    JBAllocation *b = realloc(a, sizeof *a + n);
+    JBAllocation *b = a->link.allocator.reallocate(a->link.allocator.context, a, sizeof *a + n);
 #ifdef JB_PROFILE
     if (jb_profile_active) {
         jb_profile_active->alloc_ns += now_ns() - start;
@@ -399,6 +441,7 @@ static void *xrealloc(void *p, size_t n) {
     }
     if (tracked)
         jb_link(b);
+    b->link.size = n;
     return b + 1;
 }
 
@@ -408,7 +451,7 @@ static void jb_release(void *p) {
     JBAllocation *a = (JBAllocation *)p - 1;
     if (a->link.tracked)
         jb_unlink(a);
-    free(a);
+    a->link.allocator.release(a->link.allocator.context, a);
 }
 
 /* Detach an allocation that a long-lived object now owns. */
@@ -454,7 +497,7 @@ static void jb_frame_abandon(JBErrorFrame *f) {
         next = a->link.next;
         if (a->link.sequence > f->mark) {
             jb_unlink(a);
-            free(a);
+            a->link.allocator.release(a->link.allocator.context, a);
         }
     }
     jb_frame_leave(f);
@@ -1992,7 +2035,7 @@ static float dg_f8e4m3(uint8_t u) {
  * consequently accumulated in exactly the scalar reference order. These
  * load-time images make the 16 rows contiguous for every column; NVFP4
  * keeps its nibbles packed and expands its block scales to lane vectors. */
-#if defined(JB_AVX512) && JB_STRICT_MATH
+#if defined(JB_HAVE_AVX512) && JB_STRICT_MATH
 enum { DG_EXACT_ROWS = 16 };
 
 static size_t dg_exact_place(size_t *at, size_t bytes) {
@@ -2033,7 +2076,7 @@ static void dg_exact_pack_nvfp4(DGTensor *w, DGTensor *s, int rows, int cols) {
 }
 
 static void dg_prepare_exact_model(DGModel *m) {
-    if (m->accel)
+    if (m->accel || strcmp(dg_kernels()->name, "avx512-exact"))
         return;
     size_t bytes = 0;
     for (size_t i = 0; i < m->nt; i++) {
@@ -2366,16 +2409,17 @@ static DGNvMatrix dg_nvfp4_matrix(const DGTensor *w, const DGTensor *s, const DG
     return m;
 }
 
-#if defined(JB_AVX512) && JB_STRICT_MATH
-static void dg_mm_exact_avx512(const uint8_t *data, const float *x, float *y, int tokens, int rows,
-                               int cols);
-static void dg_nvfp4_exact_avx512(const uint8_t *wd, const uint8_t *sd, float global,
-                                  const float *x, float *y, int tokens, int rows, int cols);
+#if defined(JB_HAVE_AVX512) && JB_STRICT_MATH
+static JB_TARGET_AVX512 void dg_mm_exact_avx512(const uint8_t *data, const float *x, float *y,
+                                                int tokens, int rows, int cols);
+static JB_TARGET_AVX512 void dg_nvfp4_exact_avx512(const uint8_t *wd, const uint8_t *sd,
+                                                   float global, const float *x, float *y,
+                                                   int tokens, int rows, int cols);
 #endif
 
 static void dg_nvfp4_product(const DGNvMatrix *m, const float *x, float *y, int tokens, int rows,
                              int cols) {
-#if defined(JB_AVX512) && JB_STRICT_MATH
+#if defined(JB_HAVE_AVX512) && JB_STRICT_MATH
     if (m->exact_w && m->exact_s) {
         dg_nvfp4_exact_avx512(m->exact_w, m->exact_s, m->global, x, y, tokens, rows, cols);
         return;
@@ -2457,7 +2501,7 @@ static void dg_mm_data(const uint8_t *data, const float *x, float *y, int tokens
 static void dg_mm(const DGTensor *w, const float *x, float *y, int tokens, int rows, int cols) {
     if (w->nd != 2 || w->shape[0] != (uint64_t)rows || w->shape[1] != (uint64_t)cols)
         die2("bad matrix shape", w->name);
-#if defined(JB_AVX512) && JB_STRICT_MATH
+#if defined(JB_HAVE_AVX512) && JB_STRICT_MATH
     if (w->exact) {
         dg_mm_exact_avx512(w->exact, x, y, tokens, rows, cols);
         return;
@@ -2633,21 +2677,21 @@ static void dg_dots(const float *a, const float *b, size_t stride, int keys, int
 }
 
 /* AVX2 backend. */
-#if defined(JB_AVX2)
-static __m256 dg_bf16x8(const uint8_t *p) {
+#if defined(JB_HAVE_AVX2)
+static JB_TARGET_AVX2 __m256 dg_bf16x8(const uint8_t *p) {
     __m128i h = _mm_loadu_si128((const __m128i *)p);
     return _mm256_castsi256_ps(_mm256_slli_epi32(_mm256_cvtepu16_epi32(h), 16));
 }
 
-static float dg_hsum8(__m256 x) {
+static JB_TARGET_AVX2 float dg_hsum8(__m256 x) {
     __m128 h = _mm_add_ps(_mm256_castps256_ps128(x), _mm256_extractf128_ps(x, 1));
     h = _mm_hadd_ps(h, h);
     h = _mm_hadd_ps(h, h);
     return _mm_cvtss_f32(h);
 }
 
-static void dg_mm_data_avx2(const uint8_t *data, const float *x, float *y, int tokens, int rows,
-                            int cols) {
+static JB_TARGET_AVX2 void dg_mm_data_avx2(const uint8_t *data, const float *x, float *y,
+                                           int tokens, int rows, int cols) {
     if (rows % 2)
         die("AVX2 matrix row count must be even");
     {
@@ -2687,7 +2731,8 @@ static void dg_mm_data_avx2(const uint8_t *data, const float *x, float *y, int t
     }
 }
 
-static void dg_nvfp4_weights16_avx2(const uint8_t *q, float scale, __m256 *w0, __m256 *w1) {
+static JB_TARGET_AVX2 void dg_nvfp4_weights16_avx2(const uint8_t *q, float scale, __m256 *w0,
+                                                   __m256 *w1) {
     const __m128i lut = _mm_setr_epi8(0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12);
     const __m128i mask = _mm_set1_epi8(15), raw = _mm_loadl_epi64((const __m128i *)q);
     __m128i lo = _mm_shuffle_epi8(lut, _mm_and_si128(raw, mask));
@@ -2702,8 +2747,9 @@ static void dg_nvfp4_weights16_avx2(const uint8_t *q, float scale, __m256 *w0, _
 
 /* Decode each packed 16-weight block entirely in registers, retaining the
  * reference interleaved lane order and reusing it across four tokens. */
-static void dg_nvfp4_mm_avx2(const uint8_t *wd, const uint8_t *sd, float global, const float *x,
-                             float *y, int tokens, int rows, int cols) {
+static JB_TARGET_AVX2 void dg_nvfp4_mm_avx2(const uint8_t *wd, const uint8_t *sd, float global,
+                                            const float *x, float *y, int tokens, int rows,
+                                            int cols) {
     {
         int r;
 #ifdef _OPENMP
@@ -2733,13 +2779,13 @@ static void dg_nvfp4_mm_avx2(const uint8_t *wd, const uint8_t *sd, float global,
     }
 }
 
-static double dg_hsum4d(__m256d x) {
+static JB_TARGET_AVX2 double dg_hsum4d(__m256d x) {
     __m128d h = _mm_add_pd(_mm256_castpd256_pd128(x), _mm256_extractf128_pd(x, 1));
     h = _mm_hadd_pd(h, h);
     return _mm_cvtsd_f64(h);
 }
 
-static void dg_rms_avx2(float *y, const float *x, const DGTensor *scale, int n) {
+static JB_TARGET_AVX2 void dg_rms_avx2(float *y, const float *x, const DGTensor *scale, int n) {
     __m256d a = _mm256_setzero_pd(), b = a;
     int i = 0;
     for (; i + 7 < n; i += 8) {
@@ -2766,7 +2812,7 @@ static void dg_rms_avx2(float *y, const float *x, const DGTensor *scale, int n) 
         y[i] = x[i] * q * (scale ? dg_at(scale, i) : 1.0f);
 }
 
-static double dg_dot_avx2(const float *a, const float *b, int n) {
+static JB_TARGET_AVX2 double dg_dot_avx2(const float *a, const float *b, int n) {
     __m256d s0 = _mm256_setzero_pd(), s1 = s0;
     int i = 0;
     for (; i + 7 < n; i += 8) {
@@ -2784,15 +2830,15 @@ static double dg_dot_avx2(const float *a, const float *b, int n) {
 #endif
 
 /* AVX-512 backend. */
-#if defined(JB_AVX512)
-static __m512 dg_bf16x16(const uint8_t *p) {
+#if defined(JB_HAVE_AVX512)
+static JB_TARGET_AVX512 __m512 dg_bf16x16(const uint8_t *p) {
     __m256i h = _mm256_loadu_si256((const __m256i *)p);
     return _mm512_castsi512_ps(_mm512_slli_epi32(_mm512_cvtepu16_epi32(h), 16));
 }
 
 #if JB_STRICT_MATH
-static void dg_mm_exact_avx512(const uint8_t *data, const float *x, float *y, int tokens, int rows,
-                               int cols) {
+static JB_TARGET_AVX512 void dg_mm_exact_avx512(const uint8_t *data, const float *x, float *y,
+                                                int tokens, int rows, int cols) {
     int rt;
 #ifdef _OPENMP
     JB_OMP();
@@ -2818,7 +2864,7 @@ static void dg_mm_exact_avx512(const uint8_t *data, const float *x, float *y, in
     }
 }
 
-static __m512i dg_nvfp4_exact_codes(const uint8_t *p) {
+static JB_TARGET_AVX512 __m512i dg_nvfp4_exact_codes(const uint8_t *p) {
     __m256i bytes = _mm256_cvtepu8_epi32(_mm_loadl_epi64((const __m128i *)p));
     __m256i lo = _mm256_and_si256(bytes, _mm256_set1_epi32(15));
     __m256i hi = _mm256_srli_epi32(bytes, 4);
@@ -2828,7 +2874,7 @@ static __m512i dg_nvfp4_exact_codes(const uint8_t *p) {
 /* Decode 16 transposed E4M3 scale bytes without expanding them in the model
  * image. The integer bit construction and the subnormal multiply reproduce
  * dg_f8e4m3, lane for lane. */
-static __m512 dg_f8e4m3x16(const uint8_t *p) {
+static JB_TARGET_AVX512 __m512 dg_f8e4m3x16(const uint8_t *p) {
     __m512i code = _mm512_cvtepu8_epi32(_mm_loadu_si128((const __m128i *)p));
     __m512i exponent = _mm512_and_si512(_mm512_srli_epi32(code, 3), _mm512_set1_epi32(15));
     __m512i mantissa = _mm512_and_si512(code, _mm512_set1_epi32(7));
@@ -2842,8 +2888,15 @@ static __m512 dg_f8e4m3x16(const uint8_t *p) {
     return _mm512_castsi512_ps(_mm512_xor_si512(_mm512_castps_si512(magnitude), sign));
 }
 
-static void dg_nvfp4_exact_avx512(const uint8_t *wd, const uint8_t *sd, float global,
-                                  const float *x, float *y, int tokens, int rows, int cols) {
+#ifndef JB_NO_MAIN
+static JB_TARGET_AVX512 void dg_f8e4m3x16_store(float *out, const uint8_t *p) {
+    _mm512_storeu_ps(out, dg_f8e4m3x16(p));
+}
+#endif
+
+static JB_TARGET_AVX512 void dg_nvfp4_exact_avx512(const uint8_t *wd, const uint8_t *sd,
+                                                   float global, const float *x, float *y,
+                                                   int tokens, int rows, int cols) {
     static const float lut[16] = {0, .5f, 1, 1.5f, 2, 3, 4, 6, 0, -.5f, -1, -1.5f, -2, -3, -4, -6};
     __m512 table = _mm512_loadu_ps(lut);
     int rt;
@@ -2883,8 +2936,8 @@ static void dg_nvfp4_exact_avx512(const uint8_t *wd, const uint8_t *sd, float gl
 }
 #endif
 
-static void dg_mm_data_avx512(const uint8_t *data, const float *x, float *y, int tokens, int rows,
-                              int cols) {
+static JB_TARGET_AVX512 void dg_mm_data_avx512(const uint8_t *data, const float *x, float *y,
+                                               int tokens, int rows, int cols) {
     if (rows % 2)
         die("AVX-512 matrix row count must be even");
     {
@@ -2961,8 +3014,9 @@ static void dg_nvfp4_qdq_avx512(float *out, const float *in, int tokens, int col
 }
 
 /* x in the dg_nvfp4_swizzle layout; rows must be even. */
-static void dg_nvfp4_mm_avx512(const uint8_t *wd, const uint8_t *sd, float global, const float *x,
-                               float *y, int tokens, int rows, int cols) {
+static JB_TARGET_AVX512 void dg_nvfp4_mm_avx512(const uint8_t *wd, const uint8_t *sd, float global,
+                                                const float *x, float *y, int tokens, int rows,
+                                                int cols) {
     static const float lut[16] = {0, .5f, 1, 1.5f, 2, 3, 4, 6, 0, -.5f, -1, -1.5f, -2, -3, -4, -6};
     __m512 table = _mm512_loadu_ps(lut);
     {
@@ -3019,7 +3073,7 @@ static void dg_nvfp4_mm_avx512(const uint8_t *wd, const uint8_t *sd, float globa
     }
 }
 
-static void dg_rms_avx512(float *y, const float *x, const DGTensor *scale, int n) {
+static JB_TARGET_AVX512 void dg_rms_avx512(float *y, const float *x, const DGTensor *scale, int n) {
     __m512d a = _mm512_setzero_pd(), b = a, c = a, d = a;
     int i = 0;
     for (; i + 31 < n; i += 32) {
@@ -3050,7 +3104,7 @@ static void dg_rms_avx512(float *y, const float *x, const DGTensor *scale, int n
         y[i] = x[i] * q * (scale ? dg_at(scale, i) : 1.0f);
 }
 
-static double dg_dot_avx512(const float *a, const float *b, int n) {
+static JB_TARGET_AVX512 double dg_dot_avx512(const float *a, const float *b, int n) {
     __m512d s0 = _mm512_setzero_pd(), s1 = s0;
     int i = 0;
     for (; i + 15 < n; i += 16) {
@@ -3351,63 +3405,95 @@ static void dg_rms_neon(float *y, const float *x, const DGTensor *scale, int n) 
 }
 #endif
 
+#if defined(JB_HAVE_AVX2)
+static int jb_cpu_has_avx2(void) {
+#if defined(JB_SCALAR)
+    return 0;
+#elif (defined(__GNUC__) || defined(__clang__)) && (defined(__x86_64__) || defined(__i386__))
+    __builtin_cpu_init();
+    return __builtin_cpu_supports("avx2") && __builtin_cpu_supports("fma");
+#elif defined(_MSC_VER) && defined(_M_X64)
+    int leaf[4];
+    __cpuid(leaf, 1);
+    if (!(leaf[2] & (1 << 27)) || !(leaf[2] & (1 << 28)) || !(leaf[2] & (1 << 12)) ||
+        (_xgetbv(0) & 6) != 6)
+        return 0;
+    __cpuidex(leaf, 7, 0);
+    return !!(leaf[1] & (1 << 5));
+#else
+    return 0;
+#endif
+}
+#endif
+
+#if defined(JB_HAVE_AVX512)
+static int jb_cpu_has_avx512(void) {
+#if defined(JB_SCALAR)
+    return 0;
+#elif (defined(__GNUC__) || defined(__clang__)) && (defined(__x86_64__) || defined(__i386__))
+    __builtin_cpu_init();
+    return __builtin_cpu_supports("avx2") && __builtin_cpu_supports("fma") &&
+           __builtin_cpu_supports("avx512f") && __builtin_cpu_supports("avx512dq") &&
+           __builtin_cpu_supports("avx512bw");
+#else
+    return 0;
+#endif
+}
+#endif
+
 static const DGKernelOps *dg_kernels(void) {
-#if defined(JB_AVX512)
     (void)dg_nvfp4_qdq_parallel;
-    (void)dg_nvfp4_qdq_ref;
-    (void)dg_nvfp4_mm_ref;
-    (void)dg_mm_data_ref;
-    (void)dg_rms_ref;
-    (void)dg_dot_ref;
+    static _Atomic(const DGKernelOps *) cache;
+    static const DGKernelOps scalar = {
+        "scalar",       dg_nvfp4_qdq_ref, NULL,       dg_nvfp4_mm_ref, dg_nvfp4_gated_each,
+        dg_mm_data_ref, dg_rms_ref,       dg_dot_ref, dg_dots_each,    1};
+    const DGKernelOps *cached = atomic_load_explicit(&cache, memory_order_acquire);
+    if (cached)
+        return cached;
+    const DGKernelOps *selected = &scalar;
+#if defined(JB_HAVE_AVX512)
+    (void)dg_nvfp4_qdq_parallel;
 #if JB_STRICT_MATH
     (void)dg_nvfp4_qdq_avx512;
     (void)dg_nvfp4_mm_avx512;
     (void)dg_mm_data_avx512;
     (void)dg_dot_avx512;
-    static const DGKernelOps selected = {
+    static const DGKernelOps avx512 = {
         "avx512-exact", dg_nvfp4_qdq_ref, NULL,       dg_nvfp4_mm_ref, dg_nvfp4_gated_each,
         dg_mm_data_ref, dg_rms_avx512,    dg_dot_ref, dg_dots_each,    1};
 #else
-    static const DGKernelOps selected = {"avx512",
-                                         dg_nvfp4_qdq_avx512,
-                                         dg_nvfp4_swizzle,
-                                         dg_nvfp4_mm_avx512,
-                                         dg_nvfp4_gated_each,
-                                         dg_mm_data_avx512,
-                                         dg_rms_avx512,
-                                         dg_dot_avx512,
-                                         dg_dots_each,
-                                         0};
+    static const DGKernelOps avx512 = {"avx512",
+                                       dg_nvfp4_qdq_avx512,
+                                       dg_nvfp4_swizzle,
+                                       dg_nvfp4_mm_avx512,
+                                       dg_nvfp4_gated_each,
+                                       dg_mm_data_avx512,
+                                       dg_rms_avx512,
+                                       dg_dot_avx512,
+                                       dg_dots_each,
+                                       0};
 #endif
-    return &selected;
-#elif defined(JB_AVX2)
-    (void)dg_nvfp4_qdq_ref;
-    (void)dg_nvfp4_mm_ref;
-    (void)dg_mm_data_ref;
-    (void)dg_rms_ref;
-    (void)dg_dot_ref;
-    static const DGKernelOps selected = {
+    if (jb_cpu_has_avx512())
+        selected = &avx512;
+#endif
+#if defined(JB_HAVE_AVX2)
+    static const DGKernelOps avx2 = {
         "avx2",          dg_nvfp4_qdq_parallel, NULL,        dg_nvfp4_mm_avx2, dg_nvfp4_gated_each,
         dg_mm_data_avx2, dg_rms_avx2,           dg_dot_avx2, dg_dots_each,     0};
-    return &selected;
-#elif defined(JB_NEON)
-    (void)dg_nvfp4_qdq_ref;
-    (void)dg_nvfp4_mm_ref;
-    (void)dg_mm_data_ref;
-    (void)dg_rms_ref;
-    (void)dg_dots_each;
-    (void)dg_nvfp4_gated_each;
-    static const DGKernelOps selected = {
+    if (selected == &scalar && jb_cpu_has_avx2())
+        selected = &avx2;
+#endif
+#if defined(JB_NEON)
+    static const DGKernelOps neon = {
         "neon",          dg_nvfp4_qdq_parallel, NULL,       dg_nvfp4_mm_neon, dg_nvfp4_gated_neon,
         dg_mm_data_neon, dg_rms_neon,           dg_dot_ref, dg_dots_neon,     1};
-    return &selected;
-#else
-    (void)dg_nvfp4_qdq_parallel;
-    static const DGKernelOps scalar = {
-        "scalar",       dg_nvfp4_qdq_ref, NULL,       dg_nvfp4_mm_ref, dg_nvfp4_gated_each,
-        dg_mm_data_ref, dg_rms_ref,       dg_dot_ref, dg_dots_each,    1};
-    return &scalar;
+    selected = &neon;
 #endif
+    const DGKernelOps *expected = NULL;
+    if (!atomic_compare_exchange_strong_explicit(&cache, &expected, selected, memory_order_release,
+                                                 memory_order_acquire))
+        selected = expected;
+    return selected;
 }
 
 /* CUDA accelerator for the transformer layers. The driver API and NVRTC are
@@ -5063,7 +5149,7 @@ static void dg_cuda_compile(int major, int minor) {
     size_t length = 1;
     for (size_t i = 0; i < sizeof dg_cuda_source / sizeof *dg_cuda_source; i++)
         length += strlen(dg_cuda_source[i]);
-    char *source = malloc(length);
+    char *source = jb_try_allocate(length, 0);
     if (!source) {
         dg_cuda.failure = "out of memory";
         return;
@@ -5077,7 +5163,7 @@ static void dg_cuda_compile(int major, int minor) {
     source[at] = 0;
     nvrtcProgram prog;
     int created = !dg_cuda.create(&prog, source, "jb_layers.cu", 0, NULL, NULL);
-    free(source);
+    jb_release(source);
     if (!created) {
         dg_cuda.failure = "nvrtcCreateProgram";
         return;
@@ -5086,12 +5172,14 @@ static void dg_cuda_compile(int major, int minor) {
     char *ptx = NULL;
     CUmodule module;
     if (dg_cuda.compile(prog, (int)(sizeof options / sizeof *options), options) ||
-        dg_cuda.ptx_size(prog, &size) || !(ptx = malloc(size)) || dg_cuda.ptx(prog, ptx)) {
+        dg_cuda.ptx_size(prog, &size) || !(ptx = jb_try_allocate(size, 0)) ||
+        dg_cuda.ptx(prog, ptx)) {
         size_t n = 0;
         char *log = NULL;
-        if (!dg_cuda.log_size(prog, &n) && n > 1 && (log = malloc(n)) && !dg_cuda.log(prog, log))
+        if (!dg_cuda.log_size(prog, &n) && n > 1 && (log = jb_try_allocate(n, 0)) &&
+            !dg_cuda.log(prog, log))
             snprintf(dg_cuda.compile_log, sizeof dg_cuda.compile_log, "%s", log);
-        free(log);
+        jb_release(log);
         dg_cuda.failure = "compiling the kernels";
     } else if (dg_cuda.module_load(&module, ptx))
         dg_cuda.failure = "loading the kernels";
@@ -5106,7 +5194,7 @@ static void dg_cuda_compile(int major, int minor) {
                 dg_cuda.ready = 0;
             }
     }
-    free(ptx);
+    jb_release(ptx);
     dg_cuda.destroy(&prog);
 }
 
@@ -5514,6 +5602,24 @@ static const DGAccelOps *dg_accel(void) {
     return dg_cuda.ready ? &cuda : NULL;
 }
 
+/* CUDA currently uses the context's legacy default stream. Keep complete
+ * decisions from separate sessions from interleaving until per-session
+ * streams are introduced. CPU sessions remain fully concurrent. */
+static pthread_mutex_t jb_cuda_call_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+static int jb_accel_call_lock(const DGModel *model) {
+    if (!model->accel)
+        return 0;
+    if (pthread_mutex_lock(&jb_cuda_call_mutex))
+        die_status(JB_ERROR_INTERNAL, "cannot lock CUDA execution");
+    return 1;
+}
+
+static void jb_accel_call_unlock(int locked) {
+    if (locked)
+        (void)pthread_mutex_unlock(&jb_cuda_call_mutex);
+}
+
 #ifndef JB_NO_MAIN
 /* After dg_accel(): why a present device runs nothing, or NULL; *log gets
  * NVRTC's log, empty unless compiling failed. Only the CLI reports it. */
@@ -5525,6 +5631,15 @@ static const char *dg_accel_failure(const char **log) {
 #else
 static const DGAccelOps *dg_accel(void) {
     return NULL;
+}
+
+static int jb_accel_call_lock(const DGModel *model) {
+    (void)model;
+    return 0;
+}
+
+static void jb_accel_call_unlock(int locked) {
+    (void)locked;
 }
 
 #ifndef JB_NO_MAIN
@@ -6981,8 +7096,8 @@ static int jb_numeric_format(char *out, size_t size, double value, int milliseco
 #else
     locale_t locale = jb_numeric_locale();
     locale_t previous = uselocale(locale);
-    int result = milliseconds ? snprintf(out, size, "%.3f", value)
-                              : snprintf(out, size, "%.17g", value);
+    int result =
+        milliseconds ? snprintf(out, size, "%.3f", value) : snprintf(out, size, "%.17g", value);
     uselocale(previous);
     return result;
 #endif
@@ -8230,10 +8345,16 @@ static int dg_system_batch(DGModel *m, DGTokenizer *tok, const char *const *row,
 struct jb_model {
     DGModel model;
     DGTokenizer tokenizer;
+    atomic_uint references;
+    jb_allocator allocator;
+    void *log_context;
+    jb_log_fn log;
 };
 
 struct jb_session {
     jb_model *model;
+    atomic_flag busy;
+    int poisoned;
     DGPrefixCache prefix;
     DGWorkspace workspace;
     char *questions_json;
@@ -8242,12 +8363,30 @@ struct jb_session {
     char error[sizeof jb_error_message];
 };
 
+static void jb_log_message(const jb_model *model, jb_log_level level, const char *message) {
+    if (model && model->log)
+        model->log(model->log_context, level, message);
+}
+
 const char *jb_version(void) {
     return JB_VERSION;
 }
 
+static jb_status jb_invalid(const char *message);
+
 uint32_t jb_api_version(void) {
     return JB_API_VERSION;
+}
+
+jb_status jb_get_abi_info(jb_abi_info *info) {
+    if (!info || info->struct_size < sizeof *info)
+        return jb_invalid("ABI info structure is missing or too small");
+    *info = (jb_abi_info){sizeof *info,         JB_API_VERSION,         sizeof(jb_string),
+                          sizeof(jb_candidate), sizeof(jb_question),    sizeof(jb_schema),
+                          sizeof(jb_input),     sizeof(jb_probability), sizeof(jb_answer),
+                          sizeof(jb_result)};
+    jb_error_message[0] = 0;
+    return JB_OK;
 }
 
 const char *jb_status_string(jb_status status) {
@@ -8270,11 +8409,15 @@ static jb_status jb_invalid(const char *message) {
     return JB_ERROR_INVALID_ARGUMENT;
 }
 
-jb_status jb_model_load(const char *model_directory, jb_model **out_model) {
-    if (out_model)
-        *out_model = NULL;
-    if (!model_directory || !out_model)
-        return jb_invalid("model directory and output pointer are required");
+static int jb_allocator_valid(const jb_allocator *allocator) {
+    return allocator->struct_size >= sizeof *allocator && allocator->allocate &&
+           allocator->reallocate && allocator->release;
+}
+
+static jb_status jb_model_load_impl(const char *model_directory, jb_model **out_model,
+                                    jb_allocator allocator, void *log_context, jb_log_fn log) {
+    const jb_allocator *previous_allocator = jb_active_allocator;
+    jb_active_allocator = &allocator;
     jb_model *volatile model = NULL;
     JBErrorFrame frame;
     jb_frame_enter(&frame, JB_ERROR_MODEL);
@@ -8285,25 +8428,74 @@ jb_status jb_model_load(const char *model_directory, jb_model **out_model) {
             dg_release_accel(&model->model);
             dg_unmap_shards(&model->model);
         }
-        return jb_frame_fail(&frame);
+        jb_status status = jb_frame_fail(&frame);
+        jb_active_allocator = previous_allocator;
+        if (log)
+            log(log_context, JB_LOG_ERROR, jb_error_message);
+        return status;
     }
     model = xcalloc(1, sizeof *model);
+    model->allocator = allocator;
+    model->log_context = log_context;
+    model->log = log;
+    atomic_init(&model->references, 1);
     dg_load(&model->model, model_directory);
     dgt_load(&model->tokenizer, model_directory);
     dg_upload_model(&model->model);
     dg_prepare_exact_model(&model->model);
     jb_frame_leave(&frame);
-    *out_model = model;
+    jb_active_allocator = previous_allocator;
     jb_error_message[0] = 0;
+    jb_log_message(model, JB_LOG_INFO, "model loaded");
+    *out_model = model;
     return JB_OK;
 }
 
-void jb_model_free(jb_model *model) {
+jb_status jb_model_load_ex(const char *model_directory, const jb_model_options *options,
+                           jb_model **out_model) {
+    if (out_model)
+        *out_model = NULL;
+    if (!model_directory || !out_model)
+        return jb_invalid("model directory and output pointer are required");
+    jb_allocator allocator = jb_system_allocator;
+    void *log_context = NULL;
+    jb_log_fn log = NULL;
+    if (options) {
+        if (options->struct_size < sizeof *options || options->api_version != JB_API_VERSION)
+            return jb_invalid("model options version or size is incompatible");
+        if (options->allocator.allocate || options->allocator.reallocate ||
+            options->allocator.release) {
+            if (!jb_allocator_valid(&options->allocator))
+                return jb_invalid("custom allocator is incomplete");
+            allocator = options->allocator;
+        }
+        log_context = options->log_context;
+        log = options->log;
+    }
+    return jb_model_load_impl(model_directory, out_model, allocator, log_context, log);
+}
+
+jb_status jb_model_load(const char *model_directory, jb_model **out_model) {
+    return jb_model_load_ex(model_directory, NULL, out_model);
+}
+
+void jb_model_retain(jb_model *model) {
+    if (model)
+        (void)atomic_fetch_add_explicit(&model->references, 1, memory_order_relaxed);
+}
+
+static void jb_model_release(jb_model *model) {
     if (!model)
+        return;
+    if (atomic_fetch_sub_explicit(&model->references, 1, memory_order_acq_rel) != 1)
         return;
     dgt_free(&model->tokenizer);
     dg_free(&model->model);
     jb_release(model);
+}
+
+void jb_model_free(jb_model *model) {
+    jb_model_release(model);
 }
 
 /* Copy a caller's counted string, rejecting what would otherwise be read
@@ -8405,12 +8597,18 @@ jb_status jb_session_create_json(jb_model *model, const char *questions_json,
         return jb_invalid("model, schema, and output pointer are required");
     if (questions_length > JB_MAX_JSON)
         return jb_invalid("schema JSON is too large");
+    const jb_allocator *previous_allocator = jb_active_allocator;
+    jb_active_allocator = &model->allocator;
     JBErrorFrame frame;
     jb_frame_enter(&frame, JB_ERROR_REQUEST);
-    if (setjmp(frame.jump))
-        return jb_frame_fail(&frame);
+    if (setjmp(frame.jump)) {
+        jb_status status = jb_frame_fail(&frame);
+        jb_active_allocator = previous_allocator;
+        return status;
+    }
     jb_session *session = xcalloc(1, sizeof *session);
     session->model = model;
+    atomic_flag_clear(&session->busy);
     if (questions_json) {
         int nt = 0;
         JTok *tokens = json_tokens(questions_json, questions_length, &nt);
@@ -8422,8 +8620,10 @@ jb_status jb_session_create_json(jb_model *model, const char *questions_json,
         session->questions_json[questions_length] = 0;
         session->questions_length = questions_length;
     }
+    jb_model_retain(model);
     jb_frame_leave(&frame);
     *out_session = session;
+    jb_active_allocator = previous_allocator;
     jb_error_message[0] = 0;
     return JB_OK;
 }
@@ -8433,23 +8633,31 @@ jb_status jb_session_create(jb_model *model, const jb_schema *schema, jb_session
         *out_session = NULL;
     if (!model || !schema || !out_session)
         return jb_invalid("model, typed schema, and output pointer are required");
+    const jb_allocator *previous_allocator = jb_active_allocator;
+    jb_active_allocator = &model->allocator;
     JBErrorFrame frame;
     jb_frame_enter(&frame, JB_ERROR_REQUEST);
-    if (setjmp(frame.jump))
-        return jb_frame_fail(&frame);
+    if (setjmp(frame.jump)) {
+        jb_status status = jb_frame_fail(&frame);
+        jb_active_allocator = previous_allocator;
+        return status;
+    }
     size_t length = 0;
     char *json = jb_schema_json(schema, &length);
     if (!json) {
         jb_frame_abandon(&frame);
+        jb_active_allocator = previous_allocator;
         return jb_invalid("typed schema is empty or invalid");
     }
     jb_status status = jb_session_create_json(model, json, length, out_session);
     jb_release(json);
     if (status != JB_OK) {
         jb_frame_abandon(&frame);
+        jb_active_allocator = previous_allocator;
         return status;
     }
     jb_frame_leave(&frame);
+    jb_active_allocator = previous_allocator;
     return JB_OK;
 }
 
@@ -8459,7 +8667,9 @@ void jb_session_free(jb_session *session) {
     dg_workspace_destroy(&session->workspace);
     dg_prefix_free(&session->prefix);
     jb_release(session->questions_json);
+    jb_model *model = session->model;
     jb_release(session);
+    jb_model_release(model);
 }
 
 static jb_status jb_session_decide_json_call(jb_session *session, const char *request_json,
@@ -8473,20 +8683,32 @@ static jb_status jb_session_decide_json_call(jb_session *session, const char *re
         return jb_invalid("session, request, and output pointers are required");
     if (request_length > JB_MAX_JSON)
         return jb_invalid("request JSON is too large");
+    const jb_allocator *previous_allocator = jb_active_allocator;
+    jb_active_allocator = &session->model->allocator;
+    volatile int accel_locked = 0;
     JBErrorFrame frame;
     jb_frame_enter(&frame, JB_ERROR_REQUEST);
     if (setjmp(frame.jump)) {
 #ifdef JB_PROFILE
         jb_profile_active = NULL;
 #endif
+        if (session->workspace.active || session->workspace.kv_active ||
+            session->workspace.control_active)
+            session->poisoned = 1;
         session->workspace.active = 0;
         session->workspace.kv_active = 0;
         session->workspace.control_active = 0;
-        return jb_frame_fail(&frame);
+        jb_accel_call_unlock(accel_locked);
+        jb_status status = jb_frame_fail(&frame);
+        jb_active_allocator = previous_allocator;
+        return status;
     }
+    accel_locked = jb_accel_call_lock(&session->model->model);
     dg_systemone(&session->model->model, &session->model->tokenizer, request_json, request_length,
                  &session->prefix, &session->workspace, out_json, out_length);
+    jb_accel_call_unlock(accel_locked);
     jb_frame_leave(&frame);
+    jb_active_allocator = previous_allocator;
     jb_error_message[0] = 0;
     return JB_OK;
 }
@@ -8503,17 +8725,27 @@ static jb_status jb_session_decide_json_batch_call(jb_session *session,
     if (!session || !request_json || !request_lengths || !request_count || request_count > 16 ||
         !out_json || !out_lengths)
         return jb_invalid("batch arguments are invalid");
+    const jb_allocator *previous_allocator = jb_active_allocator;
+    jb_active_allocator = &session->model->allocator;
+    volatile int accel_locked = 0;
     JBErrorFrame frame;
     jb_frame_enter(&frame, JB_ERROR_REQUEST);
     if (setjmp(frame.jump)) {
 #ifdef JB_PROFILE
         jb_profile_active = NULL;
 #endif
+        if (session->workspace.active || session->workspace.kv_active ||
+            session->workspace.control_active)
+            session->poisoned = 1;
         session->workspace.active = 0;
         session->workspace.kv_active = 0;
         session->workspace.control_active = 0;
-        return jb_frame_fail(&frame);
+        jb_accel_call_unlock(accel_locked);
+        jb_status status = jb_frame_fail(&frame);
+        jb_active_allocator = previous_allocator;
+        return status;
     }
+    accel_locked = jb_accel_call_lock(&session->model->model);
     char **output = xcalloc(request_count, sizeof *output);
     size_t *length = xcalloc(request_count, sizeof *length);
     for (size_t i = 0; i < request_count; i++) {
@@ -8531,7 +8763,9 @@ static jb_status jb_session_decide_json_batch_call(jb_session *session,
             dg_systemone(&session->model->model, &session->model->tokenizer, request_json[i],
                          request_lengths[i], &session->prefix, &session->workspace, &output[i],
                          &length[i]);
+    jb_accel_call_unlock(accel_locked);
     jb_frame_leave(&frame);
+    jb_active_allocator = previous_allocator;
     *out_json = output;
     *out_lengths = length;
     jb_error_message[0] = 0;
@@ -8544,8 +8778,7 @@ void jb_free(void *allocation) {
 
 /* Parse the JSON number grammar directly, independent of the process locale. */
 static double jb_token_double(const char *json, const JTok *token) {
-    if (token->type != JT_PRIMITIVE || token->end <= token->start ||
-        token->end - token->start > 32)
+    if (token->type != JT_PRIMITIVE || token->end <= token->start || token->end - token->start > 32)
         die("invalid numeric result field");
     char text[33], *end = NULL;
     size_t length = (size_t)(token->end - token->start);
@@ -8722,22 +8955,29 @@ static jb_status jb_session_decide_call(jb_session *session, const jb_input *inp
         *out_result = NULL;
     if (!session || !input || !out_result)
         return jb_invalid("session, input, and output pointer are required");
+    const jb_allocator *previous_allocator = jb_active_allocator;
+    jb_active_allocator = &session->model->allocator;
     JBErrorFrame frame;
     jb_frame_enter(&frame, JB_ERROR_REQUEST);
-    if (setjmp(frame.jump))
-        return jb_frame_fail(&frame);
+    if (setjmp(frame.jump)) {
+        jb_status status = jb_frame_fail(&frame);
+        jb_active_allocator = previous_allocator;
+        return status;
+    }
     size_t request_length = 0, output_length = 0;
     char *request = jb_typed_request(session, input, &request_length), *output = NULL;
     jb_status status =
-        jb_session_decide_json(session, request, request_length, &output, &output_length);
+        jb_session_decide_json_call(session, request, request_length, &output, &output_length);
     jb_release(request);
     if (status != JB_OK) {
         jb_frame_abandon(&frame);
+        jb_active_allocator = previous_allocator;
         return status;
     }
     jb_result *result = jb_result_parse(output, output_length);
     jb_release(output);
     jb_frame_leave(&frame);
+    jb_active_allocator = previous_allocator;
     *out_result = result;
     return JB_OK;
 }
@@ -8748,10 +8988,15 @@ static jb_status jb_session_decide_batch_call(jb_session *session, const jb_inpu
         *out_results = NULL;
     if (!session || !inputs || !input_count || input_count > 16 || !out_results)
         return jb_invalid("typed batch arguments are invalid");
+    const jb_allocator *previous_allocator = jb_active_allocator;
+    jb_active_allocator = &session->model->allocator;
     JBErrorFrame frame;
     jb_frame_enter(&frame, JB_ERROR_REQUEST);
-    if (setjmp(frame.jump))
-        return jb_frame_fail(&frame);
+    if (setjmp(frame.jump)) {
+        jb_status status = jb_frame_fail(&frame);
+        jb_active_allocator = previous_allocator;
+        return status;
+    }
     char **request = xcalloc(input_count, sizeof *request);
     size_t *request_length = xcalloc(input_count, sizeof *request_length);
     for (size_t i = 0; i < input_count; i++)
@@ -8759,14 +9004,15 @@ static jb_status jb_session_decide_batch_call(jb_session *session, const jb_inpu
     char **output = NULL;
     size_t *output_length = NULL;
     jb_status status =
-        jb_session_decide_json_batch(session, (const char *const *)request, request_length,
-                                     input_count, &output, &output_length);
+        jb_session_decide_json_batch_call(session, (const char *const *)request, request_length,
+                                          input_count, &output, &output_length);
     for (size_t i = 0; i < input_count; i++)
         jb_release(request[i]);
     jb_release(request_length);
     jb_release(request);
     if (status != JB_OK) {
         jb_frame_abandon(&frame);
+        jb_active_allocator = previous_allocator;
         return status;
     }
     jb_result **result = xcalloc(input_count, sizeof *result);
@@ -8777,20 +9023,45 @@ static jb_status jb_session_decide_batch_call(jb_session *session, const jb_inpu
     jb_release(output_length);
     jb_release(output);
     jb_frame_leave(&frame);
+    jb_active_allocator = previous_allocator;
     *out_results = result;
     return JB_OK;
 }
 
 /* Each session call records its outcome on the session, so the error can be
  * read from whichever thread handles the session next. */
-static jb_status jb_session_record(jb_session *session, jb_status status) {
-    if (session) {
-        if (status == JB_OK)
-            session->error[0] = 0;
-        else
-            snprintf(session->error, sizeof session->error, "%s", jb_error_message);
+static int jb_session_acquire(jb_session *session) {
+    return !session || !atomic_flag_test_and_set_explicit(&session->busy, memory_order_acquire);
+}
+
+static jb_status jb_session_release(jb_session *session, jb_status status) {
+    if (!session)
+        return status;
+    if (status == JB_OK) {
+        session->error[0] = 0;
+        atomic_flag_clear_explicit(&session->busy, memory_order_release);
+        return status;
     }
+    snprintf(session->error, sizeof session->error, "%s", jb_error_message);
+    char message[sizeof session->error];
+    memcpy(message, session->error, sizeof message);
+    jb_model *model = session->model;
+    jb_model_retain(model);
+    atomic_flag_clear_explicit(&session->busy, memory_order_release);
+    /* No session access is permitted after the callback: a reentrant logger
+     * may destroy it. The retained model keeps the callback and its context
+     * alive for this invocation. */
+    jb_log_message(model, JB_LOG_ERROR, message);
+    jb_model_release(model);
     return status;
+}
+
+static jb_status jb_session_ready(jb_session *session) {
+    if (!session || !session->poisoned)
+        return JB_OK;
+    snprintf(jb_error_message, sizeof jb_error_message,
+             "session is unusable after an inference failure");
+    return JB_ERROR_INTERNAL;
 }
 
 const char *jb_session_last_error(const jb_session *session) {
@@ -8799,7 +9070,16 @@ const char *jb_session_last_error(const jb_session *session) {
 
 jb_status jb_session_decide_json(jb_session *session, const char *request_json,
                                  size_t request_length, char **out_json, size_t *out_length) {
-    return jb_session_record(
+    if (out_json)
+        *out_json = NULL;
+    if (out_length)
+        *out_length = 0;
+    if (!jb_session_acquire(session))
+        return jb_invalid("session is already in use by another call");
+    jb_status ready = jb_session_ready(session);
+    if (ready != JB_OK)
+        return jb_session_release(session, ready);
+    return jb_session_release(
         session,
         jb_session_decide_json_call(session, request_json, request_length, out_json, out_length));
 }
@@ -8807,18 +9087,41 @@ jb_status jb_session_decide_json(jb_session *session, const char *request_json,
 jb_status jb_session_decide_json_batch(jb_session *session, const char *const *request_json,
                                        const size_t *request_lengths, size_t request_count,
                                        char ***out_json, size_t **out_lengths) {
-    return jb_session_record(
+    if (out_json)
+        *out_json = NULL;
+    if (out_lengths)
+        *out_lengths = NULL;
+    if (!jb_session_acquire(session))
+        return jb_invalid("session is already in use by another call");
+    jb_status ready = jb_session_ready(session);
+    if (ready != JB_OK)
+        return jb_session_release(session, ready);
+    return jb_session_release(
         session, jb_session_decide_json_batch_call(session, request_json, request_lengths,
                                                    request_count, out_json, out_lengths));
 }
 
 jb_status jb_session_decide(jb_session *session, const jb_input *input, jb_result **out_result) {
-    return jb_session_record(session, jb_session_decide_call(session, input, out_result));
+    if (out_result)
+        *out_result = NULL;
+    if (!jb_session_acquire(session))
+        return jb_invalid("session is already in use by another call");
+    jb_status ready = jb_session_ready(session);
+    if (ready != JB_OK)
+        return jb_session_release(session, ready);
+    return jb_session_release(session, jb_session_decide_call(session, input, out_result));
 }
 
 jb_status jb_session_decide_batch(jb_session *session, const jb_input *inputs, size_t input_count,
                                   jb_result ***out_results) {
-    return jb_session_record(
+    if (out_results)
+        *out_results = NULL;
+    if (!jb_session_acquire(session))
+        return jb_invalid("session is already in use by another call");
+    jb_status ready = jb_session_ready(session);
+    if (ready != JB_OK)
+        return jb_session_release(session, ready);
+    return jb_session_release(
         session, jb_session_decide_batch_call(session, inputs, input_count, out_results));
 }
 
@@ -9084,8 +9387,8 @@ static void dg_test_mm(uint64_t *rs) {
             else
                 memcpy(yref, y, (size_t)tokens * rows * 4);
         }
-#if defined(JB_AVX512) && JB_STRICT_MATH
-        if (rows % DG_EXACT_ROWS == 0) {
+#if defined(JB_HAVE_AVX512) && JB_STRICT_MATH
+        if (jb_cpu_has_avx512() && rows % DG_EXACT_ROWS == 0) {
             DGTensor tw = {0};
             tw.data = w;
             tw.exact = xmalloc((size_t)rows * cols * 2);
@@ -9137,18 +9440,19 @@ static void dg_test_nvfp4(uint64_t *rs) {
                                    {6, 64, 2}, {16, 704, 17}, {32, 2816, 3}};
     static const float mag4[8] = {0, .5f, 1, 1.5f, 2, 3, 4, 6};
     const float global = 0.01f, base = 0.02f;
-#if defined(JB_AVX512) && JB_STRICT_MATH
-    for (int first = 0; first < 256; first += DG_EXACT_ROWS) {
-        uint8_t code[DG_EXACT_ROWS];
-        float got[DG_EXACT_ROWS], want[DG_EXACT_ROWS];
-        for (int i = 0; i < DG_EXACT_ROWS; i++) {
-            code[i] = (uint8_t)(first + i);
-            want[i] = dg_f8e4m3(code[i]);
+#if defined(JB_HAVE_AVX512) && JB_STRICT_MATH
+    if (jb_cpu_has_avx512())
+        for (int first = 0; first < 256; first += DG_EXACT_ROWS) {
+            uint8_t code[DG_EXACT_ROWS];
+            float got[DG_EXACT_ROWS], want[DG_EXACT_ROWS];
+            for (int i = 0; i < DG_EXACT_ROWS; i++) {
+                code[i] = (uint8_t)(first + i);
+                want[i] = dg_f8e4m3(code[i]);
+            }
+            dg_f8e4m3x16_store(got, code);
+            if (memcmp(got, want, sizeof got))
+                die("kernel self-test failed: exact AVX-512 E4M3 decoder differs from reference");
         }
-        _mm512_storeu_ps(got, dg_f8e4m3x16(code));
-        if (memcmp(got, want, sizeof got))
-            die("kernel self-test failed: exact AVX-512 E4M3 decoder differs from reference");
-    }
 #endif
     for (size_t k = 0; k < sizeof shape / sizeof *shape; k++) {
         int rows = shape[k][0], cols = shape[k][1], tokens = shape[k][2];
@@ -9185,8 +9489,8 @@ static void dg_test_nvfp4(uint64_t *rs) {
             jb_check_close("NVFP4 matmul (ref)", y[i], want[i], 1e-4 * mag[i]);
         float *yref = xmalloc((size_t)tokens * rows * 4);
         memcpy(yref, y, (size_t)tokens * rows * 4);
-#if defined(JB_AVX512) && JB_STRICT_MATH
-        if (rows % DG_EXACT_ROWS == 0) {
+#if defined(JB_HAVE_AVX512) && JB_STRICT_MATH
+        if (jb_cpu_has_avx512() && rows % DG_EXACT_ROWS == 0) {
             DGTensor tw = {0}, ts = {0};
             tw.data = wd;
             ts.data = sd;
@@ -9909,6 +10213,8 @@ static double jb_best_ms(uint64_t *ns, int reps) {
 }
 
 static int bench_kernels(void) {
+    int use_exact = !strcmp(dg_kernels()->name, "avx512-exact");
+    (void)use_exact;
     printf("{\"bench\":\"info\",\"kernels\":\"%s\",\"math\":\"%s\",\"threads\":%d}\n",
            dg_kernels()->name, JB_MATH_MODE, jb_threads());
     uint64_t rs = 0x243f6a8885a308d3ull, ns[3];
@@ -9943,27 +10249,34 @@ static int bench_kernels(void) {
         jb_put_bf16(w + i * 2, jb_rng_unit(&rs));
     for (size_t i = 0; i < (size_t)256 * cols; i++)
         x[i] = jb_rng_unit(&rs);
-#if defined(JB_AVX512) && JB_STRICT_MATH
+#if defined(JB_HAVE_AVX512) && JB_STRICT_MATH
     DGTensor bw = {0};
     bw.data = w;
-    bw.exact = xmalloc((size_t)rows * cols * 2);
-    bw.shape[0] = (uint64_t)rows;
-    bw.shape[1] = (uint64_t)cols;
-    dg_exact_pack_bf16(&bw);
+    if (use_exact) {
+        bw.exact = xmalloc((size_t)rows * cols * 2);
+        bw.shape[0] = (uint64_t)rows;
+        bw.shape[1] = (uint64_t)cols;
+        dg_exact_pack_bf16(&bw);
+    }
 #endif
     for (size_t k = 0; k < sizeof mm_tokens / sizeof *mm_tokens; k++) {
         int tokens = mm_tokens[k];
         for (int kernel = 0; kernel < 2; kernel++) {
-#if !(defined(JB_AVX512) && JB_STRICT_MATH)
+#if defined(JB_HAVE_AVX512) && JB_STRICT_MATH
+            if (kernel && !use_exact && dg_kernels()->bf16_mm == dg_mm_data_ref)
+#else
             if (kernel && dg_kernels()->bf16_mm == dg_mm_data_ref)
                 break;
 #endif
-            dg_mm_data_ref(w, x, y, tokens, rows, cols);
+                dg_mm_data_ref(w, x, y, tokens, rows, cols);
             for (int rep = 0; rep < 3; rep++) {
                 uint64_t t0 = now_ns();
                 if (kernel) {
-#if defined(JB_AVX512) && JB_STRICT_MATH
-                    dg_mm_exact_avx512(bw.exact, x, y, tokens, rows, cols);
+#if defined(JB_HAVE_AVX512) && JB_STRICT_MATH
+                    if (use_exact)
+                        dg_mm_exact_avx512(bw.exact, x, y, tokens, rows, cols);
+                    else
+                        dg_mm_data(w, x, y, tokens, rows, cols);
 #else
                     dg_mm_data(w, x, y, tokens, rows, cols);
 #endif
@@ -9978,8 +10291,9 @@ static int bench_kernels(void) {
                    2.0 * rows * cols * tokens / ms / 1e6, 2.0 * rows * cols / ms / 1e6);
         }
     }
-#if defined(JB_AVX512) && JB_STRICT_MATH
-    jb_release((void *)bw.exact);
+#if defined(JB_HAVE_AVX512) && JB_STRICT_MATH
+    if (bw.exact)
+        jb_release((void *)bw.exact);
 #endif
     jb_release(w);
     jb_release(x);
@@ -10001,12 +10315,12 @@ static int bench_kernels(void) {
         xr[i] = 3 * jb_rng_unit(&rs);
     dg_nvfp4_qdq_ref(xq, xr, 64, nc, 0.02f);
     dg_nvfp4_qdq(xs, xr, 64, nc, 0.02f);
-#if defined(JB_AVX512) && JB_STRICT_MATH
+#if defined(JB_HAVE_AVX512) && JB_STRICT_MATH
     size_t exact_sbytes = (size_t)nr * nc / 16;
-    uint8_t *exact_w = xmalloc(wbytes * experts);
-    uint8_t *exact_s = xmalloc(exact_sbytes * experts);
+    uint8_t *exact_w = use_exact ? xmalloc(wbytes * experts) : NULL;
+    uint8_t *exact_s = use_exact ? xmalloc(exact_sbytes * experts) : NULL;
     const float exact_global = 0.01f;
-    for (int e = 0; e < experts; e++) {
+    for (int e = 0; use_exact && e < experts; e++) {
         DGTensor tw = {0}, ts = {0};
         tw.data = wd + wbytes * e;
         tw.exact = exact_w + wbytes * e;
@@ -10018,27 +10332,34 @@ static int bench_kernels(void) {
     for (size_t k = 0; k < sizeof nv_tokens / sizeof *nv_tokens; k++) {
         int tokens = nv_tokens[k];
         for (int kernel = 0; kernel < 2; kernel++) {
-#if !(defined(JB_AVX512) && JB_STRICT_MATH)
+#if defined(JB_HAVE_AVX512) && JB_STRICT_MATH
+            if (kernel && !use_exact && dg_kernels()->nvfp4_mm == dg_nvfp4_mm_ref)
+#else
             if (kernel && dg_kernels()->nvfp4_mm == dg_nvfp4_mm_ref)
                 break;
 #endif
-            for (int rep = 0; rep < 3; rep++) {
-                uint64_t t0 = now_ns();
-                for (int e = 0; e < experts; e++) {
-                    if (kernel) {
-#if defined(JB_AVX512) && JB_STRICT_MATH
-                        dg_nvfp4_exact_avx512(exact_w + wbytes * e, exact_s + exact_sbytes * e,
-                                              exact_global, xq, yo, tokens, nr, nc);
+                for (int rep = 0; rep < 3; rep++) {
+                    uint64_t t0 = now_ns();
+                    for (int e = 0; e < experts; e++) {
+                        if (kernel) {
+#if defined(JB_HAVE_AVX512) && JB_STRICT_MATH
+                            if (use_exact)
+                                dg_nvfp4_exact_avx512(exact_w + wbytes * e,
+                                                      exact_s + exact_sbytes * e, exact_global, xq,
+                                                      yo, tokens, nr, nc);
+                            else
+                                dg_kernels()->nvfp4_mm(wd + wbytes * e, sd + sbytes * e, 0.01f, xs,
+                                                       yo, tokens, nr, nc);
 #else
                         dg_kernels()->nvfp4_mm(wd + wbytes * e, sd + sbytes * e, 0.01f, xs, yo,
                                                tokens, nr, nc);
 #endif
-                    } else
-                        dg_nvfp4_mm_ref(wd + wbytes * e, sd + sbytes * e, 0.01f, xq, yo, tokens, nr,
-                                        nc);
+                        } else
+                            dg_nvfp4_mm_ref(wd + wbytes * e, sd + sbytes * e, 0.01f, xq, yo, tokens,
+                                            nr, nc);
+                    }
+                    ns[rep] = now_ns() - t0;
                 }
-                ns[rep] = now_ns() - t0;
-            }
             ms = jb_best_ms(ns, 3);
             printf("{\"bench\":\"nvfp4_mm\",\"kernel\":\"%s\",\"experts\":%d,\"rows\":%d,\"cols\":%"
                    "d,\"tokens\":%d,\"ms\":%.3f,\"gflops\":%.2f,\"weight_gb_per_s\":%.2f}\n",
@@ -10047,9 +10368,11 @@ static int bench_kernels(void) {
                    (double)(wbytes + sbytes) * experts / ms / 1e6);
         }
     }
-#if defined(JB_AVX512) && JB_STRICT_MATH
-    jb_release(exact_w);
-    jb_release(exact_s);
+#if defined(JB_HAVE_AVX512) && JB_STRICT_MATH
+    if (exact_w)
+        jb_release(exact_w);
+    if (exact_s)
+        jb_release(exact_s);
 #endif
     jb_release(wd);
     jb_release(sd);
@@ -10266,10 +10589,11 @@ static int selftest(void) {
         die("public result self-test failed");
     jb_result_free(public_result);
     jb_model *missing_model = NULL;
-    if (jb_model_load("__jev_bush_missing_model__", &missing_model) != JB_ERROR_IO ||
-        missing_model)
+    if (jb_model_load("__jev_bush_missing_model__", &missing_model) != JB_ERROR_IO || missing_model)
         die("public I/O status self-test failed");
     jb_model dummy_model = {0};
+    dummy_model.allocator = jb_system_allocator;
+    atomic_init(&dummy_model.references, 1);
     jb_session *public_session = NULL;
     if (jb_session_create_json(&dummy_model, "[]", 2, &public_session) != JB_ERROR_REQUEST ||
         public_session)

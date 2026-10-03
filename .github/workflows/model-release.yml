@@ -1,0 +1,60 @@
+name: Model-backed release gate
+
+on:
+  workflow_dispatch:
+    inputs:
+      model:
+        description: Absolute path to the pinned DiffusionGemma model directory
+        required: true
+        type: string
+      dataset:
+        description: Absolute path to the pinned OpenJev JSONL dataset
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  golden:
+    name: Exact model golden and concurrency
+    runs-on: [self-hosted, linux]
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build CLI and shared library
+        run: |
+          make clean
+          make CFLAGS='-O3 -std=c11 -Wall -Wextra -pedantic -Werror' OMPFLAGS=-fopenmp
+          cc -O3 -std=c11 -Wall -Wextra -pedantic -Werror -fopenmp \
+            -DJB_CANVAS_SEQUENTIAL jb.c -lm -o jb-sequential
+          cc -O2 -std=c11 -Wall -Wextra -pedantic -Werror -I. \
+            test/library_model_faults.c libjb.a -fopenmp -lm -o library-model-faults
+
+      - name: Verify authenticated golden and strict invariants
+        env:
+          JB_MODEL: ${{ inputs.model }}
+          JB_DATASET: ${{ inputs.dataset }}
+        run: |
+          tools/release_model_check.sh ./jb ./jb-sequential ./libjb.so "$JB_MODEL" "$JB_DATASET"
+          OMP_NUM_THREADS=32 ./library-model-faults "$JB_MODEL" examples/request.json
+          OMP_NUM_THREADS=1 python3 tools/check_library_concurrency.py \
+            ./libjb.so "$JB_MODEL" examples/request.json --workers 4 --iterations 2
+
+      - name: Capture release manifest
+        if: always()
+        env:
+          JB_MODEL: ${{ inputs.model }}
+          JB_DATASET: ${{ inputs.dataset }}
+        run: |
+          python3 tools/capture_run_manifest.py ./jb "$JB_MODEL" "$JB_DATASET" \
+            --compiler-flags='-O3 -std=c11 -fopenmp' > release-manifest.json
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: jev-bush-release-evidence
+          path: |
+            release-manifest.json
+            benchmarks/
