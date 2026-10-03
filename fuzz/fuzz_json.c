@@ -7,8 +7,9 @@
  *
  * The first byte selects what an input exercises:
  *   0x01  typed API: fields separated by 0x1f build a jb_schema and a
- *         jb_input, which go through jb_schema_json and jb_typed_request;
- *   0x02  jb_result_parse on the rest of the input;
+ *         jb_input, which go through jb_schema_json and the direct typed
+ *         request/question path;
+ *   0x02  generic JSON parsing and canonicalization on the remaining bytes;
  *   else  the whole input is a JSON request: parsing, canonicalization,
  *         request and question validation, and prompt construction.
  *
@@ -158,6 +159,14 @@ static void fuzz_json_request(const char *j, size_t n) {
     dg_request_free(&rq);
 }
 
+static void fuzz_json_document(const char *j, size_t n) {
+    int nt;
+    JTok *tokens = json_tokens(j, n, &nt);
+    fuzz_canonical(j, tokens, nt, 1);
+    fuzz_canonical(j, tokens, nt, 0);
+    jb_release(tokens);
+}
+
 /* Next 0x1f-separated field as a counted string; it may contain NUL. */
 static jb_string fuzz_field(const char **p, const char *end) {
     jb_string s = {*p, 0};
@@ -203,25 +212,29 @@ static void fuzz_typed(const char *j, size_t n) {
     jb_release(json_tokens(schema_json, schema_length, &nt));
     fuzz_must_succeed = 0;
 
-    jb_session session;
-    memset(&session, 0, sizeof session);
-    session.questions_json = schema_json;
-    session.questions_length = schema_length;
     jb_input input;
     input.id = fuzz_field(&p, end);
     input.state_json = fuzz_field(&p, end);
     input.samples = fuzz_byte(&p, end) % 40;
-    size_t request_length = 0;
-    char *request = jb_typed_request(&session, &input, &request_length);
-    fuzz_must_succeed = 1;
-    jb_release(json_tokens(request, request_length, &nt));
-    fuzz_must_succeed = 0;
-    jb_release(request);
-    jb_release(schema_json);
-}
 
-static void fuzz_result(const char *j, size_t n) {
-    jb_result_free(jb_result_parse(j, n));
+    DGRequest request;
+    dg_request_parts(&request, input.state_json.data, input.state_json.length, input.id.data,
+                     input.id.length, schema_json, schema_length, input.samples);
+    (void)dg_request_seed(&request);
+    char *labels[128];
+    for (int i = 0; i < 128; i++) {
+        char label[3];
+        dg_choice_candidate(i, label);
+        labels[i] = xstrdup(label);
+    }
+    int question_count;
+    DecisionWork *work = dg_questions(&request, labels, &question_count);
+    jb_release(dg_system_prompt(request.qj, request.qt, request.qnt, work, question_count));
+    dg_questions_free(work, question_count);
+    for (int i = 0; i < 128; i++)
+        jb_release(labels[i]);
+    dg_request_free(&request);
+    jb_release(schema_json);
 }
 
 int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
@@ -243,7 +256,7 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
         if (size && data[0] == 0x01)
             fuzz_typed(j + 1, size - 1);
         else if (size && data[0] == 0x02)
-            fuzz_result(j + 1, size - 1);
+            fuzz_json_document(j + 1, size - 1);
         else
             fuzz_json_request(j, size);
         jb_frame_leave(&frame);
