@@ -15,10 +15,16 @@ static int expect(jb_status got, jb_status wanted, const char *what) {
 int main(void) {
     int ok = 1;
     jb_abi_info abi = {.struct_size = sizeof abi};
-    ok &= !strcmp(jb_version(), "0.2.0");
+    ok &= !strcmp(jb_version(), "0.3.0");
     ok &= jb_api_version() == JB_API_VERSION;
     ok &= expect(jb_get_abi_info(&abi), JB_OK, "ABI info");
-    ok &= abi.string_size == sizeof(jb_string) && abi.result_size == sizeof(jb_result);
+    ok &= abi.string_size == sizeof(jb_string) && abi.result_size == sizeof(jb_result) &&
+          abi.model_info_size == sizeof(jb_model_info);
+
+    jb_model_info model_info = {.struct_size = sizeof model_info};
+    ok &= expect(jb_model_get_info(NULL, &model_info), JB_ERROR_INVALID_ARGUMENT,
+                 "NULL model info");
+    ok &= model_info.model_family == NULL;
 
     jb_model *model = (jb_model *)(uintptr_t)1;
     ok &= expect(jb_model_load(NULL, &model), JB_ERROR_INVALID_ARGUMENT, "NULL model path");

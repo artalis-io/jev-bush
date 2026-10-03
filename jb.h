@@ -20,13 +20,16 @@
 extern "C" {
 #endif
 
-#define JB_API_VERSION 2u
+#define JB_API_VERSION 3u
+#define JB_MAX_BATCH_INPUTS 16u
 
 typedef struct jb_model jb_model;
 typedef struct jb_session jb_session;
 
-/* Enumerator values are part of the ABI and never change. */
-typedef enum {
+/* Public discriminants have a fixed representation across C compilers and
+ * foreign-function interfaces. Their values are part of the ABI. */
+typedef uint32_t jb_status;
+enum {
     JB_OK = 0,
     JB_ERROR_INVALID_ARGUMENT = 1,
     JB_ERROR_IO = 2,
@@ -34,9 +37,10 @@ typedef enum {
     JB_ERROR_REQUEST = 4,
     JB_ERROR_OUT_OF_MEMORY = 5,
     JB_ERROR_INTERNAL = 6
-} jb_status;
+};
 
-typedef enum { JB_LOG_ERROR = 0, JB_LOG_WARNING = 1, JB_LOG_INFO = 2 } jb_log_level;
+typedef uint32_t jb_log_level;
+enum { JB_LOG_ERROR = 0, JB_LOG_WARNING = 1, JB_LOG_INFO = 2 };
 
 typedef void *(*jb_allocate_fn)(void *context, size_t size);
 typedef void *(*jb_reallocate_fn)(void *context, void *allocation, size_t size);
@@ -72,8 +76,7 @@ typedef struct {
             NULL, NULL                                                                             \
     }
 
-/* Existing public value layouts are permanent. Future API revisions add new
- * types or entry points instead of changing these sizes. */
+/* These are in-process ABI layouts, not serialized representations. */
 typedef struct {
     size_t struct_size;
     uint32_t api_version;
@@ -85,6 +88,7 @@ typedef struct {
     size_t probability_size;
     size_t answer_size;
     size_t result_size;
+    size_t model_info_size;
 } jb_abi_info;
 
 typedef struct {
@@ -93,11 +97,25 @@ typedef struct {
     size_t length;
 } jb_string;
 
-typedef enum {
+typedef uint32_t jb_decision_type;
+enum {
     JB_DECISION_BOOLEAN = 0,
     JB_DECISION_CHOICE = 1,
     JB_DECISION_SCORE = 2
-} jb_decision_type;
+};
+
+typedef struct {
+    size_t struct_size;
+    uint32_t api_version;
+    /* Borrowed static strings, valid for the process lifetime. */
+    const char *model_family;
+    const char *cpu_backend;
+    const char *accelerator;
+    uint32_t strict_math;
+    uint32_t max_batch_inputs;
+    uint32_t max_prompt_tokens;
+    uint32_t max_canvas_tokens;
+} jb_model_info;
 
 typedef struct {
     jb_string id;
@@ -165,6 +183,7 @@ JB_API const char *jb_last_error(void);
 JB_API jb_status jb_model_load(const char *model_directory, jb_model **out_model);
 JB_API jb_status jb_model_load_ex(const char *model_directory, const jb_model_options *options,
                                   jb_model **out_model);
+JB_API jb_status jb_model_get_info(const jb_model *model, jb_model_info *info);
 JB_API void jb_model_retain(jb_model *model);
 JB_API void jb_model_free(jb_model *model);
 
@@ -183,11 +202,13 @@ JB_API void jb_session_free(jb_session *session);
 /* Describes the most recent decide call on this session: set when it fails
  * and cleared when it succeeds. Unlike jb_last_error it does not depend on
  * the calling thread, so it stays correct when a session moves between
- * threads. The string is valid until the session's next call or its free. */
+ * threads. The string is valid until the session's next call or its free.
+ * The caller must exclusively own the idle session while reading it. */
 JB_API const char *jb_session_last_error(const jb_session *session);
 
 /* A result is released with jb_result_free; a batch of them, the array
- * included, with jb_results_free. Batch calls take 1 to 16 inputs. */
+ * included, with jb_results_free. Batch calls take 1 to
+ * JB_MAX_BATCH_INPUTS inputs. */
 JB_API jb_status jb_session_decide(jb_session *session, const jb_input *input,
                                    jb_result **out_result);
 JB_API jb_status jb_session_decide_batch(jb_session *session, const jb_input *inputs,
@@ -196,7 +217,8 @@ JB_API jb_status jb_session_decide_batch(jb_session *session, const jb_input *in
 /* JSON calls accept/return the existing complete OpenJev request/result shape.
  * Exact repeated schemas automatically reuse their prefix state. The output
  * is released with jb_free: one buffer for a single call; each string, then
- * the string array and the length array, for a batch of 1 to 16 requests. */
+ * the string array and the length array, for a batch of 1 to
+ * JB_MAX_BATCH_INPUTS requests. */
 JB_API jb_status jb_session_decide_json(jb_session *session, const char *request_json,
                                         size_t request_length, char **out_json, size_t *out_length);
 JB_API jb_status jb_session_decide_json_batch(jb_session *session, const char *const *request_json,

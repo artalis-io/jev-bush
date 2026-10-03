@@ -15,6 +15,7 @@
 /fuzz_json.exe
 /corpus/
 /artifacts/
+/.build/
 crash-*
 leak-*
 oom-*

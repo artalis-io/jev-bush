@@ -1,6 +1,9 @@
 name: Model-backed release gate
 
 on:
+  push:
+    tags:
+      - "v*"
   workflow_dispatch:
     inputs:
       model:
@@ -34,8 +37,8 @@ jobs:
 
       - name: Verify authenticated golden and strict invariants
         env:
-          JB_MODEL: ${{ inputs.model }}
-          JB_DATASET: ${{ inputs.dataset }}
+          JB_MODEL: ${{ inputs.model || vars.JB_MODEL }}
+          JB_DATASET: ${{ inputs.dataset || vars.JB_DATASET }}
         run: |
           tools/release_model_check.sh ./jb ./jb-sequential ./libjb.so "$JB_MODEL" "$JB_DATASET"
           OMP_NUM_THREADS=32 ./library-model-faults "$JB_MODEL" examples/request.json
@@ -45,8 +48,8 @@ jobs:
       - name: Capture release manifest
         if: always()
         env:
-          JB_MODEL: ${{ inputs.model }}
-          JB_DATASET: ${{ inputs.dataset }}
+          JB_MODEL: ${{ inputs.model || vars.JB_MODEL }}
+          JB_DATASET: ${{ inputs.dataset || vars.JB_DATASET }}
         run: |
           python3 tools/capture_run_manifest.py ./jb "$JB_MODEL" "$JB_DATASET" \
             --compiler-flags='-O3 -std=c11 -fopenmp' > release-manifest.json

@@ -291,6 +291,10 @@ The normal `jb.c` build still contains the CLI, but the CLI is itself a client
 of `jb_model_load()`, `jb_session_create_json()`, and the session JSON decision
 calls. There is no separate privileged inference route.
 
+The maintained implementation is split into focused `src/*.inc` modules.
+`tools/amalgamate.py` deterministically produces the self-contained `jb.c`
+distribution; `make check-amalgamation` rejects a stale or hand-edited copy.
+
 A `jb_model` is immutable after loading and may be shared by multiple sessions.
 Sessions retain their model, so the caller may release its model reference as
 soon as all sessions have been created. `jb_model_retain()` creates another
@@ -323,11 +327,15 @@ schema prefix permits it. See [`examples/library.c`](examples/library.c)
 for a complete typed example.
 
 Call `jb_api_version()` before using a dynamically loaded library and require
-`JB_API_VERSION`; `jb_get_abi_info()` additionally reports every frozen public
-value-structure size. Existing public layouts and enum values are permanent:
-future revisions add entry points or new versioned option structures instead
-of extending them in place. `JB_SHARED` declares public symbol visibility;
-`JB_BUILD_SHARED` additionally exports symbols when building a Windows DLL.
+`JB_API_VERSION`; `jb_get_abi_info()` additionally reports every public
+in-process value-structure size. Public discriminants use fixed-width integer
+types. These layouts are platform ABIs containing pointers and `size_t`, not
+serialized or cross-architecture representations. Future revisions add entry
+points or new versioned option structures instead of extending existing value
+types in place. `jb_model_get_info()` reports the selected CPU backend,
+accelerator, math semantics, and request limits. `JB_SHARED` declares public
+symbol visibility; `JB_BUILD_SHARED` additionally exports symbols when
+building a Windows DLL.
 
 `jb_model_load_ex()` accepts a versioned options structure with an allocator
 and logger. Allocator callbacks own all library heap objects associated with

@@ -24,6 +24,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Verify amalgamation
+        if: runner.os != 'Windows'
+        run: |
+          python3 tools/amalgamate.py --check
+          cc -O2 -std=c11 -Wall -Wextra -pedantic -Werror -I. src/jb.c -lm -o jb-modular
+          ./jb-modular --selftest
+
       - name: Configure MSVC
         if: runner.os == 'Windows'
         uses: ilammy/msvc-dev-cmd@v1
@@ -286,6 +293,17 @@ jobs:
             test/installed_consumer.c $(PKG_CONFIG_PATH="$PWD/stage/usr/lib/pkgconfig" pkg-config --cflags --libs jev-bush) \
             -Wl,-rpath,"$PWD/stage/usr/lib" -o installed-consumer
           ./installed-consumer
+
+      - name: Consume the static OpenMP package
+        run: |
+          make clean
+          make OMPFLAGS=-fopenmp
+          make install OMPFLAGS=-fopenmp DESTDIR="$PWD/stage-omp" PREFIX=/usr
+          export PKG_CONFIG_PATH="$PWD/stage-omp/usr/lib/pkgconfig"
+          pkg-config --libs --static jev-bush | grep -q -- '-fopenmp'
+          cc -O2 -std=c11 test/installed_consumer.c "$PWD/stage-omp/usr/lib/libjb.a" \
+            $(pkg-config --cflags --libs --static jev-bush) -o installed-static
+          ./installed-static
 
   hardening:
     name: Hardened Linux build

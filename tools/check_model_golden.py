@@ -133,7 +133,7 @@ def typed_answers(library, model_path, request):
     lib.jb_result_free.argtypes = [ctypes.POINTER(Result)]
     lib.jb_results_free.argtypes = [ctypes.POINTER(ctypes.POINTER(Result)), ctypes.c_size_t]
     lib.jb_session_free.argtypes, lib.jb_model_free.argtypes = [void], [void]
-    if lib.jb_api_version() != 2:
+    if lib.jb_api_version() != 3:
         raise SystemExit("typed library has an incompatible API version")
     keep, questions = [], []
     kinds = {"noul": 0, "choice": 1, "score": 2}
@@ -176,7 +176,7 @@ def typed_answers(library, model_path, request):
             destroy_on_error["session"] = None
             lib.jb_session_free(doomed)
 
-    options = ModelOptions(ctypes.sizeof(ModelOptions), 2,
+    options = ModelOptions(ctypes.sizeof(ModelOptions), 3,
                            Allocator(ctypes.sizeof(Allocator), None, None, None, None),
                            None, logger)
     status = lib.jb_model_load_ex(str(model_path).encode(), ctypes.byref(options),

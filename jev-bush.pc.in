@@ -5,6 +5,7 @@ includedir=${prefix}/include
 
 Name: Jev Bush
 Description: Typed probabilistic decisions for DiffusionGemma
-Version: 0.2.0
-Libs: -L${libdir} -ljb -lm
+Version: @VERSION@
+Libs: -L${libdir} -ljb
+Libs.private: @PRIVATE_LIBS@
 Cflags: -I${includedir}
