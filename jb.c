@@ -250,14 +250,14 @@ typedef struct {
 } JBCleanup;
 
 #define JB_CLEANUP_MAX 16
+#define JB_CLEANUP_STACK_MAX 64
 
 typedef struct JBErrorFrame {
     jmp_buf jump;
     struct JBErrorFrame *previous;
     uint64_t mark;
     jb_status previous_status;
-    JBCleanup cleanup[JB_CLEANUP_MAX];
-    unsigned cleanup_count;
+    unsigned cleanup_mark;
 } JBErrorFrame;
 
 static _Thread_local JBErrorFrame *jb_error_frame;
@@ -266,6 +266,8 @@ static _Thread_local char jb_error_message[256];
 static _Thread_local JBAllocation *jb_tracked;
 static _Thread_local uint64_t jb_allocation_sequence;
 static _Thread_local const jb_allocator *jb_active_allocator;
+static _Thread_local JBCleanup jb_cleanup_stack[JB_CLEANUP_STACK_MAX];
+static _Thread_local unsigned jb_cleanup_count;
 
 static void *jb_system_allocate(void *context, size_t size) {
     (void)context;
@@ -489,35 +491,38 @@ static void jb_untrack(void *p) {
     }
 }
 
-/* Fields are set before setjmp and not modified afterwards, and the status
- * lives in thread-local storage, so all of them are valid after a longjmp. */
+/* Every frame field is set before setjmp and remains unchanged afterwards.
+ * Mutable cleanups live in thread-local storage, whose values remain defined
+ * after longjmp. */
 static void jb_frame_enter(JBErrorFrame *f, jb_status status) {
     f->previous = jb_error_frame;
     f->previous_status = jb_error_status;
     f->mark = jb_allocation_sequence;
-    f->cleanup_count = 0;
+    f->cleanup_mark = jb_cleanup_count;
     jb_error_status = status;
     jb_error_frame = f;
 }
 
 static void jb_cleanup_push(JBErrorFrame *frame, JBCleanupFn function, void *context) {
-    if (!frame || frame != jb_error_frame || !function || frame->cleanup_count == JB_CLEANUP_MAX)
+    if (!frame || frame != jb_error_frame || !function || jb_cleanup_count < frame->cleanup_mark ||
+        jb_cleanup_count - frame->cleanup_mark >= JB_CLEANUP_MAX ||
+        jb_cleanup_count >= JB_CLEANUP_STACK_MAX)
         die_status(JB_ERROR_INTERNAL, "invalid error cleanup registration");
-    frame->cleanup[frame->cleanup_count++] = (JBCleanup){function, context};
+    jb_cleanup_stack[jb_cleanup_count++] = (JBCleanup){function, context};
 }
 
 static void jb_cleanup_disarm(JBErrorFrame *frame, JBCleanupFn function, void *context) {
-    if (!frame || frame != jb_error_frame || !frame->cleanup_count)
+    if (!frame || frame != jb_error_frame || jb_cleanup_count == frame->cleanup_mark)
         die_status(JB_ERROR_INTERNAL, "invalid error cleanup removal");
-    JBCleanup *cleanup = &frame->cleanup[frame->cleanup_count - 1];
+    JBCleanup *cleanup = &jb_cleanup_stack[jb_cleanup_count - 1];
     if (cleanup->function != function || cleanup->context != context)
         die_status(JB_ERROR_INTERNAL, "error cleanups removed out of order");
-    frame->cleanup_count--;
+    jb_cleanup_count--;
 }
 
 static void jb_cleanup_run(JBErrorFrame *frame) {
-    while (frame->cleanup_count) {
-        JBCleanup cleanup = frame->cleanup[--frame->cleanup_count];
+    while (jb_cleanup_count > frame->cleanup_mark) {
+        JBCleanup cleanup = jb_cleanup_stack[--jb_cleanup_count];
         cleanup.function(cleanup.context);
     }
 }
@@ -525,7 +530,7 @@ static void jb_cleanup_run(JBErrorFrame *frame) {
 /* Successful return: the outermost frame hands every allocation it made to
  * its owner (caller or session). */
 static void jb_frame_leave(JBErrorFrame *f) {
-    if (f->cleanup_count)
+    if (jb_cleanup_count != f->cleanup_mark)
         die_status(JB_ERROR_INTERNAL, "armed cleanup on successful return");
     jb_error_frame = f->previous;
     jb_error_status = f->previous_status;
@@ -1398,6 +1403,13 @@ static int dg_tensor_key_cmp(const void *a, const void *b) {
     return strcmp(a, y->name);
 }
 
+static void dg_finalize_tensor_index(DGModel *m) {
+    qsort(m->tensor, m->nt, sizeof *m->tensor, dg_tensor_cmp);
+    for (size_t i = 1; i < m->nt; i++)
+        if (!strcmp(m->tensor[i - 1].name, m->tensor[i].name))
+            die2("duplicate DiffusionGemma tensor", m->tensor[i].name);
+}
+
 static int dg_is_text(const char *name) {
     return !strncmp(name, "model.decoder.", 14) ||
            (!strncmp(name, "model.encoder.language_model.", 29) && strstr(name, ".layer_scalar"));
@@ -1552,6 +1564,16 @@ static void dg_expect_layer_count(DGModel *m, int l, const char *tail, uint64_t 
     dg_expect_count(m, n, DG_BF16, count);
 }
 
+static float dg_positive_f32_scalar(const DGTensor *tensor, const char *what) {
+    if (tensor->dtype != DG_F32 || tensor->nd != 0 || tensor->bytes != sizeof(float))
+        die2(what, tensor->name);
+    float value;
+    memcpy(&value, tensor->data, sizeof value);
+    if (!jb_finitef(value) || !(value > 0))
+        die2(what, tensor->name);
+    return value;
+}
+
 static void dg_load(DGModel *m, const char *dir) {
     memset(m, 0, sizeof *m);
     char probe[768];
@@ -1565,10 +1587,7 @@ static void dg_load(DGModel *m, const char *dir) {
         m->nshard = 11;
     for (int i = 0; i < m->nshard; i++)
         dg_parse_shard(m, i, dir);
-    qsort(m->tensor, m->nt, sizeof *m->tensor, dg_tensor_cmp);
-    for (size_t i = 1; i < m->nt; i++)
-        if (!strcmp(m->tensor[i - 1].name, m->tensor[i].name))
-            die2("duplicate DiffusionGemma tensor", m->tensor[i].name);
+    dg_finalize_tensor_index(m);
     dg_expect(m, "model.decoder.embed_tokens.weight", DG_BF16, 2, DG_VOCAB, DG_H, 0);
     dg_expect_count(m, "model.decoder.norm.weight", DG_BF16, DG_H);
     /* Validate every layer, not a sample: kernels index these tensors by the
@@ -1627,12 +1646,11 @@ static void dg_load(DGModel *m, const char *dir) {
                 v->sd = dg_expert_tensor(m, l, e, "down_proj.weight_scale");
                 v->gd = dg_expert_tensor(m, l, e, "down_proj.weight_scale_2");
                 v->ad = dg_expert_tensor(m, l, e, "down_proj.input_scale");
-                if (v->ag->dtype != DG_F32 || v->ag->bytes != 4 || v->ad->dtype != DG_F32 ||
-                    v->ad->bytes != 4)
-                    die2("bad NVFP4 input scale", v->ag->name);
-                float a13, a2;
-                memcpy(&a13, v->ag->data, 4);
-                memcpy(&a2, v->ad->data, 4);
+                (void)dg_positive_f32_scalar(v->gg, "bad NVFP4 global scale");
+                (void)dg_positive_f32_scalar(v->gu, "bad NVFP4 global scale");
+                (void)dg_positive_f32_scalar(v->gd, "bad NVFP4 global scale");
+                float a13 = dg_positive_f32_scalar(v->ag, "bad NVFP4 input scale");
+                float a2 = dg_positive_f32_scalar(v->ad, "bad NVFP4 input scale");
                 if (a13 > m->nv_a13[l])
                     m->nv_a13[l] = a13;
                 if (a2 > m->nv_a2[l])
@@ -1783,11 +1801,15 @@ static void dg_free(DGModel *m) {
 }
 
 static Vocab *dgt_vfind(DGTokenizer *d, const char *s, size_t n) {
+    if (!d->nv)
+        return NULL;
     VocabKey k = {s, (uint32_t)n};
     return bsearch(&k, d->vocab, d->nv, sizeof *d->vocab, cmp_vocab_key);
 }
 
 static Merge *dgt_mfind(DGTokenizer *d, uint32_t a, uint32_t b) {
+    if (!d->nm)
+        return NULL;
     Merge k = {a, b, 0};
     return bsearch(&k, d->merge, d->nm, sizeof *d->merge, cmp_merge);
 }
@@ -1812,6 +1834,43 @@ static char *read_whole(const char *path, size_t *n) {
     return p;
 }
 
+static int dgt_string_field(const char *j, JTok *t, int nt, int object, const char *key,
+                            const char *value) {
+    int field = jt_obj_get(j, t, nt, object, key);
+    return field >= 0 && jt_eq(j, &t[field], value);
+}
+
+static int dgt_literal_field(const char *j, JTok *t, int nt, int object, const char *key,
+                             const char *value) {
+    int field = jt_obj_get(j, t, nt, object, key);
+    return field >= 0 && jt_literal(j, &t[field], value);
+}
+
+static void dgt_validate_configuration(const char *j, JTok *t, int nt) {
+    int model = jt_obj_get(j, t, nt, 0, "model");
+    int normalizer = jt_obj_get(j, t, nt, 0, "normalizer");
+    int normalizer_pattern = jt_obj_get(j, t, nt, normalizer, "pattern");
+    int pretokenizer = jt_obj_get(j, t, nt, 0, "pre_tokenizer");
+    int pretokenizer_pattern = jt_obj_get(j, t, nt, pretokenizer, "pattern");
+    if (model < 0 || !dgt_string_field(j, t, nt, 0, "version", "1.0") || normalizer < 0 ||
+        normalizer_pattern < 0 || !dgt_string_field(j, t, nt, normalizer, "type", "Replace") ||
+        !dgt_string_field(j, t, nt, normalizer_pattern, "String", " ") ||
+        !dgt_string_field(j, t, nt, normalizer, "content", "▁") || pretokenizer < 0 ||
+        pretokenizer_pattern < 0 || !dgt_string_field(j, t, nt, pretokenizer, "type", "Split") ||
+        !dgt_string_field(j, t, nt, pretokenizer_pattern, "String", " ") ||
+        !dgt_string_field(j, t, nt, pretokenizer, "behavior", "MergedWithPrevious") ||
+        !dgt_literal_field(j, t, nt, pretokenizer, "invert", "false") ||
+        !dgt_string_field(j, t, nt, model, "type", "BPE") ||
+        !dgt_literal_field(j, t, nt, model, "dropout", "null") ||
+        !dgt_string_field(j, t, nt, model, "unk_token", "<unk>") ||
+        !dgt_literal_field(j, t, nt, model, "continuing_subword_prefix", "null") ||
+        !dgt_literal_field(j, t, nt, model, "end_of_word_suffix", "null") ||
+        !dgt_literal_field(j, t, nt, model, "fuse_unk", "true") ||
+        !dgt_literal_field(j, t, nt, model, "byte_fallback", "true") ||
+        !dgt_literal_field(j, t, nt, model, "ignore_merges", "false"))
+        die("unsupported DiffusionGemma tokenizer configuration");
+}
+
 static void dgt_load(DGTokenizer *d, const char *dir) {
     memset(d, 0, sizeof *d);
     char path[768];
@@ -1827,6 +1886,7 @@ static void dgt_load(DGTokenizer *d, const char *dir) {
     if (model < 0 || vocab < 0 || merges < 0 || added < 0 || t[vocab].type != JT_OBJECT ||
         t[merges].type != JT_ARRAY || t[added].type != JT_ARRAY)
         die("unsupported DiffusionGemma tokenizer JSON");
+    dgt_validate_configuration(j, t, nt);
     uint32_t nv = (uint32_t)(t[vocab].size / 2);
     if (nv != 262144)
         die("unexpected DiffusionGemma vocabulary size");
@@ -1924,8 +1984,14 @@ static void dgt_load(DGTokenizer *d, const char *dir) {
         if (t[i].parent != added)
             continue;
         int content = jt_obj_get(j, t, nt, i, "content");
+        int id = jt_obj_get(j, t, nt, i, "id");
         int special = jt_obj_get(j, t, nt, i, "special");
-        if (content < 0 || special < 0 || !jt_literal(j, &t[special], "true"))
+        if (content < 0 || t[content].type != JT_STRING || id < 0 || special < 0 ||
+            !jt_literal(j, &t[special], "true") ||
+            !dgt_literal_field(j, t, nt, i, "single_word", "false") ||
+            !dgt_literal_field(j, t, nt, i, "lstrip", "false") ||
+            !dgt_literal_field(j, t, nt, i, "rstrip", "false") ||
+            !dgt_literal_field(j, t, nt, i, "normalized", "false"))
             die("unsupported added token");
         size_t content_capacity = jb_size_add((size_t)(t[content].end - t[content].start) * 3, 1);
         char *s = xmalloc(content_capacity);
@@ -1934,6 +2000,8 @@ static void dgt_load(DGTokenizer *d, const char *dir) {
         jb_release(s);
         if (!v)
             die("added token absent from vocabulary");
+        if (jt_nonnegative_int(j, &t[id], "added token id") != v->id)
+            die("added token id does not match vocabulary");
         if (!v->n)
             die("empty added token");
         d->special_first[(unsigned char)v->s[0]] = 1;
@@ -5233,6 +5301,7 @@ static struct {
     CUresult (*device_get)(CUdevice *, int);
     CUresult (*device_attribute)(int *, int, CUdevice);
     CUresult (*primary_retain)(CUcontext *, CUdevice);
+    CUresult (*ctx_get)(CUcontext *);
     CUresult (*ctx_set)(CUcontext);
     CUresult (*module_load)(CUmodule *, const void *);
     CUresult (*function_get)(CUfunction *, CUmodule, const char *);
@@ -5380,6 +5449,7 @@ static void dg_cuda_open(void) {
                  dg_cuda_symbol(cu, "cuDeviceGet", &dg_cuda.device_get) &
                  dg_cuda_symbol(cu, "cuDeviceGetAttribute", &dg_cuda.device_attribute) &
                  dg_cuda_symbol(cu, "cuDevicePrimaryCtxRetain", &dg_cuda.primary_retain) &
+                 dg_cuda_symbol(cu, "cuCtxGetCurrent", &dg_cuda.ctx_get) &
                  dg_cuda_symbol(cu, "cuCtxSetCurrent", &dg_cuda.ctx_set) &
                  dg_cuda_symbol(cu, "cuModuleLoadData", &dg_cuda.module_load) &
                  dg_cuda_symbol(cu, "cuModuleGetFunction", &dg_cuda.function_get) &
@@ -5399,12 +5469,17 @@ static void dg_cuda_open(void) {
                  dg_cuda_symbol(rtc, "nvrtcGetProgramLog", &dg_cuda.log) &
                  dg_cuda_symbol(rtc, "nvrtcDestroyProgram", &dg_cuda.destroy);
     CUdevice device;
+    CUcontext previous = NULL;
     int major, minor;
-    if (!loaded || dg_cuda.init(0) || dg_cuda.device_get(&device, 0) ||
+    if (!loaded || dg_cuda.init(0) || dg_cuda.ctx_get(&previous) ||
+        dg_cuda.device_get(&device, 0) ||
         dg_cuda.device_attribute(&major, DG_CU_CC_MAJOR, device) ||
         dg_cuda.device_attribute(&minor, DG_CU_CC_MINOR, device) ||
-        dg_cuda.primary_retain(&dg_cuda.ctx, device) || dg_cuda.ctx_set(dg_cuda.ctx))
+        dg_cuda.primary_retain(&dg_cuda.ctx, device) || dg_cuda.ctx_set(dg_cuda.ctx)) {
+        if (loaded && dg_cuda.ctx_set)
+            (void)dg_cuda.ctx_set(previous);
         return;
+    }
     dg_cuda.fast = !JB_STRICT_MATH && major >= 8;
     dg_cuda.fp4 = dg_cuda.fast && major == 12;
     dg_cuda_compile(major, minor);
@@ -5415,6 +5490,7 @@ static void dg_cuda_open(void) {
         dg_cuda.compile_log[0] = 0;
         dg_cuda_compile(major, minor);
     }
+    (void)dg_cuda.ctx_set(previous);
 }
 
 static void dg_cuda_check(CUresult r, const char *what) {
@@ -5777,17 +5853,52 @@ static const DGAccelOps *dg_accel(void) {
  * streams are introduced. CPU sessions remain fully concurrent. */
 static pthread_mutex_t jb_cuda_call_mutex = PTHREAD_MUTEX_INITIALIZER;
 
-static int jb_accel_call_lock(const DGModel *model) {
+typedef uintptr_t JBAccelContext;
+
+static int jb_accel_context_enter(JBAccelContext *previous) {
+    if (!dg_cuda.ready)
+        return 0;
+    CUcontext context = NULL;
+    if (dg_cuda.ctx_get(&context) || dg_cuda.ctx_set(dg_cuda.ctx))
+        die_status(JB_ERROR_INTERNAL, "cannot enter CUDA context");
+    *previous = (JBAccelContext)context;
+    return 1;
+}
+
+static int jb_accel_context_enter_quiet(JBAccelContext *previous) {
+    if (!dg_cuda.ready)
+        return 0;
+    CUcontext context = NULL;
+    if (dg_cuda.ctx_get(&context) || dg_cuda.ctx_set(dg_cuda.ctx))
+        return 0;
+    *previous = (JBAccelContext)context;
+    return 1;
+}
+
+static void jb_accel_context_leave(int entered, JBAccelContext previous) {
+    if (entered)
+        (void)dg_cuda.ctx_set((CUcontext)previous);
+}
+
+static int jb_accel_call_lock(const DGModel *model, JBAccelContext *previous) {
     if (!model->accel)
         return 0;
     if (pthread_mutex_lock(&jb_cuda_call_mutex))
         die_status(JB_ERROR_INTERNAL, "cannot lock CUDA execution");
+    CUcontext context = NULL;
+    if (dg_cuda.ctx_get(&context) || dg_cuda.ctx_set(dg_cuda.ctx)) {
+        (void)pthread_mutex_unlock(&jb_cuda_call_mutex);
+        die_status(JB_ERROR_INTERNAL, "cannot enter CUDA context");
+    }
+    *previous = (JBAccelContext)context;
     return 1;
 }
 
-static void jb_accel_call_unlock(int locked) {
-    if (locked)
+static void jb_accel_call_unlock(int locked, JBAccelContext previous) {
+    if (locked) {
+        (void)dg_cuda.ctx_set((CUcontext)previous);
         (void)pthread_mutex_unlock(&jb_cuda_call_mutex);
+    }
 }
 
 #ifndef JB_NO_MAIN
@@ -5799,17 +5910,36 @@ static const char *dg_accel_failure(const char **log) {
 }
 #endif
 #else
+typedef uintptr_t JBAccelContext;
+
+static int jb_accel_context_enter(JBAccelContext *previous) {
+    (void)previous;
+    return 0;
+}
+
+static int jb_accel_context_enter_quiet(JBAccelContext *previous) {
+    (void)previous;
+    return 0;
+}
+
+static void jb_accel_context_leave(int entered, JBAccelContext previous) {
+    (void)entered;
+    (void)previous;
+}
+
 static const DGAccelOps *dg_accel(void) {
     return NULL;
 }
 
-static int jb_accel_call_lock(const DGModel *model) {
+static int jb_accel_call_lock(const DGModel *model, JBAccelContext *previous) {
     (void)model;
+    (void)previous;
     return 0;
 }
 
-static void jb_accel_call_unlock(int locked) {
+static void jb_accel_call_unlock(int locked, JBAccelContext previous) {
     (void)locked;
+    (void)previous;
 }
 
 #ifndef JB_NO_MAIN
@@ -7081,10 +7211,12 @@ static void dg_prefix_free(DGPrefixCache *c) {
 }
 typedef struct {
     char *p;
-    size_t n, cap;
+    size_t n, cap, limit;
 } DGBuf;
 
 static void db_need(DGBuf *b, size_t add) {
+    if (b->limit && (b->n > b->limit || add > b->limit - b->n))
+        die("JSON output is too large");
     if (add > SIZE_MAX - b->n - 1)
         die("string size overflow");
     size_t need = b->n + add + 1;
@@ -7954,6 +8086,44 @@ static void dg_questions_free(DecisionWork *w, int nq) {
     jb_release(w);
 }
 
+static void dg_schema_validate(DGTokenizer *tokenizer, const char *json, size_t length) {
+    DGRequest request = {0};
+    request.qj = json;
+    request.qt = json_tokens(json, length, &request.qnt);
+    request.qroot = 0;
+    request.requested = 1;
+    if (!request.qnt || request.qt[0].type != JT_OBJECT)
+        die("session schema must be a JSON object");
+    char provisional_data[DG_CHOICE_LABELS][3];
+    char *provisional[DG_CHOICE_LABELS];
+    for (int i = 0; i < DG_CHOICE_LABELS; i++) {
+        dg_choice_candidate(i, provisional_data[i]);
+        provisional[i] = provisional_data[i];
+    }
+    int provisional_count = 0;
+    DecisionWork *provisional_work = dg_questions(&request, provisional, &provisional_count);
+    dg_questions_free(provisional_work, provisional_count);
+    char *labels[DG_CHOICE_LABELS];
+    int label_count = dg_choice_inventory(tokenizer, labels);
+    if (label_count != DG_CHOICE_LABELS)
+        die("cannot construct OpenJev choice labels");
+    int question_count = 0;
+    DecisionWork *work = dg_questions(&request, labels, &question_count);
+    char *system = dg_system_prompt(json, request.qt, request.qnt, work, question_count);
+    DGBuf prefix = {0};
+    db_fmt(&prefix, "<bos><|turn>system\n%s<turn|>\n<|turn>user\n", system);
+    Tokens tokens = dgt_tokenize(tokenizer, prefix.p);
+    if (tokens.n > JB_MAX_CTX)
+        die("session schema exceeds DiffusionGemma context");
+    jb_release(tokens.v);
+    jb_release(prefix.p);
+    jb_release(system);
+    dg_questions_free(work, question_count);
+    for (int i = 0; i < label_count; i++)
+        jb_release(labels[i]);
+    jb_release(request.qt);
+}
+
 #ifndef JB_NO_MAIN
 static char *dg_answer_template(DecisionWork *w, int nq, const int *pick) {
     char *a = dg_answer_text(w, nq, pick);
@@ -8608,7 +8778,15 @@ struct jb_model {
     jb_allocator allocator;
     void *log_context;
     jb_log_fn log;
+    JBAccelContext load_context;
+    int load_context_entered;
 };
+
+typedef struct {
+    jb_session *session;
+    int accelerator_locked;
+    JBAccelContext accelerator_context;
+} JBCallCleanup;
 
 struct jb_session {
     jb_model *model;
@@ -8618,14 +8796,10 @@ struct jb_session {
     DGWorkspace workspace;
     char *questions_json;
     size_t questions_length;
+    JBCallCleanup call_cleanup;
     /* The most recent call's error, readable from any thread. */
     char error[sizeof jb_error_message];
 };
-
-typedef struct {
-    jb_session *session;
-    int accelerator_locked;
-} JBCallCleanup;
 
 static void jb_call_cleanup(void *context) {
     volatile JBCallCleanup *cleanup = context;
@@ -8639,7 +8813,7 @@ static void jb_call_cleanup(void *context) {
     session->workspace.active = 0;
     session->workspace.kv_active = 0;
     session->workspace.control_active = 0;
-    jb_accel_call_unlock(cleanup->accelerator_locked);
+    jb_accel_call_unlock(cleanup->accelerator_locked, cleanup->accelerator_context);
 }
 
 static void jb_log_message(const jb_model *model, jb_log_level level, const char *message) {
@@ -8697,6 +8871,7 @@ static void jb_model_load_cleanup(void *context) {
     jb_model *model = context;
     dg_release_accel(&model->model);
     dg_unmap_shards(&model->model);
+    jb_accel_context_leave(model->load_context_entered, model->load_context);
 }
 
 static jb_status jb_model_load_impl(const char *model_directory, jb_model **out_model,
@@ -8721,8 +8896,13 @@ static jb_status jb_model_load_impl(const char *model_directory, jb_model **out_
     jb_cleanup_push(&frame, jb_model_load_cleanup, model);
     dg_load(&model->model, model_directory);
     dgt_load(&model->tokenizer, model_directory);
+    if (model->model.nvfp4)
+        (void)dg_accel();
+    model->load_context_entered = jb_accel_context_enter(&model->load_context);
     dg_upload_model(&model->model);
     dg_prepare_exact_model(&model->model);
+    jb_accel_context_leave(model->load_context_entered, model->load_context);
+    model->load_context_entered = 0;
     jb_cleanup_disarm(&frame, jb_model_load_cleanup, model);
     jb_frame_leave(&frame);
     jb_active_allocator = previous_allocator;
@@ -8799,8 +8979,11 @@ static void jb_model_release(jb_model *model) {
         return;
     if (atomic_fetch_sub_explicit(&model->references, 1, memory_order_acq_rel) != 1)
         return;
+    JBAccelContext previous = 0;
+    int entered = jb_accel_context_enter_quiet(&previous);
     dgt_free(&model->tokenizer);
     dg_free(&model->model);
+    jb_accel_context_leave(entered, previous);
     jb_release(model);
 }
 
@@ -8830,7 +9013,7 @@ static char *jb_schema_json(const jb_schema *schema, size_t *length) {
     if (!schema || !schema->questions || !schema->question_count ||
         schema->question_count > DG_MAX_QUESTIONS)
         return NULL;
-    DGBuf out = {0};
+    DGBuf out = {.limit = JB_MAX_JSON};
     db_ch(&out, '{');
     for (size_t q = 0; q < schema->question_count; q++) {
         const jb_question *question = &schema->questions[q];
@@ -8920,11 +9103,7 @@ jb_status jb_session_create_json(jb_model *model, const char *questions_json,
     session->model = model;
     atomic_flag_clear(&session->busy);
     if (questions_json) {
-        int nt = 0;
-        JTok *tokens = json_tokens(questions_json, questions_length, &nt);
-        if (!nt || tokens[0].type != JT_OBJECT)
-            die("session schema must be a JSON object");
-        jb_release(tokens);
+        dg_schema_validate(&model->tokenizer, questions_json, questions_length);
         session->questions_json = xmalloc(questions_length + 1);
         memcpy(session->questions_json, questions_json, questions_length);
         session->questions_json[questions_length] = 0;
@@ -8995,7 +9174,8 @@ static jb_status jb_session_decide_json_call(jb_session *session, const char *re
         return jb_invalid("request JSON is too large");
     const jb_allocator *previous_allocator = jb_active_allocator;
     jb_active_allocator = &session->model->allocator;
-    volatile JBCallCleanup cleanup = {session, 0};
+    JBCallCleanup *cleanup = &session->call_cleanup;
+    *cleanup = (JBCallCleanup){.session = session};
     JBErrorFrame frame;
     jb_frame_enter(&frame, JB_ERROR_REQUEST);
     if (setjmp(frame.jump)) {
@@ -9003,12 +9183,13 @@ static jb_status jb_session_decide_json_call(jb_session *session, const char *re
         jb_active_allocator = previous_allocator;
         return status;
     }
-    jb_cleanup_push(&frame, jb_call_cleanup, (void *)&cleanup);
-    cleanup.accelerator_locked = jb_accel_call_lock(&session->model->model);
+    jb_cleanup_push(&frame, jb_call_cleanup, cleanup);
+    cleanup->accelerator_locked =
+        jb_accel_call_lock(&session->model->model, &cleanup->accelerator_context);
     dg_systemone(&session->model->model, &session->model->tokenizer, request_json, request_length,
                  &session->prefix, &session->workspace, out_json, out_length, NULL);
-    jb_cleanup_disarm(&frame, jb_call_cleanup, (void *)&cleanup);
-    jb_accel_call_unlock(cleanup.accelerator_locked);
+    jb_cleanup_disarm(&frame, jb_call_cleanup, cleanup);
+    jb_accel_call_unlock(cleanup->accelerator_locked, cleanup->accelerator_context);
     jb_frame_leave(&frame);
     jb_active_allocator = previous_allocator;
     jb_error_message[0] = 0;
@@ -9029,7 +9210,8 @@ static jb_status jb_session_decide_json_batch_call(jb_session *session,
         return jb_invalid("batch arguments are invalid");
     const jb_allocator *previous_allocator = jb_active_allocator;
     jb_active_allocator = &session->model->allocator;
-    volatile JBCallCleanup cleanup = {session, 0};
+    JBCallCleanup *cleanup = &session->call_cleanup;
+    *cleanup = (JBCallCleanup){.session = session};
     JBErrorFrame frame;
     jb_frame_enter(&frame, JB_ERROR_REQUEST);
     if (setjmp(frame.jump)) {
@@ -9037,8 +9219,9 @@ static jb_status jb_session_decide_json_batch_call(jb_session *session,
         jb_active_allocator = previous_allocator;
         return status;
     }
-    jb_cleanup_push(&frame, jb_call_cleanup, (void *)&cleanup);
-    cleanup.accelerator_locked = jb_accel_call_lock(&session->model->model);
+    jb_cleanup_push(&frame, jb_call_cleanup, cleanup);
+    cleanup->accelerator_locked =
+        jb_accel_call_lock(&session->model->model, &cleanup->accelerator_context);
     char **output = xcalloc(request_count, sizeof *output);
     size_t *length = xcalloc(request_count, sizeof *length);
     for (size_t i = 0; i < request_count; i++) {
@@ -9056,8 +9239,8 @@ static jb_status jb_session_decide_json_batch_call(jb_session *session,
             dg_systemone(&session->model->model, &session->model->tokenizer, request_json[i],
                          request_lengths[i], &session->prefix, &session->workspace, &output[i],
                          &length[i], NULL);
-    jb_cleanup_disarm(&frame, jb_call_cleanup, (void *)&cleanup);
-    jb_accel_call_unlock(cleanup.accelerator_locked);
+    jb_cleanup_disarm(&frame, jb_call_cleanup, cleanup);
+    jb_accel_call_unlock(cleanup->accelerator_locked, cleanup->accelerator_context);
     jb_frame_leave(&frame);
     jb_active_allocator = previous_allocator;
     *out_json = output;
@@ -9078,7 +9261,8 @@ static jb_status jb_session_decide_call(jb_session *session, const jb_input *inp
         return jb_invalid("session, input, and output pointer are required");
     const jb_allocator *previous_allocator = jb_active_allocator;
     jb_active_allocator = &session->model->allocator;
-    volatile JBCallCleanup cleanup = {session, 0};
+    JBCallCleanup *cleanup = &session->call_cleanup;
+    *cleanup = (JBCallCleanup){.session = session};
     JBErrorFrame frame;
     jb_frame_enter(&frame, JB_ERROR_REQUEST);
     if (setjmp(frame.jump)) {
@@ -9094,14 +9278,15 @@ static jb_status jb_session_decide_call(jb_session *session, const jb_input *inp
         (input->id.length && memchr(input->id.data, 0, input->id.length)))
         die("typed input is invalid");
     jb_result *result = NULL;
-    jb_cleanup_push(&frame, jb_call_cleanup, (void *)&cleanup);
-    cleanup.accelerator_locked = jb_accel_call_lock(&session->model->model);
+    jb_cleanup_push(&frame, jb_call_cleanup, cleanup);
+    cleanup->accelerator_locked =
+        jb_accel_call_lock(&session->model->model, &cleanup->accelerator_context);
     dg_systemone_parts(&session->model->model, &session->model->tokenizer, input->state_json.data,
                        input->state_json.length, input->id.data, input->id.length,
                        session->questions_json, session->questions_length, input->samples,
                        &session->prefix, &session->workspace, &result);
-    jb_cleanup_disarm(&frame, jb_call_cleanup, (void *)&cleanup);
-    jb_accel_call_unlock(cleanup.accelerator_locked);
+    jb_cleanup_disarm(&frame, jb_call_cleanup, cleanup);
+    jb_accel_call_unlock(cleanup->accelerator_locked, cleanup->accelerator_context);
     jb_frame_leave(&frame);
     jb_active_allocator = previous_allocator;
     *out_result = result;
@@ -9116,7 +9301,8 @@ static jb_status jb_session_decide_batch_call(jb_session *session, const jb_inpu
         return jb_invalid("typed batch arguments are invalid");
     const jb_allocator *previous_allocator = jb_active_allocator;
     jb_active_allocator = &session->model->allocator;
-    volatile JBCallCleanup cleanup = {session, 0};
+    JBCallCleanup *cleanup = &session->call_cleanup;
+    *cleanup = (JBCallCleanup){.session = session};
     JBErrorFrame frame;
     jb_frame_enter(&frame, JB_ERROR_REQUEST);
     if (setjmp(frame.jump)) {
@@ -9133,8 +9319,9 @@ static jb_status jb_session_decide_batch_call(jb_session *session, const jb_inpu
             (input->id.length && memchr(input->id.data, 0, input->id.length)))
             die("typed input is invalid");
     }
-    jb_cleanup_push(&frame, jb_call_cleanup, (void *)&cleanup);
-    cleanup.accelerator_locked = jb_accel_call_lock(&session->model->model);
+    jb_cleanup_push(&frame, jb_call_cleanup, cleanup);
+    cleanup->accelerator_locked =
+        jb_accel_call_lock(&session->model->model, &cleanup->accelerator_context);
     int batched =
         dg_system_batch_parts(&session->model->model, &session->model->tokenizer, inputs,
                               (int)input_count, session->questions_json, session->questions_length,
@@ -9147,8 +9334,8 @@ static jb_status jb_session_decide_batch_call(jb_session *session, const jb_inpu
                                input->id.length, session->questions_json, session->questions_length,
                                input->samples, &session->prefix, &session->workspace, &result[i]);
         }
-    jb_cleanup_disarm(&frame, jb_call_cleanup, (void *)&cleanup);
-    jb_accel_call_unlock(cleanup.accelerator_locked);
+    jb_cleanup_disarm(&frame, jb_call_cleanup, cleanup);
+    jb_accel_call_unlock(cleanup->accelerator_locked, cleanup->accelerator_context);
     jb_frame_leave(&frame);
     jb_active_allocator = previous_allocator;
     *out_results = result;
@@ -10711,7 +10898,16 @@ static int selftest(void) {
     if (jb_session_create_json(&dummy_model, "[]", 2, &public_session) != JB_ERROR_REQUEST ||
         public_session)
         die("public schema error self-test failed");
-    if (jb_session_create_json(&dummy_model, "{}", 2, &public_session) != JB_OK)
+    if (jb_session_create_json(&dummy_model, "{}", 2, &public_session) != JB_ERROR_REQUEST ||
+        public_session)
+        die("empty schema acceptance self-test failed");
+    static const char invalid_schema[] =
+        "{\"route\":{\"type\":\"choice\",\"criteria\":{\"only\":\"One.\"}}}";
+    if (jb_session_create_json(&dummy_model, invalid_schema, sizeof invalid_schema - 1,
+                               &public_session) != JB_ERROR_REQUEST ||
+        public_session)
+        die("invalid fixed schema acceptance self-test failed");
+    if (jb_session_create_json(&dummy_model, NULL, 0, &public_session) != JB_OK)
         die("public session self-test failed");
     const jb_input invalid_input = {{NULL, 0}, {"{", 1}, 0};
     jb_result *invalid_result = NULL;

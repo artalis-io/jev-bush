@@ -215,6 +215,13 @@ static int dg_tensor_key_cmp(const void *a, const void *b) {
     return strcmp(a, y->name);
 }
 
+static void dg_finalize_tensor_index(DGModel *m) {
+    qsort(m->tensor, m->nt, sizeof *m->tensor, dg_tensor_cmp);
+    for (size_t i = 1; i < m->nt; i++)
+        if (!strcmp(m->tensor[i - 1].name, m->tensor[i].name))
+            die2("duplicate DiffusionGemma tensor", m->tensor[i].name);
+}
+
 static int dg_is_text(const char *name) {
     return !strncmp(name, "model.decoder.", 14) ||
            (!strncmp(name, "model.encoder.language_model.", 29) && strstr(name, ".layer_scalar"));
@@ -369,6 +376,16 @@ static void dg_expect_layer_count(DGModel *m, int l, const char *tail, uint64_t 
     dg_expect_count(m, n, DG_BF16, count);
 }
 
+static float dg_positive_f32_scalar(const DGTensor *tensor, const char *what) {
+    if (tensor->dtype != DG_F32 || tensor->nd != 0 || tensor->bytes != sizeof(float))
+        die2(what, tensor->name);
+    float value;
+    memcpy(&value, tensor->data, sizeof value);
+    if (!jb_finitef(value) || !(value > 0))
+        die2(what, tensor->name);
+    return value;
+}
+
 static void dg_load(DGModel *m, const char *dir) {
     memset(m, 0, sizeof *m);
     char probe[768];
@@ -382,10 +399,7 @@ static void dg_load(DGModel *m, const char *dir) {
         m->nshard = 11;
     for (int i = 0; i < m->nshard; i++)
         dg_parse_shard(m, i, dir);
-    qsort(m->tensor, m->nt, sizeof *m->tensor, dg_tensor_cmp);
-    for (size_t i = 1; i < m->nt; i++)
-        if (!strcmp(m->tensor[i - 1].name, m->tensor[i].name))
-            die2("duplicate DiffusionGemma tensor", m->tensor[i].name);
+    dg_finalize_tensor_index(m);
     dg_expect(m, "model.decoder.embed_tokens.weight", DG_BF16, 2, DG_VOCAB, DG_H, 0);
     dg_expect_count(m, "model.decoder.norm.weight", DG_BF16, DG_H);
     /* Validate every layer, not a sample: kernels index these tensors by the
@@ -444,12 +458,11 @@ static void dg_load(DGModel *m, const char *dir) {
                 v->sd = dg_expert_tensor(m, l, e, "down_proj.weight_scale");
                 v->gd = dg_expert_tensor(m, l, e, "down_proj.weight_scale_2");
                 v->ad = dg_expert_tensor(m, l, e, "down_proj.input_scale");
-                if (v->ag->dtype != DG_F32 || v->ag->bytes != 4 || v->ad->dtype != DG_F32 ||
-                    v->ad->bytes != 4)
-                    die2("bad NVFP4 input scale", v->ag->name);
-                float a13, a2;
-                memcpy(&a13, v->ag->data, 4);
-                memcpy(&a2, v->ad->data, 4);
+                (void)dg_positive_f32_scalar(v->gg, "bad NVFP4 global scale");
+                (void)dg_positive_f32_scalar(v->gu, "bad NVFP4 global scale");
+                (void)dg_positive_f32_scalar(v->gd, "bad NVFP4 global scale");
+                float a13 = dg_positive_f32_scalar(v->ag, "bad NVFP4 input scale");
+                float a2 = dg_positive_f32_scalar(v->ad, "bad NVFP4 input scale");
                 if (a13 > m->nv_a13[l])
                     m->nv_a13[l] = a13;
                 if (a2 > m->nv_a2[l])
@@ -600,11 +613,15 @@ static void dg_free(DGModel *m) {
 }
 
 static Vocab *dgt_vfind(DGTokenizer *d, const char *s, size_t n) {
+    if (!d->nv)
+        return NULL;
     VocabKey k = {s, (uint32_t)n};
     return bsearch(&k, d->vocab, d->nv, sizeof *d->vocab, cmp_vocab_key);
 }
 
 static Merge *dgt_mfind(DGTokenizer *d, uint32_t a, uint32_t b) {
+    if (!d->nm)
+        return NULL;
     Merge k = {a, b, 0};
     return bsearch(&k, d->merge, d->nm, sizeof *d->merge, cmp_merge);
 }
@@ -629,6 +646,43 @@ static char *read_whole(const char *path, size_t *n) {
     return p;
 }
 
+static int dgt_string_field(const char *j, JTok *t, int nt, int object, const char *key,
+                            const char *value) {
+    int field = jt_obj_get(j, t, nt, object, key);
+    return field >= 0 && jt_eq(j, &t[field], value);
+}
+
+static int dgt_literal_field(const char *j, JTok *t, int nt, int object, const char *key,
+                             const char *value) {
+    int field = jt_obj_get(j, t, nt, object, key);
+    return field >= 0 && jt_literal(j, &t[field], value);
+}
+
+static void dgt_validate_configuration(const char *j, JTok *t, int nt) {
+    int model = jt_obj_get(j, t, nt, 0, "model");
+    int normalizer = jt_obj_get(j, t, nt, 0, "normalizer");
+    int normalizer_pattern = jt_obj_get(j, t, nt, normalizer, "pattern");
+    int pretokenizer = jt_obj_get(j, t, nt, 0, "pre_tokenizer");
+    int pretokenizer_pattern = jt_obj_get(j, t, nt, pretokenizer, "pattern");
+    if (model < 0 || !dgt_string_field(j, t, nt, 0, "version", "1.0") || normalizer < 0 ||
+        normalizer_pattern < 0 || !dgt_string_field(j, t, nt, normalizer, "type", "Replace") ||
+        !dgt_string_field(j, t, nt, normalizer_pattern, "String", " ") ||
+        !dgt_string_field(j, t, nt, normalizer, "content", "▁") || pretokenizer < 0 ||
+        pretokenizer_pattern < 0 || !dgt_string_field(j, t, nt, pretokenizer, "type", "Split") ||
+        !dgt_string_field(j, t, nt, pretokenizer_pattern, "String", " ") ||
+        !dgt_string_field(j, t, nt, pretokenizer, "behavior", "MergedWithPrevious") ||
+        !dgt_literal_field(j, t, nt, pretokenizer, "invert", "false") ||
+        !dgt_string_field(j, t, nt, model, "type", "BPE") ||
+        !dgt_literal_field(j, t, nt, model, "dropout", "null") ||
+        !dgt_string_field(j, t, nt, model, "unk_token", "<unk>") ||
+        !dgt_literal_field(j, t, nt, model, "continuing_subword_prefix", "null") ||
+        !dgt_literal_field(j, t, nt, model, "end_of_word_suffix", "null") ||
+        !dgt_literal_field(j, t, nt, model, "fuse_unk", "true") ||
+        !dgt_literal_field(j, t, nt, model, "byte_fallback", "true") ||
+        !dgt_literal_field(j, t, nt, model, "ignore_merges", "false"))
+        die("unsupported DiffusionGemma tokenizer configuration");
+}
+
 static void dgt_load(DGTokenizer *d, const char *dir) {
     memset(d, 0, sizeof *d);
     char path[768];
@@ -644,6 +698,7 @@ static void dgt_load(DGTokenizer *d, const char *dir) {
     if (model < 0 || vocab < 0 || merges < 0 || added < 0 || t[vocab].type != JT_OBJECT ||
         t[merges].type != JT_ARRAY || t[added].type != JT_ARRAY)
         die("unsupported DiffusionGemma tokenizer JSON");
+    dgt_validate_configuration(j, t, nt);
     uint32_t nv = (uint32_t)(t[vocab].size / 2);
     if (nv != 262144)
         die("unexpected DiffusionGemma vocabulary size");
@@ -741,8 +796,14 @@ static void dgt_load(DGTokenizer *d, const char *dir) {
         if (t[i].parent != added)
             continue;
         int content = jt_obj_get(j, t, nt, i, "content");
+        int id = jt_obj_get(j, t, nt, i, "id");
         int special = jt_obj_get(j, t, nt, i, "special");
-        if (content < 0 || special < 0 || !jt_literal(j, &t[special], "true"))
+        if (content < 0 || t[content].type != JT_STRING || id < 0 || special < 0 ||
+            !jt_literal(j, &t[special], "true") ||
+            !dgt_literal_field(j, t, nt, i, "single_word", "false") ||
+            !dgt_literal_field(j, t, nt, i, "lstrip", "false") ||
+            !dgt_literal_field(j, t, nt, i, "rstrip", "false") ||
+            !dgt_literal_field(j, t, nt, i, "normalized", "false"))
             die("unsupported added token");
         size_t content_capacity = jb_size_add((size_t)(t[content].end - t[content].start) * 3, 1);
         char *s = xmalloc(content_capacity);
@@ -751,6 +812,8 @@ static void dgt_load(DGTokenizer *d, const char *dir) {
         jb_release(s);
         if (!v)
             die("added token absent from vocabulary");
+        if (jt_nonnegative_int(j, &t[id], "added token id") != v->id)
+            die("added token id does not match vocabulary");
         if (!v->n)
             die("empty added token");
         d->special_first[(unsigned char)v->s[0]] = 1;

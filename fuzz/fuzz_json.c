@@ -10,6 +10,7 @@
  *         jb_input, which go through jb_schema_json and the direct typed
  *         request/question path;
  *   0x02  generic JSON parsing and canonicalization on the remaining bytes;
+ *   'T'   tokenizer configuration validation on the remaining JSON;
  *   else  the whole input is a JSON request: parsing, canonicalization,
  *         request and question validation, and prompt construction.
  *
@@ -167,6 +168,15 @@ static void fuzz_json_document(const char *j, size_t n) {
     jb_release(tokens);
 }
 
+static void fuzz_tokenizer_configuration(const char *j, size_t n) {
+    int nt;
+    JTok *tokens = json_tokens(j, n, &nt);
+    if (!nt || tokens[0].type != JT_OBJECT)
+        die("tokenizer configuration must be an object");
+    dgt_validate_configuration(j, tokens, nt);
+    jb_release(tokens);
+}
+
 /* Next 0x1f-separated field as a counted string; it may contain NUL. */
 static jb_string fuzz_field(const char **p, const char *end) {
     jb_string s = {*p, 0};
@@ -257,6 +267,8 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
             fuzz_typed(j + 1, size - 1);
         else if (size && data[0] == 0x02)
             fuzz_json_document(j + 1, size - 1);
+        else if (size && data[0] == 'T')
+            fuzz_tokenizer_configuration(j + 1, size - 1);
         else
             fuzz_json_request(j, size);
         jb_frame_leave(&frame);

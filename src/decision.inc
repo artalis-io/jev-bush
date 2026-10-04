@@ -1,9 +1,11 @@
 typedef struct {
     char *p;
-    size_t n, cap;
+    size_t n, cap, limit;
 } DGBuf;
 
 static void db_need(DGBuf *b, size_t add) {
+    if (b->limit && (b->n > b->limit || add > b->limit - b->n))
+        die("JSON output is too large");
     if (add > SIZE_MAX - b->n - 1)
         die("string size overflow");
     size_t need = b->n + add + 1;
@@ -871,6 +873,44 @@ static void dg_questions_free(DecisionWork *w, int nq) {
         jb_release(w[x].prob);
     }
     jb_release(w);
+}
+
+static void dg_schema_validate(DGTokenizer *tokenizer, const char *json, size_t length) {
+    DGRequest request = {0};
+    request.qj = json;
+    request.qt = json_tokens(json, length, &request.qnt);
+    request.qroot = 0;
+    request.requested = 1;
+    if (!request.qnt || request.qt[0].type != JT_OBJECT)
+        die("session schema must be a JSON object");
+    char provisional_data[DG_CHOICE_LABELS][3];
+    char *provisional[DG_CHOICE_LABELS];
+    for (int i = 0; i < DG_CHOICE_LABELS; i++) {
+        dg_choice_candidate(i, provisional_data[i]);
+        provisional[i] = provisional_data[i];
+    }
+    int provisional_count = 0;
+    DecisionWork *provisional_work = dg_questions(&request, provisional, &provisional_count);
+    dg_questions_free(provisional_work, provisional_count);
+    char *labels[DG_CHOICE_LABELS];
+    int label_count = dg_choice_inventory(tokenizer, labels);
+    if (label_count != DG_CHOICE_LABELS)
+        die("cannot construct OpenJev choice labels");
+    int question_count = 0;
+    DecisionWork *work = dg_questions(&request, labels, &question_count);
+    char *system = dg_system_prompt(json, request.qt, request.qnt, work, question_count);
+    DGBuf prefix = {0};
+    db_fmt(&prefix, "<bos><|turn>system\n%s<turn|>\n<|turn>user\n", system);
+    Tokens tokens = dgt_tokenize(tokenizer, prefix.p);
+    if (tokens.n > JB_MAX_CTX)
+        die("session schema exceeds DiffusionGemma context");
+    jb_release(tokens.v);
+    jb_release(prefix.p);
+    jb_release(system);
+    dg_questions_free(work, question_count);
+    for (int i = 0; i < label_count; i++)
+        jb_release(labels[i]);
+    jb_release(request.qt);
 }
 
 #ifndef JB_NO_MAIN

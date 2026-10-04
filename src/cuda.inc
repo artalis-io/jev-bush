@@ -1565,6 +1565,7 @@ static struct {
     CUresult (*device_get)(CUdevice *, int);
     CUresult (*device_attribute)(int *, int, CUdevice);
     CUresult (*primary_retain)(CUcontext *, CUdevice);
+    CUresult (*ctx_get)(CUcontext *);
     CUresult (*ctx_set)(CUcontext);
     CUresult (*module_load)(CUmodule *, const void *);
     CUresult (*function_get)(CUfunction *, CUmodule, const char *);
@@ -1712,6 +1713,7 @@ static void dg_cuda_open(void) {
                  dg_cuda_symbol(cu, "cuDeviceGet", &dg_cuda.device_get) &
                  dg_cuda_symbol(cu, "cuDeviceGetAttribute", &dg_cuda.device_attribute) &
                  dg_cuda_symbol(cu, "cuDevicePrimaryCtxRetain", &dg_cuda.primary_retain) &
+                 dg_cuda_symbol(cu, "cuCtxGetCurrent", &dg_cuda.ctx_get) &
                  dg_cuda_symbol(cu, "cuCtxSetCurrent", &dg_cuda.ctx_set) &
                  dg_cuda_symbol(cu, "cuModuleLoadData", &dg_cuda.module_load) &
                  dg_cuda_symbol(cu, "cuModuleGetFunction", &dg_cuda.function_get) &
@@ -1731,12 +1733,17 @@ static void dg_cuda_open(void) {
                  dg_cuda_symbol(rtc, "nvrtcGetProgramLog", &dg_cuda.log) &
                  dg_cuda_symbol(rtc, "nvrtcDestroyProgram", &dg_cuda.destroy);
     CUdevice device;
+    CUcontext previous = NULL;
     int major, minor;
-    if (!loaded || dg_cuda.init(0) || dg_cuda.device_get(&device, 0) ||
+    if (!loaded || dg_cuda.init(0) || dg_cuda.ctx_get(&previous) ||
+        dg_cuda.device_get(&device, 0) ||
         dg_cuda.device_attribute(&major, DG_CU_CC_MAJOR, device) ||
         dg_cuda.device_attribute(&minor, DG_CU_CC_MINOR, device) ||
-        dg_cuda.primary_retain(&dg_cuda.ctx, device) || dg_cuda.ctx_set(dg_cuda.ctx))
+        dg_cuda.primary_retain(&dg_cuda.ctx, device) || dg_cuda.ctx_set(dg_cuda.ctx)) {
+        if (loaded && dg_cuda.ctx_set)
+            (void)dg_cuda.ctx_set(previous);
         return;
+    }
     dg_cuda.fast = !JB_STRICT_MATH && major >= 8;
     dg_cuda.fp4 = dg_cuda.fast && major == 12;
     dg_cuda_compile(major, minor);
@@ -1747,6 +1754,7 @@ static void dg_cuda_open(void) {
         dg_cuda.compile_log[0] = 0;
         dg_cuda_compile(major, minor);
     }
+    (void)dg_cuda.ctx_set(previous);
 }
 
 static void dg_cuda_check(CUresult r, const char *what) {
@@ -2109,17 +2117,52 @@ static const DGAccelOps *dg_accel(void) {
  * streams are introduced. CPU sessions remain fully concurrent. */
 static pthread_mutex_t jb_cuda_call_mutex = PTHREAD_MUTEX_INITIALIZER;
 
-static int jb_accel_call_lock(const DGModel *model) {
+typedef uintptr_t JBAccelContext;
+
+static int jb_accel_context_enter(JBAccelContext *previous) {
+    if (!dg_cuda.ready)
+        return 0;
+    CUcontext context = NULL;
+    if (dg_cuda.ctx_get(&context) || dg_cuda.ctx_set(dg_cuda.ctx))
+        die_status(JB_ERROR_INTERNAL, "cannot enter CUDA context");
+    *previous = (JBAccelContext)context;
+    return 1;
+}
+
+static int jb_accel_context_enter_quiet(JBAccelContext *previous) {
+    if (!dg_cuda.ready)
+        return 0;
+    CUcontext context = NULL;
+    if (dg_cuda.ctx_get(&context) || dg_cuda.ctx_set(dg_cuda.ctx))
+        return 0;
+    *previous = (JBAccelContext)context;
+    return 1;
+}
+
+static void jb_accel_context_leave(int entered, JBAccelContext previous) {
+    if (entered)
+        (void)dg_cuda.ctx_set((CUcontext)previous);
+}
+
+static int jb_accel_call_lock(const DGModel *model, JBAccelContext *previous) {
     if (!model->accel)
         return 0;
     if (pthread_mutex_lock(&jb_cuda_call_mutex))
         die_status(JB_ERROR_INTERNAL, "cannot lock CUDA execution");
+    CUcontext context = NULL;
+    if (dg_cuda.ctx_get(&context) || dg_cuda.ctx_set(dg_cuda.ctx)) {
+        (void)pthread_mutex_unlock(&jb_cuda_call_mutex);
+        die_status(JB_ERROR_INTERNAL, "cannot enter CUDA context");
+    }
+    *previous = (JBAccelContext)context;
     return 1;
 }
 
-static void jb_accel_call_unlock(int locked) {
-    if (locked)
+static void jb_accel_call_unlock(int locked, JBAccelContext previous) {
+    if (locked) {
+        (void)dg_cuda.ctx_set((CUcontext)previous);
         (void)pthread_mutex_unlock(&jb_cuda_call_mutex);
+    }
 }
 
 #ifndef JB_NO_MAIN
@@ -2131,17 +2174,36 @@ static const char *dg_accel_failure(const char **log) {
 }
 #endif
 #else
+typedef uintptr_t JBAccelContext;
+
+static int jb_accel_context_enter(JBAccelContext *previous) {
+    (void)previous;
+    return 0;
+}
+
+static int jb_accel_context_enter_quiet(JBAccelContext *previous) {
+    (void)previous;
+    return 0;
+}
+
+static void jb_accel_context_leave(int entered, JBAccelContext previous) {
+    (void)entered;
+    (void)previous;
+}
+
 static const DGAccelOps *dg_accel(void) {
     return NULL;
 }
 
-static int jb_accel_call_lock(const DGModel *model) {
+static int jb_accel_call_lock(const DGModel *model, JBAccelContext *previous) {
     (void)model;
+    (void)previous;
     return 0;
 }
 
-static void jb_accel_call_unlock(int locked) {
+static void jb_accel_call_unlock(int locked, JBAccelContext previous) {
     (void)locked;
+    (void)previous;
 }
 
 #ifndef JB_NO_MAIN

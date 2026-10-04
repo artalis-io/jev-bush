@@ -5,7 +5,15 @@ struct jb_model {
     jb_allocator allocator;
     void *log_context;
     jb_log_fn log;
+    JBAccelContext load_context;
+    int load_context_entered;
 };
+
+typedef struct {
+    jb_session *session;
+    int accelerator_locked;
+    JBAccelContext accelerator_context;
+} JBCallCleanup;
 
 struct jb_session {
     jb_model *model;
@@ -15,14 +23,10 @@ struct jb_session {
     DGWorkspace workspace;
     char *questions_json;
     size_t questions_length;
+    JBCallCleanup call_cleanup;
     /* The most recent call's error, readable from any thread. */
     char error[sizeof jb_error_message];
 };
-
-typedef struct {
-    jb_session *session;
-    int accelerator_locked;
-} JBCallCleanup;
 
 static void jb_call_cleanup(void *context) {
     volatile JBCallCleanup *cleanup = context;
@@ -36,7 +40,7 @@ static void jb_call_cleanup(void *context) {
     session->workspace.active = 0;
     session->workspace.kv_active = 0;
     session->workspace.control_active = 0;
-    jb_accel_call_unlock(cleanup->accelerator_locked);
+    jb_accel_call_unlock(cleanup->accelerator_locked, cleanup->accelerator_context);
 }
 
 static void jb_log_message(const jb_model *model, jb_log_level level, const char *message) {
@@ -94,6 +98,7 @@ static void jb_model_load_cleanup(void *context) {
     jb_model *model = context;
     dg_release_accel(&model->model);
     dg_unmap_shards(&model->model);
+    jb_accel_context_leave(model->load_context_entered, model->load_context);
 }
 
 static jb_status jb_model_load_impl(const char *model_directory, jb_model **out_model,
@@ -118,8 +123,13 @@ static jb_status jb_model_load_impl(const char *model_directory, jb_model **out_
     jb_cleanup_push(&frame, jb_model_load_cleanup, model);
     dg_load(&model->model, model_directory);
     dgt_load(&model->tokenizer, model_directory);
+    if (model->model.nvfp4)
+        (void)dg_accel();
+    model->load_context_entered = jb_accel_context_enter(&model->load_context);
     dg_upload_model(&model->model);
     dg_prepare_exact_model(&model->model);
+    jb_accel_context_leave(model->load_context_entered, model->load_context);
+    model->load_context_entered = 0;
     jb_cleanup_disarm(&frame, jb_model_load_cleanup, model);
     jb_frame_leave(&frame);
     jb_active_allocator = previous_allocator;
@@ -196,8 +206,11 @@ static void jb_model_release(jb_model *model) {
         return;
     if (atomic_fetch_sub_explicit(&model->references, 1, memory_order_acq_rel) != 1)
         return;
+    JBAccelContext previous = 0;
+    int entered = jb_accel_context_enter_quiet(&previous);
     dgt_free(&model->tokenizer);
     dg_free(&model->model);
+    jb_accel_context_leave(entered, previous);
     jb_release(model);
 }
 
@@ -227,7 +240,7 @@ static char *jb_schema_json(const jb_schema *schema, size_t *length) {
     if (!schema || !schema->questions || !schema->question_count ||
         schema->question_count > DG_MAX_QUESTIONS)
         return NULL;
-    DGBuf out = {0};
+    DGBuf out = {.limit = JB_MAX_JSON};
     db_ch(&out, '{');
     for (size_t q = 0; q < schema->question_count; q++) {
         const jb_question *question = &schema->questions[q];
@@ -317,11 +330,7 @@ jb_status jb_session_create_json(jb_model *model, const char *questions_json,
     session->model = model;
     atomic_flag_clear(&session->busy);
     if (questions_json) {
-        int nt = 0;
-        JTok *tokens = json_tokens(questions_json, questions_length, &nt);
-        if (!nt || tokens[0].type != JT_OBJECT)
-            die("session schema must be a JSON object");
-        jb_release(tokens);
+        dg_schema_validate(&model->tokenizer, questions_json, questions_length);
         session->questions_json = xmalloc(questions_length + 1);
         memcpy(session->questions_json, questions_json, questions_length);
         session->questions_json[questions_length] = 0;
@@ -392,7 +401,8 @@ static jb_status jb_session_decide_json_call(jb_session *session, const char *re
         return jb_invalid("request JSON is too large");
     const jb_allocator *previous_allocator = jb_active_allocator;
     jb_active_allocator = &session->model->allocator;
-    volatile JBCallCleanup cleanup = {session, 0};
+    JBCallCleanup *cleanup = &session->call_cleanup;
+    *cleanup = (JBCallCleanup){.session = session};
     JBErrorFrame frame;
     jb_frame_enter(&frame, JB_ERROR_REQUEST);
     if (setjmp(frame.jump)) {
@@ -400,12 +410,13 @@ static jb_status jb_session_decide_json_call(jb_session *session, const char *re
         jb_active_allocator = previous_allocator;
         return status;
     }
-    jb_cleanup_push(&frame, jb_call_cleanup, (void *)&cleanup);
-    cleanup.accelerator_locked = jb_accel_call_lock(&session->model->model);
+    jb_cleanup_push(&frame, jb_call_cleanup, cleanup);
+    cleanup->accelerator_locked =
+        jb_accel_call_lock(&session->model->model, &cleanup->accelerator_context);
     dg_systemone(&session->model->model, &session->model->tokenizer, request_json, request_length,
                  &session->prefix, &session->workspace, out_json, out_length, NULL);
-    jb_cleanup_disarm(&frame, jb_call_cleanup, (void *)&cleanup);
-    jb_accel_call_unlock(cleanup.accelerator_locked);
+    jb_cleanup_disarm(&frame, jb_call_cleanup, cleanup);
+    jb_accel_call_unlock(cleanup->accelerator_locked, cleanup->accelerator_context);
     jb_frame_leave(&frame);
     jb_active_allocator = previous_allocator;
     jb_error_message[0] = 0;
@@ -426,7 +437,8 @@ static jb_status jb_session_decide_json_batch_call(jb_session *session,
         return jb_invalid("batch arguments are invalid");
     const jb_allocator *previous_allocator = jb_active_allocator;
     jb_active_allocator = &session->model->allocator;
-    volatile JBCallCleanup cleanup = {session, 0};
+    JBCallCleanup *cleanup = &session->call_cleanup;
+    *cleanup = (JBCallCleanup){.session = session};
     JBErrorFrame frame;
     jb_frame_enter(&frame, JB_ERROR_REQUEST);
     if (setjmp(frame.jump)) {
@@ -434,8 +446,9 @@ static jb_status jb_session_decide_json_batch_call(jb_session *session,
         jb_active_allocator = previous_allocator;
         return status;
     }
-    jb_cleanup_push(&frame, jb_call_cleanup, (void *)&cleanup);
-    cleanup.accelerator_locked = jb_accel_call_lock(&session->model->model);
+    jb_cleanup_push(&frame, jb_call_cleanup, cleanup);
+    cleanup->accelerator_locked =
+        jb_accel_call_lock(&session->model->model, &cleanup->accelerator_context);
     char **output = xcalloc(request_count, sizeof *output);
     size_t *length = xcalloc(request_count, sizeof *length);
     for (size_t i = 0; i < request_count; i++) {
@@ -453,8 +466,8 @@ static jb_status jb_session_decide_json_batch_call(jb_session *session,
             dg_systemone(&session->model->model, &session->model->tokenizer, request_json[i],
                          request_lengths[i], &session->prefix, &session->workspace, &output[i],
                          &length[i], NULL);
-    jb_cleanup_disarm(&frame, jb_call_cleanup, (void *)&cleanup);
-    jb_accel_call_unlock(cleanup.accelerator_locked);
+    jb_cleanup_disarm(&frame, jb_call_cleanup, cleanup);
+    jb_accel_call_unlock(cleanup->accelerator_locked, cleanup->accelerator_context);
     jb_frame_leave(&frame);
     jb_active_allocator = previous_allocator;
     *out_json = output;
@@ -475,7 +488,8 @@ static jb_status jb_session_decide_call(jb_session *session, const jb_input *inp
         return jb_invalid("session, input, and output pointer are required");
     const jb_allocator *previous_allocator = jb_active_allocator;
     jb_active_allocator = &session->model->allocator;
-    volatile JBCallCleanup cleanup = {session, 0};
+    JBCallCleanup *cleanup = &session->call_cleanup;
+    *cleanup = (JBCallCleanup){.session = session};
     JBErrorFrame frame;
     jb_frame_enter(&frame, JB_ERROR_REQUEST);
     if (setjmp(frame.jump)) {
@@ -491,14 +505,15 @@ static jb_status jb_session_decide_call(jb_session *session, const jb_input *inp
         (input->id.length && memchr(input->id.data, 0, input->id.length)))
         die("typed input is invalid");
     jb_result *result = NULL;
-    jb_cleanup_push(&frame, jb_call_cleanup, (void *)&cleanup);
-    cleanup.accelerator_locked = jb_accel_call_lock(&session->model->model);
+    jb_cleanup_push(&frame, jb_call_cleanup, cleanup);
+    cleanup->accelerator_locked =
+        jb_accel_call_lock(&session->model->model, &cleanup->accelerator_context);
     dg_systemone_parts(&session->model->model, &session->model->tokenizer, input->state_json.data,
                        input->state_json.length, input->id.data, input->id.length,
                        session->questions_json, session->questions_length, input->samples,
                        &session->prefix, &session->workspace, &result);
-    jb_cleanup_disarm(&frame, jb_call_cleanup, (void *)&cleanup);
-    jb_accel_call_unlock(cleanup.accelerator_locked);
+    jb_cleanup_disarm(&frame, jb_call_cleanup, cleanup);
+    jb_accel_call_unlock(cleanup->accelerator_locked, cleanup->accelerator_context);
     jb_frame_leave(&frame);
     jb_active_allocator = previous_allocator;
     *out_result = result;
@@ -513,7 +528,8 @@ static jb_status jb_session_decide_batch_call(jb_session *session, const jb_inpu
         return jb_invalid("typed batch arguments are invalid");
     const jb_allocator *previous_allocator = jb_active_allocator;
     jb_active_allocator = &session->model->allocator;
-    volatile JBCallCleanup cleanup = {session, 0};
+    JBCallCleanup *cleanup = &session->call_cleanup;
+    *cleanup = (JBCallCleanup){.session = session};
     JBErrorFrame frame;
     jb_frame_enter(&frame, JB_ERROR_REQUEST);
     if (setjmp(frame.jump)) {
@@ -530,8 +546,9 @@ static jb_status jb_session_decide_batch_call(jb_session *session, const jb_inpu
             (input->id.length && memchr(input->id.data, 0, input->id.length)))
             die("typed input is invalid");
     }
-    jb_cleanup_push(&frame, jb_call_cleanup, (void *)&cleanup);
-    cleanup.accelerator_locked = jb_accel_call_lock(&session->model->model);
+    jb_cleanup_push(&frame, jb_call_cleanup, cleanup);
+    cleanup->accelerator_locked =
+        jb_accel_call_lock(&session->model->model, &cleanup->accelerator_context);
     int batched =
         dg_system_batch_parts(&session->model->model, &session->model->tokenizer, inputs,
                               (int)input_count, session->questions_json, session->questions_length,
@@ -544,8 +561,8 @@ static jb_status jb_session_decide_batch_call(jb_session *session, const jb_inpu
                                input->id.length, session->questions_json, session->questions_length,
                                input->samples, &session->prefix, &session->workspace, &result[i]);
         }
-    jb_cleanup_disarm(&frame, jb_call_cleanup, (void *)&cleanup);
-    jb_accel_call_unlock(cleanup.accelerator_locked);
+    jb_cleanup_disarm(&frame, jb_call_cleanup, cleanup);
+    jb_accel_call_unlock(cleanup->accelerator_locked, cleanup->accelerator_context);
     jb_frame_leave(&frame);
     jb_active_allocator = previous_allocator;
     *out_results = result;

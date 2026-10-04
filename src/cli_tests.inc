@@ -1446,7 +1446,16 @@ static int selftest(void) {
     if (jb_session_create_json(&dummy_model, "[]", 2, &public_session) != JB_ERROR_REQUEST ||
         public_session)
         die("public schema error self-test failed");
-    if (jb_session_create_json(&dummy_model, "{}", 2, &public_session) != JB_OK)
+    if (jb_session_create_json(&dummy_model, "{}", 2, &public_session) != JB_ERROR_REQUEST ||
+        public_session)
+        die("empty schema acceptance self-test failed");
+    static const char invalid_schema[] =
+        "{\"route\":{\"type\":\"choice\",\"criteria\":{\"only\":\"One.\"}}}";
+    if (jb_session_create_json(&dummy_model, invalid_schema, sizeof invalid_schema - 1,
+                               &public_session) != JB_ERROR_REQUEST ||
+        public_session)
+        die("invalid fixed schema acceptance self-test failed");
+    if (jb_session_create_json(&dummy_model, NULL, 0, &public_session) != JB_OK)
         die("public session self-test failed");
     const jb_input invalid_input = {{NULL, 0}, {"{", 1}, 0};
     jb_result *invalid_result = NULL;

@@ -361,8 +361,9 @@ jobs:
       - name: Fuzz safetensors metadata
         run: |
           mkdir -p safetensors-corpus
-          ./fuzz_safetensors -max_total_time=120 -max_len=1048576 -dict=fuzz/json.dict \
-            -artifact_prefix=artifacts/ safetensors-corpus
+          ./fuzz_safetensors -max_total_time=120 -max_len=1048576 \
+            -dict=fuzz/safetensors.dict -artifact_prefix=artifacts/ \
+            safetensors-corpus fuzz/safetensors-corpus
 
       - name: Upload crashing inputs
         if: failure()

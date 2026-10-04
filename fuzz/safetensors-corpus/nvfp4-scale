@@ -1,0 +1,3 @@
+N{"model.decoder.layers.0.mlp.experts.0.gate_proj.weight_scale_2":{"dtype":"F32","shape":[],"data_offsets":[0,4]}}
+
+1111

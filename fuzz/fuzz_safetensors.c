@@ -1,12 +1,10 @@
 /*
  * libFuzzer target for the bounded safetensors metadata reader.
  *
- * Byte zero selects BF16/NVFP4 validation and raw/structured input. Raw mode
- * passes the remaining bytes directly to the parser. Structured mode reads a
- * little-endian 32-bit header length from bytes 1..4 and turns the remaining
- * bytes into a safetensors file with a valid 64-bit length prefix. This lets
- * mutations reach JSON descriptors while raw mode continues to exercise the
- * framing checks themselves.
+ * Byte zero selects BF16/NVFP4 validation and raw/structured input. Printable
+ * seed modes use `B` (BF16), `N` (NVFP4), or `D` (NVFP4 parsed as two shards),
+ * followed by a JSON header, a blank line, and tensor bytes. Other inputs keep
+ * the compact flag/length format so mutations exercise framing checks too.
  *
  * Build: clang -g -O1 -fsanitize=fuzzer,address,undefined \
  *        -fno-sanitize-recover=all fuzz/fuzz_safetensors.c -lm -o fuzz_safetensors
@@ -105,7 +103,26 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
         const uint8_t *file = size ? data + 1 : data;
         size_t file_size = size ? size - 1 : 0;
         uint8_t *structured = NULL;
-        if (!(flags & 2) && file_size >= 4) {
+        int seeded = flags == 'B' || flags == 'N' || flags == 'D';
+        int duplicate_shard = flags == 'D';
+        if (seeded) {
+            size_t header_size = 0;
+            while (header_size + 1 < file_size &&
+                   !(file[header_size] == '\n' && file[header_size + 1] == '\n'))
+                header_size++;
+            if (header_size + 1 == file_size)
+                header_size = file_size;
+            size_t separator = header_size < file_size ? 2 : 0;
+            size_t body_size = file_size - header_size - separator;
+            structured = xmalloc(file_size - separator + 8);
+            for (int i = 0; i < 8; i++)
+                structured[i] = (uint8_t)((uint64_t)header_size >> (8 * i));
+            memcpy(structured + 8, file, header_size);
+            if (body_size)
+                memcpy(structured + 8 + header_size, file + header_size + separator, body_size);
+            file = structured;
+            file_size = file_size - separator + 8;
+        } else if (!(flags & 2) && file_size >= 4) {
             uint32_t requested = (uint32_t)file[0] | (uint32_t)file[1] << 8 |
                                  (uint32_t)file[2] << 16 | (uint32_t)file[3] << 24;
             size_t body_size = file_size - 4;
@@ -120,10 +137,15 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
         }
 
         DGModel model = {0};
-        DGShard shard = {0};
-        model.nvfp4 = !!(flags & 1);
-        snprintf(shard.path, sizeof shard.path, "fuzz.safetensors");
-        dg_parse_shard_data(&model, &shard, file, file_size);
+        DGShard shard[2] = {0};
+        model.nvfp4 = seeded ? flags != 'B' : !!(flags & 1);
+        snprintf(shard[0].path, sizeof shard[0].path, "fuzz-1.safetensors");
+        dg_parse_shard_data(&model, &shard[0], file, file_size);
+        if (duplicate_shard) {
+            snprintf(shard[1].path, sizeof shard[1].path, "fuzz-2.safetensors");
+            dg_parse_shard_data(&model, &shard[1], file, file_size);
+        }
+        dg_finalize_tensor_index(&model);
 
         for (size_t i = 0; i < model.nt; i++) {
             const uint8_t *begin = file;
@@ -133,7 +155,8 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
                 abort();
         }
         jb_release(model.tensor);
-        jb_release(shard.names);
+        jb_release(shard[0].names);
+        jb_release(shard[1].names);
         jb_release(structured);
         jb_frame_leave(&frame);
     }

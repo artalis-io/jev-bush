@@ -249,14 +249,14 @@ typedef struct {
 } JBCleanup;
 
 #define JB_CLEANUP_MAX 16
+#define JB_CLEANUP_STACK_MAX 64
 
 typedef struct JBErrorFrame {
     jmp_buf jump;
     struct JBErrorFrame *previous;
     uint64_t mark;
     jb_status previous_status;
-    JBCleanup cleanup[JB_CLEANUP_MAX];
-    unsigned cleanup_count;
+    unsigned cleanup_mark;
 } JBErrorFrame;
 
 static _Thread_local JBErrorFrame *jb_error_frame;
@@ -265,6 +265,8 @@ static _Thread_local char jb_error_message[256];
 static _Thread_local JBAllocation *jb_tracked;
 static _Thread_local uint64_t jb_allocation_sequence;
 static _Thread_local const jb_allocator *jb_active_allocator;
+static _Thread_local JBCleanup jb_cleanup_stack[JB_CLEANUP_STACK_MAX];
+static _Thread_local unsigned jb_cleanup_count;
 
 static void *jb_system_allocate(void *context, size_t size) {
     (void)context;
@@ -488,35 +490,38 @@ static void jb_untrack(void *p) {
     }
 }
 
-/* Fields are set before setjmp and not modified afterwards, and the status
- * lives in thread-local storage, so all of them are valid after a longjmp. */
+/* Every frame field is set before setjmp and remains unchanged afterwards.
+ * Mutable cleanups live in thread-local storage, whose values remain defined
+ * after longjmp. */
 static void jb_frame_enter(JBErrorFrame *f, jb_status status) {
     f->previous = jb_error_frame;
     f->previous_status = jb_error_status;
     f->mark = jb_allocation_sequence;
-    f->cleanup_count = 0;
+    f->cleanup_mark = jb_cleanup_count;
     jb_error_status = status;
     jb_error_frame = f;
 }
 
 static void jb_cleanup_push(JBErrorFrame *frame, JBCleanupFn function, void *context) {
-    if (!frame || frame != jb_error_frame || !function || frame->cleanup_count == JB_CLEANUP_MAX)
+    if (!frame || frame != jb_error_frame || !function || jb_cleanup_count < frame->cleanup_mark ||
+        jb_cleanup_count - frame->cleanup_mark >= JB_CLEANUP_MAX ||
+        jb_cleanup_count >= JB_CLEANUP_STACK_MAX)
         die_status(JB_ERROR_INTERNAL, "invalid error cleanup registration");
-    frame->cleanup[frame->cleanup_count++] = (JBCleanup){function, context};
+    jb_cleanup_stack[jb_cleanup_count++] = (JBCleanup){function, context};
 }
 
 static void jb_cleanup_disarm(JBErrorFrame *frame, JBCleanupFn function, void *context) {
-    if (!frame || frame != jb_error_frame || !frame->cleanup_count)
+    if (!frame || frame != jb_error_frame || jb_cleanup_count == frame->cleanup_mark)
         die_status(JB_ERROR_INTERNAL, "invalid error cleanup removal");
-    JBCleanup *cleanup = &frame->cleanup[frame->cleanup_count - 1];
+    JBCleanup *cleanup = &jb_cleanup_stack[jb_cleanup_count - 1];
     if (cleanup->function != function || cleanup->context != context)
         die_status(JB_ERROR_INTERNAL, "error cleanups removed out of order");
-    frame->cleanup_count--;
+    jb_cleanup_count--;
 }
 
 static void jb_cleanup_run(JBErrorFrame *frame) {
-    while (frame->cleanup_count) {
-        JBCleanup cleanup = frame->cleanup[--frame->cleanup_count];
+    while (jb_cleanup_count > frame->cleanup_mark) {
+        JBCleanup cleanup = jb_cleanup_stack[--jb_cleanup_count];
         cleanup.function(cleanup.context);
     }
 }
@@ -524,7 +529,7 @@ static void jb_cleanup_run(JBErrorFrame *frame) {
 /* Successful return: the outermost frame hands every allocation it made to
  * its owner (caller or session). */
 static void jb_frame_leave(JBErrorFrame *f) {
-    if (f->cleanup_count)
+    if (jb_cleanup_count != f->cleanup_mark)
         die_status(JB_ERROR_INTERNAL, "armed cleanup on successful return");
     jb_error_frame = f->previous;
     jb_error_status = f->previous_status;
