@@ -361,6 +361,28 @@ Selected performance observations:
 - Fast CUDA on a DGX Spark averaged 268 ms per one-read row, excluding model
   load. OpenJev on an RTX PRO 6000 averaged 54.2 ms/row.
 
+The same 400-row, 2,000-decision set was rerun on one NVIDIA RTX PRO 6000
+Blackwell Max-Q with commit `d0c11b7`, the NVFP4 checkpoint, one worker, and 32
+host threads. Wall time includes model loading; mean row latency and
+decisions/s use the sum of the rows' internal timings and exclude model load.
+
+| RTX PRO 6000 CUDA mode | reads | wall time | mean row | decisions/s | accuracy |
+|---|---:|---:|---:|---:|---:|
+| fast, one read | 400 | 59.86 s | 142.8 ms | 35.02 | 66.25% |
+| strict/exact, one read | 400 | 140.44 s | 343.7 ms | 14.55 | 66.25% |
+| fast, automatic reads | 1,504 | 79.46 s | 191.3 ms | 26.14 | 66.20% |
+| strict/exact, automatic reads | 1,498 | 194.69 s | 479.3 ms | 10.43 | 65.95% |
+
+Against the recorded DGX Spark runs, the RTX PRO 6000 was 1.88x faster by
+fast one-read row latency (268 vs 142.8 ms), 2.05x faster by fast automatic
+wall time (163 vs 79.46 s), and 2.25x faster by strict automatic wall time
+(439 vs 194.69 s). Both strict runs reproduced all 2,000 prior strict CUDA
+answer objects exactly. The benchmark used the installed CUDA 13.0 NVRTC via
+`LD_LIBRARY_PATH=/usr/local/lib/ollama/mlx_cuda_v13`; NVRTC 13.2 generated
+kernels that the host's CUDA 13.0 driver could not load. Another process
+retained 59.2 GiB on the device but was at 0% SM before each run; monitoring
+showed Jev Bush sustaining 76--95% SM without observed competing GPU 0 work.
+
 Hardware, read policy, model format, math mode, and concurrency materially
 affect these numbers. Use the machine-readable record rather than quoting a
 number without its conditions. Development history and future experiments live
