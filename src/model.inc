@@ -220,18 +220,15 @@ static int dg_is_text(const char *name) {
            (!strncmp(name, "model.encoder.language_model.", 29) && strstr(name, ".layer_scalar"));
 }
 
-static void dg_parse_shard(DGModel *m, int si, const char *dir) {
-    DGShard *s = &m->shard[si];
-    jb_path(s->path, sizeof s->path, "%s/model-%05d-of-%05d.safetensors", dir, si + 1, m->nshard);
-    map_file(&s->file, s->path);
-    if (s->file.size < 9)
+static void dg_parse_shard_data(DGModel *m, DGShard *s, const uint8_t *data, size_t size) {
+    if (size < 9)
         die2("short safetensors file", s->path);
     uint64_t hn = 0;
     for (int i = 0; i < 8; i++)
-        hn |= (uint64_t)s->file.map[i] << (8 * i);
-    if (!hn || hn > s->file.size - 8 || hn > JB_MAX_JSON)
+        hn |= (uint64_t)data[i] << (8 * i);
+    if (!hn || hn > size - 8 || hn > JB_MAX_JSON)
         die2("invalid safetensors header", s->path);
-    const char *j = (const char *)s->file.map + 8;
+    const char *j = (const char *)data + 8;
     int nt = 0;
     JTok *tok = json_tokens(j, (size_t)hn, &nt);
     if (!nt || tok[0].type != JT_OBJECT)
@@ -294,9 +291,9 @@ static void dg_parse_shard(DGModel *m, int si, const char *dir) {
                 off[no++] = jt_u64(j, &tok[k], name);
             }
         uint64_t base = 8 + hn;
-        if (no != 2 || off[1] < off[0] || base > s->file.size || off[1] > s->file.size - base)
+        if (no != 2 || off[1] < off[0] || base > size || off[1] > size - base)
             die2("out-of-bounds safetensors data", name);
-        t.data = s->file.map + base + off[0];
+        t.data = data + base + off[0];
         t.bytes = off[1] - off[0];
         /* Every consumer indexes tensors by shape, so the byte span must
          * match it exactly or reads run past the tensor's data. */
@@ -313,6 +310,13 @@ static void dg_parse_shard(DGModel *m, int si, const char *dir) {
         dg_push_tensor(m, t);
     }
     jb_release(tok);
+}
+
+static void dg_parse_shard(DGModel *m, int si, const char *dir) {
+    DGShard *s = &m->shard[si];
+    jb_path(s->path, sizeof s->path, "%s/model-%05d-of-%05d.safetensors", dir, si + 1, m->nshard);
+    map_file(&s->file, s->path);
+    dg_parse_shard_data(m, s, s->file.map, s->file.size);
 }
 
 static DGTensor *dg_tensor(DGModel *m, const char *name) {

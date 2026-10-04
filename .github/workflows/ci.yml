@@ -337,7 +337,7 @@ jobs:
           nm -u libjb.so | grep -q '__stack_chk_fail'
 
   fuzz:
-    name: Fuzz JSON reader
+    name: Fuzz input readers
     runs-on: ubuntu-latest
 
     steps:
@@ -347,14 +347,22 @@ jobs:
         run: |
           clang -g -O1 -fsanitize=fuzzer,address,undefined -fno-sanitize-recover=all \
             fuzz/fuzz_json.c -lm -o fuzz_json
+          clang -g -O1 -fsanitize=fuzzer,address,undefined -fno-sanitize-recover=all \
+            fuzz/fuzz_safetensors.c -lm -o fuzz_safetensors
 
       # New inputs go to the first (scratch) directory; the checked-in seeds
       # stay read-only.
-      - name: Fuzz
+      - name: Fuzz JSON
         run: |
           mkdir -p corpus artifacts
           ./fuzz_json -max_total_time=120 -max_len=1048576 -dict=fuzz/json.dict \
             -artifact_prefix=artifacts/ corpus fuzz/corpus
+
+      - name: Fuzz safetensors metadata
+        run: |
+          mkdir -p safetensors-corpus
+          ./fuzz_safetensors -max_total_time=120 -max_len=1048576 -dict=fuzz/json.dict \
+            -artifact_prefix=artifacts/ safetensors-corpus
 
       - name: Upload crashing inputs
         if: failure()
